@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -124,6 +125,20 @@ class AdvisoryDB:
             json.dump(payload, fh, indent=2)
         return len(self.advisories)
 
+    def clone(self) -> "AdvisoryDB":
+        """Return a mutable shallow copy sharing the immutable Advisory objects.
+
+        The list and the two indices are copied so the clone can accept further
+        ``load_file``/``add`` calls (user-supplied extra databases) without
+        mutating the cached source.
+        """
+        copy = AdvisoryDB()
+        copy.advisories = list(self.advisories)
+        copy._by_package = {k: list(v) for k, v in self._by_package.items()}
+        copy._seen = set(self._seen)
+        copy.generated_at = self.generated_at
+        return copy
+
 
 def _mtime_date(path: str) -> str:
     """The file's modification date (YYYY-MM-DD), or '' if unavailable."""
@@ -132,3 +147,32 @@ def _mtime_date(path: str) -> str:
     except OSError:
         return ""
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+
+
+# A full OSV export is hundreds of megabytes, and parsing it dominates a scan.
+# The bundled files are read-only at scan time, so the parsed database is
+# cached (keyed on each file's size and mtime) and callers receive a cheap
+# mutable clone. This is shared across scans and threads, hence the lock.
+_seed_cache: dict = {"key": None, "db": None}
+_seed_cache_lock = threading.Lock()
+
+
+def load_seed_db(paths: list) -> AdvisoryDB:
+    """Load the bundled advisory files once, then return clones of the result."""
+    key = tuple((p, _stat_key(p)) for p in paths)
+    with _seed_cache_lock:
+        if _seed_cache["key"] != key:
+            db = AdvisoryDB()
+            for p in paths:
+                db.load_file(p)
+            _seed_cache["key"] = key
+            _seed_cache["db"] = db
+        return _seed_cache["db"].clone()
+
+
+def _stat_key(path: str) -> tuple:
+    try:
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return (-1, -1)

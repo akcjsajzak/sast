@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .advisory.analyzer import analyze_dependencies
-from .advisory.db import AdvisoryDB
+from .advisory.db import load_seed_db
 from .analysis.blade import scan_blade
 from .analysis.config_scan import (collect_config_files, load_properties,
                                    scan_configs)
@@ -180,9 +180,7 @@ class ScanEngine:
             findings.extend(scan_secrets(secret_files, root))
 
         # Dependency analysis, per language and per module.
-        db = AdvisoryDB()
-        for seed in self._seed_paths():
-            db.load_file(seed)
+        db = load_seed_db(self._seed_paths())
         for extra in (self.options.advisory_dbs or []):
             if os.path.isfile(extra):
                 db.load_file(extra)
