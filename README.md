@@ -420,5 +420,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-279 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+298 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.
