@@ -19,6 +19,18 @@ FEEDS       ?= Packagist Maven npm PyPI Go NuGet
 ADVISORY_DIR := sast/data/advisories
 DOWNLOADED  := $(ADVISORY_DIR)/downloaded.json
 
+# Grammars to bundle, derived from requirements.txt rather than listed by
+# hand so adding a language cannot leave the list stale.
+#
+# PyInstaller's import analysis does currently find these on its own — a build
+# with only the first three collected was verified to work for all eight
+# languages — because each tree_sitter_* wheel ships its compiled extension as
+# the module itself, which is picked up as a binary dependency. Collecting
+# them explicitly is belt and braces: it also brings along any package data a
+# grammar ships separately, which is not guaranteed to be found.
+GRAMMARS := $(shell grep -oE '^tree_sitter[a-z_0-9]*' requirements.txt)
+COLLECT  := $(foreach g,$(GRAMMARS),--collect-all $(g))
+
 # Host detection.
 ifeq ($(OS),Windows_NT)
   EXE      := dist/sast.exe
@@ -45,13 +57,18 @@ feeds: venv
 	$(VENV_BIN)/python -m sast.fetch_feeds --ecosystems $(FEEDS) -o $(DOWNLOADED)
 
 build: venv
+	@echo "Collecting grammars: $(GRAMMARS)"
 	$(VENV_BIN)/pyinstaller --onefile --clean --name sast \
-	  --collect-all tree_sitter \
-	  --collect-all tree_sitter_php \
-	  --collect-all tree_sitter_java \
+	  $(COLLECT) \
 	  --add-data "$(ADVISORY_DIR)$(SEP)sast/data/advisories" \
 	  sast/__main__.py
 	@echo "Built: $(EXE)"
+
+# Prove the frozen binary works. The unit tests exercise the Python package,
+# not the executable, so a grammar missing from the bundle passes every test
+# and still fails for users.
+smoke:
+	$(PYTHON) tests/smoke_binary.py $(EXE)
 
 test: venv
 	$(VENV_BIN)/python -m unittest tests.test_sast -v

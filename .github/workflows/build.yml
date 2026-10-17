@@ -38,12 +38,30 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then SEP=';'; else SEP=':'; fi
+          # Grammars to bundle, derived from requirements.txt rather than
+          # listed by hand so adding a language cannot leave the list stale.
+          # PyInstaller's import analysis does find these on its own today;
+          # collecting them explicitly also brings along any package data a
+          # grammar ships separately, which is not guaranteed to be found.
+          COLLECT=()
+          while read -r pkg; do
+            [ -n "$pkg" ] && COLLECT+=(--collect-all "$pkg")
+          done < <(grep -oE '^tree_sitter[a-z_0-9]*' requirements.txt)
+          echo "Collecting grammars: ${COLLECT[*]}"
           python -m PyInstaller --onefile --clean --name sast \
-            --collect-all tree_sitter \
-            --collect-all tree_sitter_php \
-            --collect-all tree_sitter_java \
+            "${COLLECT[@]}" \
             --add-data "sast/data/advisories${SEP}sast/data/advisories" \
             sast/__main__.py
+
+      # The unit tests exercise the Python package, so nothing they do says
+      # whether the binary works: a grammar or data file missing from the
+      # bundle would pass them and still fail for users. This runs the built
+      # executable against one vulnerable file per engine.
+      - name: Smoke-test the built executable
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=dist/sast.exe; else BIN=dist/sast; fi
+          python tests/smoke_binary.py "$BIN"
 
       - name: Upload executable
         uses: actions/upload-artifact@v4

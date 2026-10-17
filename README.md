@@ -88,7 +88,13 @@ make                 # download feeds + build (default)
 make feeds           # only (re)download feeds -> sast/data/advisories/downloaded.json
 make build           # only build dist/sast (Linux) / dist/sast.exe (Windows)
 make test            # run the unit test suite
+make smoke           # run the built binary against one fixture per engine
 ```
+
+`make smoke` exists because the unit tests import the Python package and so
+say nothing about whether the *executable* works — a grammar or data file
+missing from the bundle would pass every test and still fail for users. CI
+runs it on both platforms before uploading an artifact.
 
 The resulting binary (`dist/sast` or `dist/sast.exe`) contains the tool and the
 advisory database — no network access is required to run it. Re-run `make`
