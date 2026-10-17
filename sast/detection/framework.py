@@ -1,4 +1,4 @@
-"""Framework auto-detection for PHP and Java projects."""
+"""Framework auto-detection from manifests and source markers."""
 from __future__ import annotations
 
 import json

@@ -161,7 +161,7 @@ def cmd_package_map(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sast",
-        description="Offline framework-aware SAST for PHP and Java.",
+        description="Offline application security scanning: code, dependencies, IaC, containers and secrets.",
     )
     parser.add_argument("--version", action="version", version=f"sast {__version__}")
     sub = parser.add_subparsers(dest="command")
