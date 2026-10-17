@@ -56,6 +56,11 @@ class GenericTaintEngine:
         self._seen: set = set()
         self._call_memo: dict = {}
         self._file_text_cache: dict = {}
+        # (source rule, path) -> whether the rule's file gate passes. The gate
+        # is a regex over the whole file and match_source runs it for every
+        # candidate expression, so without this a scan spends most of its
+        # time re-searching the same text for the same answer.
+        self._file_gate_cache: dict = {}
         # Declared element counts for fixed-size arrays, so an index finding
         # can name the bound it may exceed.
         self._array_sizes: dict = {}
@@ -622,13 +627,22 @@ class GenericTaintEngine:
             cache[key] = text
         return text
 
+    def _file_allows(self, src, sf: SourceFile) -> bool:
+        """Whether a file-gated source applies to this file, cached."""
+        key = (id(src), sf.path)
+        allowed = self._file_gate_cache.get(key)
+        if allowed is None:
+            allowed = src.file_allows(self._file_text(sf))
+            self._file_gate_cache[key] = allowed
+        return allowed
+
     def match_source(self, kind, name, root="", path="", sf=None):
         """The first source rule this expression satisfies, or None."""
         for src in self.rules.sources:
             if src.kind != kind:
                 continue
             if src.file_requires and not (
-                    sf is not None and src.file_allows(self._file_text(sf))):
+                    sf is not None and self._file_allows(src, sf)):
                 continue
             if not match_callee(name, src.match):
                 continue

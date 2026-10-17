@@ -222,8 +222,17 @@ def _dedup(items: list):
     seen = set()
     out = []
     for it in items:
-        key = getattr(it, "location", None)
-        key = (key.file, key.line, key.column) if key is not None else repr(it)
+        loc = getattr(it, "location", None)
+        if loc is not None:
+            key = (loc.file, loc.line, loc.column)
+        elif isinstance(it, Location):
+            # Origins are bare Locations. Keyed on every field, which is what
+            # comparing their repr() did, without building the string: this
+            # runs on every taint merge.
+            key = (it.file, it.line, it.column, it.end_line, it.end_column,
+                   it.code)
+        else:
+            key = repr(it)
         if key not in seen:
             seen.add(key)
             out.append(it)

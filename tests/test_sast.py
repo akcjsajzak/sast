@@ -3130,3 +3130,49 @@ class TestFindingDeduplication(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestScanCaches(unittest.TestCase):
+    """The per-file caches that keep a scan from re-reading the same text.
+
+    Without them a modest Python package took minutes: a file-gated source
+    re-ran its regex over the whole file for every candidate expression, and
+    every trace step re-decoded the file to fetch one line.
+    """
+
+    def test_line_text_splits_the_file_once(self):
+        from sast.parsing.generic import GenericParser
+        sf = GenericParser("python").parse("x.py", b"a = 1\nb = 2\n")
+        self.assertEqual(sf.line_text(1), "b = 2")
+        self.assertEqual(sf.line_text(5), "")
+        lines = sf._lines
+        sf.line_text(0)
+        self.assertIs(sf._lines, lines)
+
+    def test_file_gate_is_evaluated_once_per_file(self):
+        from sast.rules.base import TaintSource
+        calls = []
+        original = TaintSource.file_allows
+
+        def counting(self, text):
+            calls.append(self.file_requires)
+            return original(self, text)
+
+        TaintSource.file_allows = counting
+        try:
+            result = _scan({"server.py": (
+                "from http.server import BaseHTTPRequestHandler\n"
+                "import os\n"
+                "class H(BaseHTTPRequestHandler):\n"
+                "    def do_GET(self):\n"
+                "        a = self.path\n"
+                "        b = self.path\n"
+                "        c = self.path\n"
+                "        os.system(a + b + c)\n")})
+        finally:
+            TaintSource.file_allows = original
+        self.assertTrue(any(f.rule_id.startswith("py-cmdi")
+                            for f in result.findings))
+        # One evaluation per gated rule for this one file, however many
+        # expressions consulted it.
+        self.assertEqual(len(calls), len(set(calls)))

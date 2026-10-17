@@ -1,8 +1,7 @@
 """A parsed source file, wrapping the raw bytes and tree-sitter tree."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
 
 from tree_sitter import Node, Tree
 
@@ -13,6 +12,10 @@ class SourceFile:
     content: bytes
     tree: Tree
     language: str
+    # Decoded lines, split on first use. Every finding and trace step asks
+    # for the text of one line, and re-decoding the whole file each time
+    # dominated the cost of building them.
+    _lines: list = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def root(self) -> Node:
@@ -28,7 +31,10 @@ class SourceFile:
 
     def line_text(self, row: int) -> str:
         """Return the full text of a 0-based source line."""
-        lines = self.content.decode("utf-8", "replace").splitlines()
+        lines = self._lines
+        if lines is None:
+            lines = self._lines = self.content.decode(
+                "utf-8", "replace").splitlines()
         if 0 <= row < len(lines):
             return lines[row]
         return ""
