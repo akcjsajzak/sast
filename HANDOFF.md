@@ -39,10 +39,18 @@ source gets error-recovered by tree-sitter in ways that swallow whole
 functions: the first Go probe reported 13/24 purely because it had a duplicate
 import.
 
-**The probe-by-shape method is what found the Go and C# gaps**, and it is the
-thing to reuse: write one file per language with a statement for every sink
-shape the rules claim to cover, assert on line numbers, and check both
-directions (must-fire and must-stay-silent).
+**The probe-by-shape method is what found the Go, C#, PHP and JavaScript
+gaps**, and it is the thing to reuse: write one file per language with a
+statement for every sink shape the rules claim to cover, assert on line
+numbers, and check both directions (must-fire and must-stay-silent). All six
+engines have now been probed this way; redo it whenever a rule set grows.
+
+It also surfaced a recurring failure mode worth naming: **a rule that cannot
+fire at all.** PHP's `mail()` asked for an `email` tag no source produced, Go's
+`ioutil` and `fmt.Fprintf` rules hinted on a receiver those calls never have,
+and the JS header rules needed a `header` tag that did not exist. Each looked
+complete in the rule file and detected nothing. A rule whose tags or hints
+cannot be satisfied is invisible without a probe.
 
 ## OWASP Benchmark
 
@@ -181,6 +189,19 @@ Python: `http.server` handler attributes gated on the base class; the WSGI
 Go: `ioutil` file operations; the `fmt.Fprint*` family (the writer is the first
 argument, not the receiver); `Header.Set`/`Add`.
 
+PHP: the `call_user_func` family and a call through a variable holding a
+tainted name; `create_function`; `scandir`/`opendir`/`glob`; `preg_replace`
+with the /e modifier; variable variables; and `mail()`, which had a rule but
+no tag that could satisfy it.
+
+JavaScript: the server-response sinks, which were missing entirely —
+`res.send` is the most common sink in an Express application — plus
+`res.render` (attacker-chosen template), `res.setHeader`, jsonp, cookies,
+`spawn`'s argument array, and prototype pollution through `Object.assign`.
+`SinkRule.arg_shape` keeps the response rules to string-shaped arguments,
+since Express sends an object or array as JSON and a browser never renders
+that as HTML.
+
 C#: `Request["key"]` (the WebForms indexer, which has no member name and was
 entirely invisible); the ADO.NET execute methods as receiver-tainted sinks;
 `CommandText` as a property sink; the provider-specific command and adapter
@@ -190,10 +211,10 @@ reflection.
 
 ## App results
 
-BenchmarkJava 2257, DVWA 60, OpenDoor 58, Damn_Vulnerable_C_Program 57,
-dvws-node 53, pygoat 43, WebGoat.NET 38, Vulnerable-Web-Application 29,
-NodeGoat 18, dvna 18, DSVW 17, govwa 15, Tiredful-API 12, nodejs-goof 11,
-railsgoat 10.
+BenchmarkJava 2257, DVWA 60, dvws-node 59, OpenDoor 58,
+Damn_Vulnerable_C_Program 57, pygoat 43, WebGoat.NET 38,
+Vulnerable-Web-Application 29, NodeGoat 18, dvna 18, DSVW 17, govwa 15,
+Tiredful-API 12, nodejs-goof 11, railsgoat 10.
 
 DSVW went 3 → 17 and now covers its documented SQLi, pickle RCE, path
 traversal, command injection, XXE, XPath injection, `exec`, SSTI, raw XSS and
@@ -236,12 +257,13 @@ out-of-bounds indexing.
 
 ## State of the tree
 
-`python3 -m unittest tests.test_sast` — 234 tests, all passing. 43 of them are
+`python3 -m unittest tests.test_sast` — 239 tests, all passing. 48 of them are
 new and cover every shape this work fixed: the Python propagation shapes, the
 C parameter and out-parameter handling, the Java constant folding in both
 directions, the Go and C# probe shapes, configured crypto, finding
 deduplication, numeric taint through arithmetic, same-named functions in
-separate files, and the memory-safety checker including its negative cases.
+separate files, the PHP and JavaScript probe shapes, and the memory-safety
+checker including its negative cases.
 
 I checked these actually fail without the fixes rather than trusting that they
 passed: reverting the Go parameter binding and the Java braceless-branch walk
