@@ -25,6 +25,12 @@ Throwaway harnesses, deliberately not committed — recreate from this recipe:
   working once several templates co-occurred in one file; the finding's own
   trace is the only attribution that cannot be wrong.
 * `apps.py` — scans every app and prints a per-rule breakdown.
+* `bench_full.py` — the same scoring with the repository root in scope, which
+  is what lets a configured crypto algorithm be resolved.
+
+Correct-code negative controls, cloned alongside the vulnerable apps and just
+as important: cJSON, sds and uthash for the C memory-safety checker. Any
+change to it should be re-run against those before being believed.
 
 Two measurement traps worth knowing. A per-rule breakdown printed with
 `most_common(8)` silently hides rules that *are* firing — that cost an hour
@@ -40,14 +46,21 @@ directions (must-fire and must-stay-silent).
 
 ## OWASP Benchmark
 
-| | recall | precision | specificity | score (TPR−FPR) |
-|---|---|---|---|---|
-| start | 56.6% | 79.4% | 84.3% | 40.9 |
-| now | **89.8%** | 74.4% | 67.0% | **56.8** |
+| | recall | precision | score (TPR−FPR) |
+|---|---|---|---|
+| start | 56.6% | 79.4% | 40.9 |
+| now, test-code directory only | 89.8% | 74.4% | 56.8 |
+| now, repository root in scope | **92.7%** | 75.0% | **59.7** |
 
-Per category: crypto 100%, weakrand 100%, xpathi 93.3%, sqli 93.8%, cmdi
-91.3%, securecookie 91.7%, ldapi 88.9%, pathtraver 88.7%, trustbound 84.3%,
-xss 83.3%, hash 69.0%.
+The two rows differ because `bench.py` points the scanner at the test-code
+directory alone, which isolates the taint engines but leaves
+`src/main/resources` out of scope — so a configured crypto algorithm cannot be
+resolved. Scanning the repository root is the realistic case; `bench_full.py`
+does that.
+
+Per category (repository root): crypto 100%, hash 100%, weakrand 100%, sqli
+93.8%, xpathi 93.3%, securecookie 91.7%, cmdi 91.3%, ldapi 88.9%, pathtraver
+88.7%, trustbound 84.3%, xss 83.3%.
 
 ## What was fixed
 
@@ -113,6 +126,28 @@ so `self.path` is a source only in an `http.server` handler),
 dangerous because of what they are called on — `untrusted.format(x)`,
 `cmd.ExecuteReader()`).
 
+### New analyses
+
+* **Use-after-free and double-free for C and C++** (`memory_safety.py`). The
+  dominant C vulnerability class, and no taint path reaches it. Per function
+  it holds ALLOCATED / FREED / MAYBE-FREED per local pointer; a use while
+  FREED reports with high confidence, one while MAYBE with medium. Assigning
+  or NULLing the pointer clears the state, so the recommended
+  `free(p); p = NULL;` idiom is never reported. Direct aliasing is tracked;
+  realloc marks its old pointer freed. A function containing a `goto` is
+  skipped, because the order statements appear in is then not the order they
+  run in. **Validated against 221 files of correct C** (cJSON, sds, uthash):
+  zero findings. Out of scope by design, each needing an alias analysis to
+  stay sound: crossing function boundaries, loop iterations, and pointers
+  inside struct fields or array elements.
+* **Crypto algorithms chosen in configuration.** `load_properties` reads every
+  `.properties` file under the scan root, keeping a key only when every file
+  defining it agrees. `const_eval` resolves `props.getProperty("key")` (with
+  the call's own default when the key is absent), and a `getInstance` check
+  folds the argument to decide whether the algorithm is weak. The
+  `.properties` files are also scanned on their own, so the configured value
+  is reported at the line a developer has to change.
+
 ### New rules
 
 Java: the rest of Spring's `JdbcTemplate` surface and JDBC batching;
@@ -135,37 +170,21 @@ reflection.
 
 ## App results
 
-BenchmarkJava 2182, DVWA 60, dvws-node 53, OpenDoor 55, pygoat 42,
+BenchmarkJava 2257, DVWA 60, OpenDoor 55, dvws-node 53, pygoat 42,
 WebGoat.NET 30, Vulnerable-Web-Application 29, NodeGoat 18, dvna 18, DSVW 17,
-govwa 15, Tiredful-API 12, nodejs-goof 11, railsgoat 10,
-Damn_Vulnerable_C_Program 5.
+Damn_Vulnerable_C_Program 17, govwa 15, Tiredful-API 12, nodejs-goof 11,
+railsgoat 10.
 
 DSVW went 3 → 17 and now covers its documented SQLi, pickle RCE, path
 traversal, command injection, XXE, XPath injection, `exec`, SSTI, raw XSS and
 header injection. WebGoat.NET 22 → 30 with its SQL injection found. govwa
 gained Go SQL injection traced through its `(p *Profile)` methods.
-`Damn_Vulnerable_C_Program` 0 → 5.
+`Damn_Vulnerable_C_Program` 0 → 17, the last 12 being its documented
+double-free and use-after-free across the six copies of its source.
 
 ## Still open, highest value first
 
-1. **`hash` is stuck at 69%, and the reason is now known.** All 236 hash and
-   crypto tests read the algorithm from a variable; the only thing separating
-   vulnerable from safe is which properties key is used
-   (`hashAlg1=MD5` vs `hashAlg2=SHA-256` in `benchmark.properties`). crypto
-   reaches 100% only because its weak algorithm happens to appear as the
-   literal default in the source. Fixing hash means **resolving a properties
-   lookup against the config files in the repo** and feeding the result into
-   `const_eval` — worth building, because weak crypto configured in a
-   properties file is a real pattern no amount of taint analysis finds. Do not
-   instead flag every non-literal algorithm: that would gain 40 true positives
-   and add 107 false ones.
-2. **C/C++ memory safety is not modelled at all.** The engine finds the
-   taint-driven classes in `Damn_Vulnerable_C_Program` (heap overflow via
-   `memcpy`, path traversal, integer-overflow `malloc`) but not the local
-   state classes it is mostly made of: use-after-free, double free,
-   out-of-bounds index, divide by zero, memory leak. Those need an
-   intra-procedural alloc/free state tracker, not taint.
-3. **Benchmark's remaining 437 false positives are mostly synthetic, and
+1. **Benchmark's remaining 437 false positives are mostly synthetic, and
    chasing them would make the tool worse on real code.** Partitioned: 24% is
    list index arithmetic (`valuesList.remove(0)` then `get(1)`, so `get(1)`
    returns the safe element), 11% a StringBuilder slice that drops the tainted
@@ -176,21 +195,30 @@ gained Go SQL injection traced through its `(p *Profile)` methods.
    map case is the one defensible piece: taint per *literal* map key, falling
    back to whole-container taint the moment a dynamic key or an escape appears.
    That is worth about 75 of the 437.
-4. **Record what the probes proved.** The shapes now working are not covered
-   by `tests/test_sast.py`: Python tuple unpacking, `dict(genexp)`,
-   comprehensions, for-loop binding, f-strings, chained assignment; the Java
-   constant-folding cases in both directions; the Go and C# probe files. These
-   are the regression tests this work most needs and the cheapest thing left
-   to do.
-5. **A Benchmark lesson worth not relearning.** I pinned `Runtime.exec` to its
+2. **Out-of-bounds index into a fixed-size array.** The remaining C class in
+   `Damn_Vulnerable_C_Program`: `char buf[10]; ... buf[n]` where `n` is
+   attacker-controlled. Tractable — track declared array sizes and report a
+   tainted or unbounded index — and it needs the taint engine rather than
+   `memory_safety.py`, since the judgement is about where the index came
+   from. Memory leak and divide-by-zero are the other two, both lower value:
+   a leak needs escape analysis to avoid reporting every pointer handed to a
+   struct, and a divide-by-zero on a validated input is noise.
+3. **A Benchmark lesson worth not relearning.** I pinned `Runtime.exec` to its
    first argument, reasoning that the environment array and working directory
    are not the command. Ground truth disagreed and it is right: an attacker
    who controls envp controls execution through LD_PRELOAD, IFS, PATH or
    BASH_ENV. Reverted, with the reasoning recorded at the rule.
-6. Longer-standing, unchanged: suppression/baseline support; SARIF relative
+4. Longer-standing, unchanged: suppression/baseline support; SARIF relative
    paths and `partialFingerprints`; dependency CVEs missing from SARIF output.
 
 ## State of the tree
 
-`python3 -m unittest tests.test_sast` — 191 tests, all passing. No new tests
-were added for this run's fixes; item 4 says which shapes deserve them.
+`python3 -m unittest tests.test_sast` — 224 tests, all passing. 33 of them are
+new and cover every shape this work fixed: the Python propagation shapes, the
+C parameter and out-parameter handling, the Java constant folding in both
+directions, the Go and C# probe shapes, configured crypto, finding
+deduplication, and the memory-safety checker including its negative cases.
+
+I checked these actually fail without the fixes rather than trusting that they
+passed: reverting the Go parameter binding and the Java braceless-branch walk
+fails three of them.
