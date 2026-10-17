@@ -117,6 +117,42 @@ sast scan /path/to/project --min-severity high
 sast scan /path/to/project --advisory-db my-advisories.json --advisory-db more.json
 ```
 
+## Web interface
+
+`sast server` serves a browser interface that scans a local path, an uploaded
+ZIP, or a git repository and shows the report on the same page.
+
+```bash
+sast server                      # http://127.0.0.1:8000
+sast server --port 9000 --data-dir /var/lib/sast
+```
+
+Scan history is kept in SQLite under `~/.sast` and survives a restart; a scan
+cut short by one is marked `interrupted` rather than left reading `running`
+forever. Reports stay available as HTML and JSON.
+
+It is built on `http.server` from the standard library — a framework would
+have cost the tool its defining property of running offline with nothing
+installed.
+
+### Security of the interface
+
+**There is no authentication**, so the bind address is the security boundary.
+It listens on `127.0.0.1` by default; `--host 0.0.0.0` prints a warning and
+shows a banner in the page, because anyone who can reach the port can then
+scan any path on the machine and read the results. Two protections apply
+regardless: the `Host` header is checked, so a page on another site cannot
+drive the server through DNS rebinding, and state-changing requests must be
+same-origin.
+
+The three inputs are all attacker-shaped, and are treated that way:
+
+| Input | Handling |
+|---|---|
+| **ZIP** | Entries with absolute paths, `..` traversal, symlinks or device files are refused; the resolved destination is re-checked against the extraction root; size and entry count are capped against zip bombs. |
+| **Git** | `git clone` is reached through an argument list, never a shell. Schemes are allow-listed, which blocks `ext::` (arbitrary command execution) and `file://`; a URL starting with `-` is refused so it cannot be read as `--upload-pack=`; clones are shallow, time-limited and cannot prompt for credentials. |
+| **Local path** | Resolved and reported, so what was scanned is never ambiguous. |
+
 ### Failing a build (CI gating)
 
 By default `sast scan` always exits 0. Pass `--fail-on` to exit 1 when
@@ -214,6 +250,7 @@ sast/
   reporting/   HTML, JSON, SARIF renderers
   rules/       declarative rule model + per-language rule sets
   data/        bundled advisory seed databases
+  web/         optional browser interface (`sast server`)
   engine.py    orchestration
   cli.py       command-line interface
 examples/      vulnerable fixtures (raw-php, laravel-app, symfony-app,

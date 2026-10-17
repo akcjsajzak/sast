@@ -212,6 +212,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("--package-map", help="JSON map of cpe vendor:product -> package")
     p_import.set_defaults(func=cmd_import_feed)
 
+    p_server = sub.add_parser(
+        "server", help="Serve the web interface (scan from a browser)")
+    p_server.add_argument("--host", default="127.0.0.1",
+                          help="Bind address (default: 127.0.0.1). The interface "
+                               "has no authentication, so binding to a routable "
+                               "address exposes this machine.")
+    p_server.add_argument("--port", type=int, default=8000,
+                          help="Port to listen on (default: 8000; 0 picks a free one)")
+    p_server.add_argument("--data-dir", default=None, metavar="DIR",
+                          help="Where scan history and reports are kept "
+                               "(default: ~/.sast)")
+    p_server.add_argument("--include-tests", action="store_true",
+                          help="Also scan test code (excluded by default)")
+    p_server.add_argument("--no-reachability", action="store_true",
+                          help="Skip reachability analysis for dependencies")
+    p_server.set_defaults(func=cmd_server)
+
     p_fetch = sub.add_parser("fetch-feeds", help="Download OSV feeds into the internal advisory format")
     p_fetch.add_argument("--ecosystems", nargs="*", default=None,
                          choices=["Packagist", "Maven", "npm", "PyPI", "Go", "NuGet",
@@ -222,6 +239,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch.set_defaults(func=cmd_fetch_feeds)
 
     return parser
+
+
+def cmd_server(args) -> int:
+    from .web import DEFAULT_DATA_DIR, serve
+    options = ScanOptions(
+        include_tests=args.include_tests,
+        reachability=not args.no_reachability,
+    )
+    return serve(host=args.host, port=args.port,
+                 data_dir=args.data_dir or DEFAULT_DATA_DIR,
+                 options=options)
 
 
 def cmd_fetch_feeds(args) -> int:

