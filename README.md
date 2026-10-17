@@ -8,11 +8,6 @@ dependencies, infrastructure-as-code, Dockerfiles, templates and hard-coded
 secrets. It runs entirely offline and ships as a single binary, so there is
 nothing to install and nothing to phone home to.
 
-The name is a backronym. "Static Analysis & Surface Testing": static analysis
-of your code, plus every other surface an attacker can reach — the packages you
-depend on, the cloud resources you define, the containers you ship and the
-credentials you commit.
-
 ![sast HTML report](docs/report.png)
 
 ## What it does
