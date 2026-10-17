@@ -3261,3 +3261,145 @@ class TestCliCorrectness(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("missing-feed.json", err)
         self.assertTrue(os.path.isfile(out_db))
+
+
+class TestWebServerHardening(unittest.TestCase):
+    """Host parsing, the bounded scan queue, and delete racing a scan."""
+
+    def _serve(self, host):
+        import threading
+        from sast.web.server import make_server
+        httpd, store, service = make_server(host, 0,
+                                            tempfile.mkdtemp(prefix="sast-web-"))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+        def stop():
+            httpd.shutdown()
+            httpd.server_close()
+            store.close()
+        self.addCleanup(stop)
+        return httpd.server_address[1], store, service
+
+    @staticmethod
+    def _status(addr, port, host_header):
+        import http.client
+        conn = http.client.HTTPConnection(addr, port, timeout=10)
+        try:
+            conn.putrequest("GET", "/healthz", skip_host=True)
+            conn.putheader("Host", host_header)
+            conn.endheaders()
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_host_header_parsing(self):
+        from sast.web.server import _host_only
+        self.assertEqual(_host_only("[::1]:8000"), "::1")
+        self.assertEqual(_host_only("[::1]"), "::1")
+        self.assertEqual(_host_only("LocalHost:8000"), "localhost")
+        self.assertEqual(_host_only("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(_host_only("[broken"), "")
+
+    def test_ipv6_loopback_host_header_is_accepted(self):
+        port, _store, _service = self._serve("127.0.0.1")
+        self.assertEqual(self._status("127.0.0.1", port, f"[::1]:{port}"), 200)
+        self.assertEqual(self._status("127.0.0.1", port, "evil.example"), 421)
+
+    def test_wildcard_bind_accepts_the_address_it_was_reached_on(self):
+        """Bound to 0.0.0.0, the server answers at whatever IP it was reached
+        on, but still refuses a name or an IP that is not that address."""
+        import socket as _socket
+        port, _store, _service = self._serve("0.0.0.0")
+        try:
+            probe = _socket.create_connection(("127.0.0.2", port), timeout=2)
+            probe.close()
+        except OSError:
+            self.skipTest("127.0.0.2 is not routable on this platform")
+        self.assertEqual(self._status("127.0.0.2", port, f"127.0.0.2:{port}"), 200)
+        self.assertEqual(self._status("127.0.0.2", port, f"127.0.0.3:{port}"), 421)
+        self.assertEqual(self._status("127.0.0.2", port, "attacker.example"), 421)
+
+    def test_scan_queue_is_bounded(self):
+        import threading
+        from sast.web.server import ScanService, ServiceBusy
+        from sast.web.store import ScanStore
+        store = ScanStore(tempfile.mkdtemp(prefix="sast-store-"))
+        self.addCleanup(store.close)
+        release = threading.Event()
+        ran = []
+        service = ScanService(store, workers=1, max_pending=2)
+        service._run = lambda scan_id, *rest: (release.wait(10),
+                                               ran.append(scan_id))
+        first = service.start("path", "/a")
+        second = service.start("path", "/b")
+        with self.assertRaises(ServiceBusy):
+            service.start("path", "/c")
+        self.assertEqual(store.get(second).progress, "queued")
+        release.set()
+        self.assertTrue(service.wait(10))
+        self.assertEqual(ran, [first, second])
+        service.start("path", "/d")  # capacity is back
+        self.assertTrue(service.wait(10))
+
+    def test_busy_server_answers_503(self):
+        port, _store, service = self._serve("127.0.0.1")
+        service.max_pending = 0
+        import urllib.error
+        import urllib.request
+        boundary = "----sasttest"
+        body = (f'--{boundary}\r\nContent-Disposition: form-data; '
+                f'name="source_type"\r\n\r\npath\r\n--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="path"\r\n\r\n/tmp\r\n'
+                f'--{boundary}--\r\n').encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/start",
+                                     data=body, method="POST")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(ctx.exception.code, 503)
+        self.assertEqual(ctx.exception.headers.get("Retry-After"), "30")
+
+    def test_queued_scan_deleted_before_it_starts_never_runs(self):
+        import threading
+        from sast.web.server import ScanService
+        from sast.web.store import ScanStore
+        store = ScanStore(tempfile.mkdtemp(prefix="sast-store-"))
+        self.addCleanup(store.close)
+        release = threading.Event()
+        ran = []
+        service = ScanService(store, workers=1)
+        service._run = lambda scan_id, *rest: (release.wait(10),
+                                               ran.append(scan_id))
+        first = service.start("path", "/a")
+        queued = service.start("path", "/b")
+        self.assertTrue(store.delete(queued))
+        release.set()
+        self.assertTrue(service.wait(10))
+        self.assertEqual(ran, [first])
+
+    def test_delete_removes_verdicts_and_blocks_a_late_report(self):
+        from sast.web.store import ScanStore
+        store = ScanStore(tempfile.mkdtemp(prefix="sast-store-"))
+        self.addCleanup(store.close)
+        record = store.create("path", "/x")
+        store.set_triage(record.id, {"abc": "real"})
+        self.assertTrue(store.delete(record.id))
+        self.assertEqual(store.triage(record.id), {})
+        # A scan that was still running when deleted finishes afterwards.
+        self.assertFalse(store.write_report(record.id, "<html>", "{}"))
+        self.assertFalse(os.path.exists(store.report_path(record.id)))
+        self.assertFalse(os.path.exists(store.json_path(record.id)))
+
+    def test_delete_of_an_invalid_id_is_refused_cleanly(self):
+        from sast.web.store import ScanStore
+        store = ScanStore(tempfile.mkdtemp(prefix="sast-store-"))
+        self.addCleanup(store.close)
+        self.assertFalse(store.delete("../../etc/passwd"))
+        self.assertFalse(store.delete("deadbeef"))
+
+    def test_report_finds_the_triage_api_relative_to_itself(self):
+        html_out = _scan({"a.php": '<?php system($_GET["c"]);'})
+        page = render_html(html_out)
+        self.assertNotIn("fetch('/api/triage/'", page)
+        self.assertIn("location.pathname.slice(0, m.index) + '/api/triage/'",
+                      page)

@@ -13,8 +13,10 @@ through DNS rebinding) and state-changing requests must be same-origin.
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import os
+import queue
 import socket
 import sys
 import threading
@@ -36,6 +38,12 @@ MAX_UPLOAD_BYTES = 256 * 1024 * 1024
 # with tens of thousands of findings.
 MAX_TRIAGE_BYTES = 1024 * 1024
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".sast")
+# Scans are CPU-bound and tree-sitter holds the GIL while parsing, so running
+# more at once only slows each down. Two keeps a quick scan from waiting
+# behind a long one; the rest queue. The queue is bounded because each entry
+# may hold an uploaded archive in memory.
+MAX_CONCURRENT_SCANS = 2
+MAX_PENDING_SCANS = 8
 
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
@@ -46,28 +54,68 @@ _WARNING_BANNER = (
 )
 
 
-class ScanService:
-    """Runs scans on worker threads and records them in the store."""
+class ServiceBusy(Exception):
+    """Too many scans are already running or queued."""
 
-    def __init__(self, store: ScanStore, options: ScanOptions = None) -> None:
+
+class ScanService:
+    """Runs scans on a fixed pool of worker threads and records them.
+
+    A thread per request would let any client start unbounded concurrent
+    scans, each holding its upload in memory. Workers are daemon threads so
+    stopping the server never waits on a scan in flight; the store marks
+    what was cut short on the next start.
+    """
+
+    def __init__(self, store: ScanStore, options: ScanOptions = None,
+                 workers: int = MAX_CONCURRENT_SCANS,
+                 max_pending: int = MAX_PENDING_SCANS) -> None:
         self.store = store
         self.options = options or ScanOptions()
-        self._threads: list = []
+        self.max_pending = max_pending
+        self._queue: queue.Queue = queue.Queue()
+        # Scans accepted and not yet finished, queued or running.
+        self._pending = 0
+        self._idle = threading.Condition()
+        for n in range(max(1, workers)):
+            threading.Thread(target=self._worker, name=f"sast-scan-{n}",
+                             daemon=True).start()
 
     def start(self, source_type: str, value: str, upload: bytes = b"",
               filename: str = "", branch: str = "") -> str:
         label = {"path": value, "git": value, "zip": filename or "upload.zip"}.get(
             source_type, value)
-        record = self.store.create(source_type, label or "(unnamed)")
-        thread = threading.Thread(
-            target=self._run,
-            args=(record.id, source_type, value, upload, filename, branch),
-            daemon=True,
-        )
-        self._threads.append(thread)
-        thread.start()
-        self._log(record.id, f"started: {label}")
+        with self._idle:
+            if self._pending >= self.max_pending:
+                raise ServiceBusy(
+                    f"{self._pending} scans are already running or queued; "
+                    "try again when one finishes.")
+            self._pending += 1
+        try:
+            record = self.store.create(source_type, label or "(unnamed)")
+            self.store.progress(record.id, "queued")
+        except BaseException:
+            self._done()
+            raise
+        self._queue.put((record.id, source_type, value, upload, filename, branch))
+        self._log(record.id, f"queued: {label}")
         return record.id
+
+    def _worker(self) -> None:
+        while True:
+            job = self._queue.get()
+            try:
+                # Deleted while it waited in the queue: nothing to do.
+                if self.store.get(job[0]) is not None:
+                    self._log(job[0], "started")
+                    self._run(*job)
+            finally:
+                self._done()
+
+    def _done(self) -> None:
+        with self._idle:
+            self._pending -= 1
+            self._idle.notify_all()
 
     def _log(self, scan_id: str, message: str) -> None:
         # Progress goes to stderr so it is visible whether stdout is a terminal
@@ -89,8 +137,10 @@ class ScanService:
                 progress=lambda msg: self._on_progress(scan_id, msg),
             )
             result = ScanEngine(options).scan(directory)
-            self.store.write_report(
-                scan_id, render_html(result), render_json(result))
+            if not self.store.write_report(
+                    scan_id, render_html(result), render_json(result)):
+                self._log(scan_id, "deleted while running; report discarded")
+                return
             self.store.finish(scan_id, result, time.time() - started)
             self._log(scan_id, "done: "
                       f"{len(result.findings)} finding(s), "
@@ -107,12 +157,10 @@ class ScanService:
             if cleanup is not None:
                 cleanup()
 
-    def wait(self, timeout: float = 120) -> None:
-        """Block until in-flight scans finish. Used by the tests."""
-        deadline = time.time() + timeout
-        for thread in list(self._threads):
-            remaining = max(0.0, deadline - time.time())
-            thread.join(remaining)
+    def wait(self, timeout: float = 120) -> bool:
+        """Block until queued and running scans finish. Used by the tests."""
+        with self._idle:
+            return self._idle.wait_for(lambda: self._pending == 0, timeout)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -160,11 +208,23 @@ class Handler(BaseHTTPRequestHandler):
 
         Without this, a page on an attacker's domain could point DNS at
         127.0.0.1 and drive this server from the victim's browser.
+
+        Besides the configured names, an IP literal naming the very address
+        this connection arrived on is accepted. That is what makes a server
+        bound to 0.0.0.0 reachable at its LAN address, and it is safe:
+        rebinding needs a hostname the attacker controls, and a browser that
+        connected to a bare IP sends that IP, never the attacker's name.
         """
-        host = (self.headers.get("Host") or "").split(":")[0].strip("[]").lower()
+        host = _host_only(self.headers.get("Host") or "")
         if not host:
             return False
-        return host in self.allowed_hosts
+        if host in self.allowed_hosts:
+            return True
+        try:
+            local = self.connection.getsockname()[0]
+        except (OSError, IndexError):
+            return False
+        return _same_ip(host, local)
 
     def _same_origin(self) -> bool:
         """State-changing requests must come from this server's own page."""
@@ -336,7 +396,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             upload, filename = part.data, os.path.basename(part.filename or "upload.zip")
 
-        scan_id = self.service.start(source_type, value, upload, filename, branch)
+        try:
+            scan_id = self.service.start(
+                source_type, value, upload, filename, branch)
+        except ServiceBusy as exc:
+            self._send(503, json.dumps({"error": str(exc)}).encode("utf-8"),
+                       "application/json; charset=utf-8",
+                       {"Retry-After": "30"})
+            return
         self._json(202, {"id": scan_id})
 
 
@@ -410,3 +477,33 @@ def serve(host: str = "127.0.0.1", port: int = 8000,
 
 def _escape(value: str) -> str:
     return html.escape(value or "")
+
+
+def _host_only(header: str) -> str:
+    """The host part of a Host header, lower-cased, without port or brackets.
+
+    An IPv6 literal arrives bracketed with its port outside the brackets
+    (`[::1]:8000`), so splitting on the first colon leaves nothing.
+    """
+    header = header.strip().lower()
+    if header.startswith("["):
+        end = header.find("]")
+        return header[1:end] if end > 0 else ""
+    if header.count(":") == 1:
+        return header.split(":", 1)[0]
+    return header
+
+
+def _same_ip(host: str, local: str) -> bool:
+    """True when `host` is an IP literal equal to the local address."""
+    try:
+        want = ipaddress.ip_address(host)
+        have = ipaddress.ip_address(local.split("%", 1)[0])
+    except ValueError:
+        return False
+    # A dual-stack socket reports IPv4 clients as ::ffff:a.b.c.d.
+    if getattr(have, "ipv4_mapped", None):
+        have = have.ipv4_mapped
+    if getattr(want, "ipv4_mapped", None):
+        want = want.ipv4_mapped
+    return want == have and not want.is_unspecified

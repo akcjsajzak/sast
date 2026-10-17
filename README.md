@@ -256,7 +256,13 @@ installed.
 There is no authentication, so the bind address is the security boundary. It
 listens on `127.0.0.1` by default, and `--host 0.0.0.0` prints a warning.
 Regardless of bind address, the `Host` header is checked (DNS-rebinding
-protection) and state-changing requests must be same-origin. The inputs are
+protection) and state-changing requests must be same-origin. A server bound
+to all interfaces answers at the IP address it was reached on, since a bare
+IP cannot be rebound; any other name must be the machine's own hostname.
+
+Two scans run at a time and up to eight wait in a queue; past that the server
+answers `503` with `Retry-After` rather than starting unbounded work. Deleting
+a scan that is queued or still running discards it and its triage verdicts. The inputs are
 attacker-shaped and treated that way: ZIP entries with traversal or symlinks
 are refused, git clone runs through an argument list rather than a shell with
 schemes allow-listed, and local paths are resolved and reported unambiguously.

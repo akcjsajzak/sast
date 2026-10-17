@@ -782,9 +782,14 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
       activeCats[c.getAttribute('data-cat-filter')] = true;
     }});
   }}
+  // The API sits beside /report/, so it is found from the report's own
+  // path: a server mounted under a prefix by a reverse proxy keeps working.
+  var apiBase = '';
   var scanId = (function(){{
     var m = location.pathname.match(new RegExp('/report/([A-Za-z0-9_-]+)'));
-    return m ? m[1] : '';
+    if (!m) return '';
+    apiBase = location.pathname.slice(0, m.index) + '/api/triage/';
+    return m[1];
   }})();
   var remote = !!scanId && location.protocol.indexOf('http') === 0;
   var storeKey = 'sast-triage:' + (scanId || location.pathname);
@@ -802,7 +807,7 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
     if (!remote) {{ saveLocal(); return; }}
     var payload = {{ verdicts: {{}} }};
     payload.verdicts[fid] = state;
-    fetch('/api/triage/' + scanId, {{
+    fetch(apiBase + scanId, {{
       method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify(payload)
     }}).catch(function(){{
@@ -912,7 +917,7 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
   function startTriage(){{
     setWhere();
     if (!remote) {{ triage = loadLocal(); paint(); apply(); return; }}
-    fetch('/api/triage/' + scanId)
+    fetch(apiBase + scanId)
       .then(function(r){{ return r.ok ? r.json() : null; }})
       .then(function(d){{
         triage = (d && d.verdicts) || {{}};

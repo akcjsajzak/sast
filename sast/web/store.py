@@ -243,17 +243,28 @@ class ScanStore:
         return [_row_to_record(r) for r in rows]
 
     def delete(self, scan_id: str) -> bool:
-        record = self.get(scan_id)
-        if record is None:
-            return False
-        for path in (self.report_path(scan_id), self.json_path(scan_id)):
+        """Remove a scan, its verdicts and its reports.
+
+        The rows go first, under the lock, so a scan still running cannot
+        write its report back afterwards: write_report checks for the row
+        under the same lock.
+        """
+        try:
+            paths = (self.report_path(scan_id), self.json_path(scan_id))
+        except ValueError:
+            return False  # not an id this store could have issued
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
+            if cur.rowcount == 0:
+                self._conn.commit()
+                return False
+            self._conn.execute("DELETE FROM triage WHERE scan_id = ?", (scan_id,))
+            self._conn.commit()
+        for path in paths:
             try:
                 os.remove(path)
             except OSError:
                 pass
-        with self._lock:
-            self._conn.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
-            self._conn.commit()
         return True
 
     # ------------------------------------------------------------------
@@ -263,12 +274,19 @@ class ScanStore:
     def json_path(self, scan_id: str) -> str:
         return os.path.join(self.reports_dir, f"{_safe_id(scan_id)}.json")
 
-    def write_report(self, scan_id: str, html: str, payload: str = "") -> None:
-        with open(self.report_path(scan_id), "w", encoding="utf-8") as fh:
-            fh.write(html)
-        if payload:
-            with open(self.json_path(scan_id), "w", encoding="utf-8") as fh:
-                fh.write(payload)
+    def write_report(self, scan_id: str, html: str, payload: str = "") -> bool:
+        """Write a scan's reports. False if the scan was deleted meanwhile."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM scans WHERE id = ?", (scan_id,)).fetchone()
+            if row is None:
+                return False
+            with open(self.report_path(scan_id), "w", encoding="utf-8") as fh:
+                fh.write(html)
+            if payload:
+                with open(self.json_path(scan_id), "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+        return True
 
     def read_report(self, scan_id: str) -> str:
         try:
