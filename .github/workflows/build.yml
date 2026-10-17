@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pyinstaller
+
+      - name: Run unit tests
+        run: python -m unittest tests.test_sast
+
+      - name: Download vulnerability feeds
+        run: python -m sast.fetch_feeds --ecosystems Packagist Maven -o sast/data/advisories/downloaded.json
+
+      - name: Build executable
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then SEP=';'; else SEP=':'; fi
+          python -m PyInstaller --onefile --clean --name sast \
+            --collect-all tree_sitter \
+            --collect-all tree_sitter_php \
+            --collect-all tree_sitter_java \
+            --add-data "sast/data/advisories${SEP}sast/data/advisories" \
+            sast/__main__.py
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-${{ matrix.os }}
+          path: dist/sast*
+          if-no-files-found: error
