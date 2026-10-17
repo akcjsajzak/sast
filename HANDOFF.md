@@ -96,6 +96,17 @@ Per category (repository root): crypto 100%, hash 100%, weakrand 100%, sqli
   symbol table, and one implementation was indexed per bare name, so
   WebGoat.NET's SQL layer resolved to a stub provider.
 * `x = y = value` left every target but the innermost one clean.
+* **Only one function per bare name was ever analysed.** The generic engine
+  re-walked bodies by iterating the symbol table, which keeps one preferred
+  implementation per name, so two same-named functions meant one was skipped
+  outright — and `static` helpers called `init` or `main` in several C files,
+  or `run` in several Python modules, are the normal case. Fixing it gained
+  findings in every generic-engine language at once.
+* **Arithmetic dropped all taint**, so `malloc(w * h)` was invisible while
+  `malloc(w + h)` was found, purely because `+` doubles as string
+  concatenation. Arithmetic now keeps the tags a language declares numeric and
+  drops the rest: a quotient is not a string an attacker controls, but it is a
+  number an attacker influences.
 
 ### Precision
 
@@ -140,6 +151,9 @@ dangerous because of what they are called on — `untrusted.format(x)`,
   zero findings. Out of scope by design, each needing an alias analysis to
   stay sound: crossing function boundaries, loop iterations, and pointers
   inside struct fields or array elements.
+* **Attacker-influenced array indexing** (CWE-129), via a new `index` sink
+  kind that fires on both reads and writes. Limited to fixed-size arrays; see
+  the open items for why heap pointers need more than this.
 * **Crypto algorithms chosen in configuration.** `load_properties` reads every
   `.properties` file under the scan root, keeping a key only when every file
   defining it agrees. `const_eval` resolves `props.getProperty("key")` (with
@@ -170,17 +184,18 @@ reflection.
 
 ## App results
 
-BenchmarkJava 2257, DVWA 60, OpenDoor 55, dvws-node 53, pygoat 42,
-WebGoat.NET 30, Vulnerable-Web-Application 29, NodeGoat 18, dvna 18, DSVW 17,
-Damn_Vulnerable_C_Program 17, govwa 15, Tiredful-API 12, nodejs-goof 11,
+BenchmarkJava 2257, DVWA 60, OpenDoor 58, Damn_Vulnerable_C_Program 57,
+dvws-node 53, pygoat 43, WebGoat.NET 38, Vulnerable-Web-Application 29,
+NodeGoat 18, dvna 18, DSVW 17, govwa 15, Tiredful-API 12, nodejs-goof 11,
 railsgoat 10.
 
 DSVW went 3 → 17 and now covers its documented SQLi, pickle RCE, path
 traversal, command injection, XXE, XPath injection, `exec`, SSTI, raw XSS and
 header injection. WebGoat.NET 22 → 30 with its SQL injection found. govwa
 gained Go SQL injection traced through its `(p *Profile)` methods.
-`Damn_Vulnerable_C_Program` 0 → 17, the last 12 being its documented
-double-free and use-after-free across the six copies of its source.
+`Damn_Vulnerable_C_Program` 0 → 57, covering its documented heap overflows,
+integer-overflow allocations, path traversal, double-free, use-after-free and
+out-of-bounds indexing.
 
 ## Still open, highest value first
 
@@ -195,14 +210,16 @@ double-free and use-after-free across the six copies of its source.
    map case is the one defensible piece: taint per *literal* map key, falling
    back to whole-container taint the moment a dynamic key or an escape appears.
    That is worth about 75 of the 437.
-2. **Out-of-bounds index into a fixed-size array.** The remaining C class in
-   `Damn_Vulnerable_C_Program`: `char buf[10]; ... buf[n]` where `n` is
-   attacker-controlled. Tractable — track declared array sizes and report a
-   tainted or unbounded index — and it needs the taint engine rather than
-   `memory_safety.py`, since the judgement is about where the index came
-   from. Memory leak and divide-by-zero are the other two, both lower value:
-   a leak needs escape analysis to avoid reporting every pointer handed to a
-   struct, and a divide-by-zero on a validated input is noise.
+2. **Out-of-bounds indexing on heap pointers.** `c-oob-index` reports an
+   attacker-influenced index into a *fixed-size* array only. Extending it to
+   heap pointers needs the index expression compared numerically against the
+   allocation's: `malloc(n + 3)` with `buf[n + 1]` is correct and
+   `malloc(n)` with `buf[n]` is off by one, and without that comparison the
+   rule found 5 false positives in cJSON and 1 in sds against 10 real ones.
+   An interval or offset analysis would close it; a heuristic will not.
+   Memory leak and divide-by-zero are the other two C classes left, both
+   lower value: a leak needs escape analysis to avoid reporting every pointer
+   handed to a struct, and a divide-by-zero on a validated input is noise.
 3. **A Benchmark lesson worth not relearning.** I pinned `Runtime.exec` to its
    first argument, reasoning that the environment array and working directory
    are not the command. Ground truth disagreed and it is right: an attacker
@@ -213,11 +230,12 @@ double-free and use-after-free across the six copies of its source.
 
 ## State of the tree
 
-`python3 -m unittest tests.test_sast` — 224 tests, all passing. 33 of them are
+`python3 -m unittest tests.test_sast` — 230 tests, all passing. 39 of them are
 new and cover every shape this work fixed: the Python propagation shapes, the
 C parameter and out-parameter handling, the Java constant folding in both
 directions, the Go and C# probe shapes, configured crypto, finding
-deduplication, and the memory-safety checker including its negative cases.
+deduplication, numeric taint through arithmetic, same-named functions in
+separate files, and the memory-safety checker including its negative cases.
 
 I checked these actually fail without the fixes rather than trusting that they
 passed: reverting the Go parameter binding and the Java braceless-branch walk
