@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from .semver import version_in_ranges
 
@@ -39,6 +40,9 @@ class AdvisoryDB:
         self.advisories: list[Advisory] = []
         self._by_package: dict = {}
         self._seen: set = set()
+        # Newest 'generated_at' across every loaded file (ISO-8601 date), so
+        # reports can state how stale the offline database is.
+        self.generated_at: str = ""
         if seed_path and os.path.isfile(seed_path):
             self.load_file(seed_path)
 
@@ -49,8 +53,16 @@ class AdvisoryDB:
                 data = json.load(fh)
         except (OSError, json.JSONDecodeError):
             return 0
+        if isinstance(data, list):
+            entries = data
+            # A bare list carries no metadata; fall back to the file's mtime.
+            stamp = _mtime_date(path)
+        else:
+            entries = data.get("advisories", [])
+            stamp = data.get("generated_at") or _mtime_date(path)
+        if stamp and stamp > self.generated_at:
+            self.generated_at = stamp
         count = 0
-        entries = data if isinstance(data, list) else data.get("advisories", [])
         for e in entries:
             adv = self._from_dict(e)
             if adv:
@@ -103,6 +115,20 @@ class AdvisoryDB:
         return [a.to_dict() for a in self.advisories]
 
     def export(self, path: str) -> int:
+        """Write the DB with a generation stamp so staleness is visible later."""
+        payload = {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "advisories": self.to_dicts(),
+        }
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(self.to_dicts(), fh, indent=2)
+            json.dump(payload, fh, indent=2)
         return len(self.advisories)
+
+
+def _mtime_date(path: str) -> str:
+    """The file's modification date (YYYY-MM-DD), or '' if unavailable."""
+    try:
+        ts = os.path.getmtime(path)
+    except OSError:
+        return ""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")

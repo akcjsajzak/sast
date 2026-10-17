@@ -143,12 +143,22 @@ class DependencyIssue:
 class ScanResult:
     """Aggregate result of a scan."""
     root: str
-    language: str
-    framework: str
+    language: str                      # primary language (most prevalent)
+    framework: str                     # framework of the primary language
     files_scanned: int = 0
     findings: list = field(default_factory=list)
     dependency_issues: list = field(default_factory=list)
     duration_seconds: float = 0.0
+    # Every language found, most prevalent first, and the framework detected
+    # for each. A polyglot repo scans them all; `language`/`framework` stay as
+    # the primary pair so existing consumers keep working.
+    languages: list = field(default_factory=list)
+    frameworks: dict = field(default_factory=dict)
+    # Files left out of the scan, keyed by reason ('tests', 'too_large', ...).
+    files_skipped: dict = field(default_factory=dict)
+    # Offline advisory database provenance.
+    advisory_count: int = 0
+    advisory_db_date: str = ""
 
     def stats(self) -> dict:
         counts = {s.value: 0 for s in Severity}
@@ -156,3 +166,18 @@ class ScanResult:
             if f.severity.value in counts:
                 counts[f.severity.value] += 1
         return counts
+
+    def count_at_or_above(self, severity: Severity) -> int:
+        """How many findings AND dependency issues are at least `severity`.
+
+        Used by `--fail-on` so a vulnerable dependency can break a build just
+        as a code finding does.
+        """
+        threshold = SEVERITY_ORDER.get(severity, 99)
+        return sum(
+            1 for item in (*self.findings, *self.dependency_issues)
+            if SEVERITY_ORDER.get(item.severity, 99) <= threshold
+        )
+
+    def total_skipped(self) -> int:
+        return sum(self.files_skipped.values())

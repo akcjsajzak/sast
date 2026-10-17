@@ -61,11 +61,33 @@ def make_loc(sf: SourceFile, node: Node) -> Location:
     )
 
 
+# Confidence lattice: lower index == more certain.
+_CONFIDENCE = ("high", "medium", "low")
+
+
+def _conf_rank(c: str) -> int:
+    try:
+        return _CONFIDENCE.index(c)
+    except ValueError:
+        return 0
+
+
+def strongest_confidence(a: str, b: str) -> str:
+    """The more certain of two confidences (used when taints merge)."""
+    return a if _conf_rank(a) <= _conf_rank(b) else b
+
+
+def weakest_confidence(a: str, b: str) -> str:
+    """The less certain of two confidences (used when reporting a finding)."""
+    return a if _conf_rank(a) >= _conf_rank(b) else b
+
+
 @dataclass
 class Taint:
     tags: set = field(default_factory=set)
     origins: list = field(default_factory=list)
     steps: list = field(default_factory=list)
+    confidence: str = "high"
 
     def merge(self, other: "Taint") -> "Taint":
         if other is None:
@@ -73,13 +95,17 @@ class Taint:
         tags = self.tags | other.tags
         origins = self.origins + other.origins
         steps = self.steps + other.steps
-        return Taint(tags=tags, origins=_dedup(origins), steps=_dedup(steps))
+        # If any contributing value is certainly attacker-controlled, the
+        # combined value is too.
+        return Taint(tags=tags, origins=_dedup(origins), steps=_dedup(steps),
+                     confidence=strongest_confidence(self.confidence, other.confidence))
 
     def with_step(self, step: TaintStep) -> "Taint":
         return Taint(
             tags=set(self.tags),
             origins=list(self.origins),
             steps=self.steps + [step],
+            confidence=self.confidence,
         )
 
 
@@ -91,7 +117,7 @@ def _taint_key(t: "Taint"):
     finding — both produce distinct findings.
     """
     origins = tuple(sorted((o.file, o.line, o.column) for o in t.origins))
-    return (frozenset(t.tags), origins)
+    return (frozenset(t.tags), origins, t.confidence)
 
 
 def _dedup(items: list):
@@ -513,7 +539,10 @@ class TaintEngine:
         if base.type == "variable_name":
             sg = au.superglobal(base)
             if sg:
-                return self.source_taint("superglobal", sg, node, sf)
+                # Literal subscript key, if any — lets rules model mixed
+                # containers such as $_SERVER key by key.
+                key = au.literal_string(nc[1]) if len(nc) > 1 else None
+                return self.source_taint("superglobal", sg, node, sf, key=key)
             return env.get(au.var_name(base))
         return self.taint_of(base, sf, env, ctx)
 
@@ -606,13 +635,15 @@ class TaintEngine:
 
         return None
 
-    def source_taint(self, kind, match, node, sf, cls=None, args=None):
+    def source_taint(self, kind, match, node, sf, cls=None, args=None, key=None):
         for src in self.rules.sources:
             if src.kind != kind:
                 continue
             if not match_callee(match, src.match):
                 continue
             if src.cls and not match_callee(cls, src.cls):
+                continue
+            if not src.key_matches(key):
                 continue
             if src.arg_literal:
                 idx, lit = src.arg_literal
@@ -626,6 +657,7 @@ class TaintEngine:
                     description=src.description,
                     code=sf.node_line(node),
                 )],
+                confidence=src.confidence,
             )
         return None
 
@@ -655,7 +687,8 @@ class TaintEngine:
         remaining = t.tags - set(tags)
         if not remaining:
             return None
-        return Taint(tags=remaining, origins=list(t.origins), steps=list(t.steps))
+        return Taint(tags=remaining, origins=list(t.origins), steps=list(t.steps),
+                     confidence=t.confidence)
 
     def check_call_sink(self, kind, callee, cls, args, node, sf, env, ctx):
         for sink in self.rules.sinks:
@@ -817,7 +850,9 @@ class TaintEngine:
             category=sink.category,
             description=sink.description,
             remediation=sink.remediation,
-            confidence=sink.confidence,
+            # A finding is only as certain as the weaker of "this sink is
+            # dangerous" and "this data is attacker-controlled".
+            confidence=weakest_confidence(sink.confidence, taint.confidence),
             framework=self.framework,
             language=self.language,
             location=loc,

@@ -23,7 +23,12 @@ Think of it as an offline, framework-aware Snyk / SonarQube.
     CSRF/authorization misconfig, weak crypto.
 - **Dependency vulnerability scanning** — matches `composer.lock`,
   `pom.xml`/`build.gradle` against a bundled offline advisory DB with semantic
-  version ranges; import OSV, NVD (1.1 & 2.0), or a custom JSON feed.
+  version ranges; import OSV, NVD (1.1 & 2.0), or a custom JSON feed. Reports
+  state how old the bundled database is.
+- **Confidence-aware taint sources** — `$_SERVER` is modelled key by key
+  (`HTTP_*`, `REQUEST_URI`, … are tainted; `DOCUMENT_ROOT`, `REMOTE_ADDR` are
+  not), and second-order sources such as `$_SESSION` report at lower
+  confidence than direct request input.
 - **Reports** — self-contained HTML, JSON, and SARIF 2.1.0 (GitHub code
   scanning, VS Code, SonarQube compatible).
 
@@ -66,8 +71,47 @@ sast scan /path/to/project --format sarif -o results.sarif
 # Filter by minimum severity
 sast scan /path/to/project --min-severity high
 
-# Use an extra advisory DB
-sast scan /path/to/project --advisory-db my-advisories.json
+# Use extra advisory DBs (repeatable)
+sast scan /path/to/project --advisory-db my-advisories.json --advisory-db more.json
+```
+
+### Failing a build (CI gating)
+
+By default `sast scan` always exits 0. Pass `--fail-on` to exit 1 when
+anything at or above a severity is found — code findings and vulnerable
+dependencies both count:
+
+```bash
+sast scan . --format sarif -o results.sarif --fail-on high
+```
+
+### Scan scope and limits
+
+```bash
+sast scan . --include-tests          # also scan test code (excluded by default)
+sast scan . --max-file-size 5        # skip source files over 5 MB (default: 2)
+sast scan . --max-files 1000         # cap files scanned per language
+```
+
+Test code is skipped by default — fixtures deliberately contain unsafe
+patterns that are not attacker-reachable in production. Files left out are
+reported in the summary and in every report format.
+
+Scanning is single-threaded on purpose: tree-sitter's Python binding holds
+the GIL for the duration of a parse, so a worker pool measurably *slows*
+scans down rather than speeding them up.
+
+### Polyglot and multi-module projects
+
+Every language present is scanned, not just the most common one, and
+frameworks are detected from module manifests anywhere in the tree — so a
+monorepo whose root has no `composer.json` or `pom.xml` still resolves
+Laravel, Symfony, Spring and Spring Boot per module:
+
+```
+  Languages:   php, java
+    php      framework: Laravel
+    java     framework: Spring Boot
 ```
 
 ### Importing vulnerability feeds (offline)

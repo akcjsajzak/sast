@@ -93,17 +93,42 @@ def render_html(result: ScanResult) -> str:
     summary = "".join(summary_cards)
 
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    languages = result.languages or [result.language]
+    lang_label = ", ".join(l.upper() for l in languages)
+    if result.frameworks:
+        fw_label = ", ".join(
+            f"{result.frameworks.get(l, 'raw')} ({l})" if len(languages) > 1
+            else result.frameworks.get(l, "raw")
+            for l in languages
+        )
+    else:
+        fw_label = result.framework
+
+    files_label = str(result.files_scanned)
+    if result.files_skipped:
+        detail = ", ".join(f"{n} {reason}" for reason, n in sorted(result.files_skipped.items()))
+        files_label += f" ({detail} skipped)"
+
+    meta = [
+        ("Project", root),
+        ("Language", lang_label),
+        ("Framework", fw_label),
+        ("Files scanned", files_label),
+        ("Duration", f"{result.duration_seconds}s"),
+        ("Generated", generated),
+    ]
+    if result.advisory_count:
+        meta.append((
+            "Advisory DB",
+            f"{result.advisory_count} advisories · "
+            f"as of {result.advisory_db_date or 'unknown date'}",
+        ))
+
     meta_items = "".join(
         f'<div class="hmeta"><span class="hk">{_esc(k)}</span>'
         f'<span class="hv">{_esc(v)}</span></div>'
-        for k, v in (
-            ("Project", root),
-            ("Language", result.language.upper()),
-            ("Framework", result.framework),
-            ("Files scanned", result.files_scanned),
-            ("Duration", f"{result.duration_seconds}s"),
-            ("Generated", generated),
-        )
+        for k, v in meta
     )
 
     return _PAGE.format(

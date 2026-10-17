@@ -46,14 +46,55 @@ _LOG = ["log"]
 _PATH = ["path", "lfi"]
 
 
+# $_SERVER keys that carry attacker-controlled data. Every HTTP_* entry is a
+# verbatim request header; the rest are derived from the request line or from
+# client-supplied credentials. Keys NOT listed here (DOCUMENT_ROOT,
+# SCRIPT_FILENAME, SERVER_NAME, REMOTE_ADDR, ...) are set by the server and are
+# deliberately not treated as taint sources.
+_SERVER_TAINTED_KEYS = (
+    "HTTP_*",            # every inbound request header
+    "QUERY_STRING",
+    "REQUEST_URI",
+    "PATH_INFO",
+    "ORIG_PATH_INFO",
+    "PATH_TRANSLATED",
+    "CONTENT_TYPE",
+    "PHP_AUTH_USER",
+    "PHP_AUTH_PW",
+    "PHP_AUTH_DIGEST",
+    "AUTH_TYPE",
+)
+
+
 def _sources() -> list[TaintSource]:
     s = []
-    # Raw PHP superglobals.
-    for name in ("_GET", "_POST", "_REQUEST", "_COOKIE", "_SERVER", "_FILES", "_ENV", "_SESSION"):
+    # Superglobals that are wholly attacker-controlled.
+    for name in ("_GET", "_POST", "_REQUEST", "_COOKIE", "_FILES"):
         s.append(TaintSource(
             kind="superglobal", match=name, tags=_ALL_TAGS,
             description=f"Untrusted data from superglobal ${name}",
         ))
+
+    # $_SERVER is mixed: only request-derived keys are attacker-controlled.
+    s.append(TaintSource(
+        kind="superglobal", match="_SERVER", tags=_ALL_TAGS,
+        keys=_SERVER_TAINTED_KEYS,
+        description="Untrusted data from a request-controlled $_SERVER key",
+    ))
+
+    # Second-order sources: attacker data can reach these, but only if it was
+    # stored earlier. Reported at lower confidence so they can be filtered out.
+    s.append(TaintSource(
+        kind="superglobal", match="_SESSION", tags=_ALL_TAGS, confidence="low",
+        description="Session data in $_SESSION (second-order: tainted only if "
+                    "attacker-controlled input was stored there)",
+    ))
+    s.append(TaintSource(
+        kind="superglobal", match="_ENV", tags=_ALL_TAGS, confidence="low",
+        description="Environment data in $_ENV (second-order: attacker-controlled "
+                    "only if the environment is externally influenced)",
+    ))
+
     # Raw request body and environment.
     s.append(TaintSource(
         kind="function", match="file_get_contents", tags=_ALL_TAGS,
@@ -61,7 +102,7 @@ def _sources() -> list[TaintSource]:
         arg_literal=(0, "php://input"),
     ))
     s.append(TaintSource(
-        kind="function", match="getenv", tags=_ALL_TAGS,
+        kind="function", match="getenv", tags=_ALL_TAGS, confidence="low",
         description="Environment variable (potentially attacker influenced)",
     ))
     for fn in ("getallheaders", "apache_request_headers"):

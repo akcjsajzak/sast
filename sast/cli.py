@@ -19,10 +19,18 @@ def _severity_choices() -> str:
 
 
 def cmd_scan(args) -> int:
+    # --advisory-db is repeatable; --advisory-dbs is a deprecated alias.
+    advisory_dbs = list(args.advisory_db or []) + list(args.advisory_dbs or [])
+    if args.advisory_dbs:
+        print("warning: --advisory-dbs is deprecated; use repeated --advisory-db",
+              file=sys.stderr)
+
     options = ScanOptions(
-        advisory_db=args.advisory_db,
-        extra_db_files=args.advisory_dbs or [],
+        advisory_dbs=advisory_dbs,
         min_severity=args.min_severity,
+        include_tests=args.include_tests,
+        max_file_bytes=int(args.max_file_size * 1024 * 1024),
+        max_files=args.max_files,
     )
     engine = ScanEngine(options)
     result = engine.scan(args.path)
@@ -37,7 +45,7 @@ def cmd_scan(args) -> int:
         else:
             sys.stdout.write(out)
             sys.stdout.write("\n")
-        return 0
+        return _exit_code(result, args.fail_on, stream=sys.stderr)
 
     print_summary(result)
 
@@ -46,24 +54,52 @@ def cmd_scan(args) -> int:
     with open(output, "w", encoding="utf-8") as fh:
         fh.write(html_out)
     print(f"\nHTML report written to {output}")
+    return _exit_code(result, args.fail_on)
+
+
+def _exit_code(result, fail_on: str, stream=None) -> int:
+    """Exit 1 when the scan meets the configured failure threshold."""
+    if not fail_on or fail_on == "none":
+        return 0
+    try:
+        threshold = Severity(fail_on)
+    except ValueError:
+        return 0
+    n = result.count_at_or_above(threshold)
+    if n:
+        print(f"\nFAILED: {n} issue(s) at or above '{fail_on}' severity.",
+              file=stream or sys.stdout)
+        return 1
     return 0
 
 
 def print_summary(result, stream=None) -> None:
     stats = result.stats()
     p = print if stream is None else lambda *a, **k: print(*a, file=stream, **k)
+    languages = result.languages or [result.language]
     p("=" * 60)
     p("SAST scan complete")
     p(f"  Root:        {result.root}")
-    p(f"  Language:    {result.language}")
-    p(f"  Framework:   {result.framework}")
+    if len(languages) > 1:
+        p(f"  Languages:   {', '.join(languages)}")
+        for lang in languages:
+            p(f"    {lang:<8} framework: {result.frameworks.get(lang, 'raw')}")
+    else:
+        p(f"  Language:    {result.language}")
+        p(f"  Framework:   {result.framework}")
     p(f"  Files:       {result.files_scanned}")
+    if result.files_skipped:
+        detail = ", ".join(f"{n} {reason}" for reason, n in sorted(result.files_skipped.items()))
+        p(f"  Skipped:     {result.total_skipped()} ({detail})")
     p(f"  Duration:    {result.duration_seconds}s")
     p("  Findings:")
     for sev in ("critical", "high", "medium", "low", "info"):
         if stats.get(sev):
             p(f"    {sev:<10} {stats[sev]}")
     p(f"  Dependencies with known vulns: {len(result.dependency_issues)}")
+    if result.advisory_count:
+        stamp = result.advisory_db_date or "unknown date"
+        p(f"  Advisory DB: {result.advisory_count} advisories, as of {stamp}")
     p("=" * 60)
 
 
@@ -111,9 +147,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--format", choices=["html", "json", "sarif"], default="html")
     p_scan.add_argument("--min-severity", default="info",
                         help=f"Minimum severity to report ({_severity_choices()})")
-    p_scan.add_argument("--advisory-db", help="Additional advisory JSON file")
+    p_scan.add_argument("--fail-on", default="none",
+                        choices=[*(s.value for s in Severity), "none"],
+                        help="Exit with status 1 if any finding or vulnerable "
+                             "dependency is at or above this severity "
+                             "(default: none — always exit 0)")
+    p_scan.add_argument("--advisory-db", action="append", default=[], metavar="FILE",
+                        help="Additional advisory JSON file (repeatable)")
+    # Deprecated alias kept so existing invocations keep working.
     p_scan.add_argument("--advisory-dbs", nargs="*", default=[],
-                        help="Additional advisory JSON files")
+                        help=argparse.SUPPRESS)
+    p_scan.add_argument("--include-tests", action="store_true",
+                        help="Also scan test code (excluded by default)")
+    p_scan.add_argument("--max-file-size", type=float, default=2.0, metavar="MB",
+                        help="Skip source files larger than this many MB (default: 2)")
+    p_scan.add_argument("--max-files", type=int, default=0, metavar="N",
+                        help="Scan at most N files per language (0 = unlimited)")
     p_scan.set_defaults(func=cmd_scan)
 
     p_import = sub.add_parser("import-feed", help="Import an OSV/NVD/generic feed")

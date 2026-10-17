@@ -25,9 +25,35 @@ class TaintSource:
     cls: Optional[str] = None  # class name, for 'static'/'method' matching
     arg_literal: Optional[tuple] = None  # (arg_index, literal) — only a source when arg matches
     obj_hint: Optional[str] = None  # substring the receiver must contain (Java)
+    # Subscript keys this source applies to, e.g. $_SERVER['HTTP_HOST']. An
+    # entry ending in '*' matches by prefix. None = any key (whole container).
+    keys: Optional[tuple] = None
+    # How certain we are the data is attacker-controlled. Propagated into the
+    # finding so second-order sources ($_SESSION, $_ENV) report below direct
+    # request input. One of 'high' | 'medium' | 'low'.
+    confidence: str = "high"
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)
+
+    def key_matches(self, key: Optional[str]) -> bool:
+        """True if a subscript key selects this source.
+
+        A source restricted to specific keys never matches an unknown key
+        (``None``, i.e. a dynamic subscript or whole-container access), so a
+        broader fallback rule can handle those instead.
+        """
+        if self.keys is None:
+            return True
+        if key is None:
+            return False
+        for want in self.keys:
+            if want.endswith("*"):
+                if key.startswith(want[:-1]):
+                    return True
+            elif key == want:
+                return True
+        return False
 
 
 @dataclass

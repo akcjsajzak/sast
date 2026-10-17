@@ -1,17 +1,20 @@
 """End-to-end and unit tests for the SAST engine (stdlib unittest)."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import unittest
 
-from sast.advisory.db import AdvisoryDB
+from sast.advisory.db import Advisory, AdvisoryDB
 from sast.advisory.importers import import_feed
 from sast.advisory.semver import satisfies
+from sast.cli import _exit_code
 from sast.detection.framework import detect_framework
-from sast.detection.language import detect_language
+from sast.detection.language import detect_language, detect_languages, is_test_path
 from sast.engine import ScanEngine, ScanOptions
+from sast.models import Severity
 from sast.reporting.html_report import render_html
 from sast.reporting.json_report import render_json
 from sast.reporting.sarif_report import render_sarif
@@ -357,6 +360,194 @@ class TestPhpRuleAdditions(unittest.TestCase):
         rules = {f.rule_id for f in r.findings}
         self.assertIn("php-path-file_put_contents", rules)
         self.assertIn("php-log-error_log", rules)
+
+
+class TestSourcePrecision(unittest.TestCase):
+    """$_SERVER is modelled key by key; second-order sources report lower."""
+
+    def _findings(self, code):
+        return _scan({"a.php": code}).findings
+
+    def test_server_request_keys_are_tainted(self):
+        for key in ("HTTP_HOST", "HTTP_X_FORWARDED_FOR", "REQUEST_URI", "QUERY_STRING"):
+            f = self._findings(f"<?php system($_SERVER['{key}']);")
+            self.assertTrue(f, f"$_SERVER['{key}'] should be a taint source")
+            self.assertEqual(f[0].confidence, "high")
+
+    def test_server_infrastructure_keys_are_not_tainted(self):
+        for key in ("DOCUMENT_ROOT", "SCRIPT_NAME", "SERVER_NAME", "REMOTE_ADDR"):
+            self.assertEqual(
+                self._findings(f"<?php system($_SERVER['{key}']);"), [],
+                f"$_SERVER['{key}'] is server-controlled and must not be a source",
+            )
+
+    def test_second_order_sources_are_low_confidence(self):
+        for sg in ("_SESSION", "_ENV"):
+            f = self._findings(f"<?php system(${sg}['c']);")
+            self.assertTrue(f)
+            self.assertEqual(f[0].confidence, "low")
+
+    def test_direct_input_stays_high_confidence(self):
+        for sg in ("_GET", "_POST", "_COOKIE"):
+            f = self._findings(f"<?php system(${sg}['c']);")
+            self.assertTrue(f)
+            self.assertEqual(f[0].confidence, "high")
+
+    def test_merged_taint_keeps_strongest_confidence(self):
+        # $_GET is certain, $_SESSION is not; the concatenation is certain.
+        f = self._findings("<?php system($_SESSION['a'] . $_GET['b']);")
+        self.assertTrue(f)
+        self.assertEqual(f[0].confidence, "high")
+
+
+class TestFailOn(unittest.TestCase):
+    def test_count_at_or_above(self):
+        r = _scan({"a.php": "<?php system($_POST['c']); echo $_GET['x'];"})
+        self.assertGreaterEqual(r.count_at_or_above(Severity.CRITICAL), 1)
+        self.assertEqual(r.count_at_or_above(Severity.INFO),
+                         len(r.findings) + len(r.dependency_issues))
+
+    def test_exit_code(self):
+        quiet = io.StringIO()  # _exit_code explains itself on the given stream
+        r = _scan({"a.php": "<?php system($_POST['c']);"})
+        self.assertEqual(_exit_code(r, "none", stream=quiet), 0)
+        self.assertEqual(_exit_code(r, "critical", stream=quiet), 1)
+        clean = _scan({"a.php": "<?php echo 'safe';"})
+        self.assertEqual(_exit_code(clean, "critical", stream=quiet), 0)
+
+
+class TestTestExclusion(unittest.TestCase):
+    def test_is_test_path(self):
+        for p in ("tests/FooTest.php", "src/test/java/com/x/ApiTest.java",
+                  "spec/thing_spec.php", "app/UserTest.php"):
+            self.assertTrue(is_test_path(p), p)
+        for p in ("src/Admin.php", "app/Http/Controllers/UserController.php",
+                  "src/main/java/com/x/Api.java", "src/Contest.php"):
+            self.assertFalse(is_test_path(p), p)
+
+    def test_tests_excluded_by_default(self):
+        files = {
+            "src/App.php": "<?php system($_GET['a']);",
+            "tests/AppTest.php": "<?php system($_GET['b']);",
+        }
+        tmp = tempfile.mkdtemp()
+        for rel, content in files.items():
+            path = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(content)
+
+        default = ScanEngine(ScanOptions()).scan(tmp)
+        self.assertEqual(default.files_scanned, 1)
+        self.assertEqual(default.files_skipped.get("tests"), 1)
+
+        with_tests = ScanEngine(ScanOptions(include_tests=True)).scan(tmp)
+        self.assertEqual(with_tests.files_scanned, 2)
+
+
+class TestPolyglotAndModules(unittest.TestCase):
+    def _monorepo(self):
+        tmp = tempfile.mkdtemp()
+        files = {
+            "php-app/composer.json": json.dumps({"require": {"laravel/framework": "^9.0"}}),
+            "php-app/src/A.php": "<?php $i=$_GET['i']; mysqli_query($c, 'SELECT '.$i);",
+            "java-api/pom.xml": "<project><dependencies><dependency>"
+                                "<groupId>org.springframework.boot</groupId>"
+                                "<artifactId>spring-boot-starter-web</artifactId>"
+                                "<version>2.7.0</version></dependency></dependencies></project>",
+            "java-api/src/main/java/A.java":
+                "import org.springframework.web.bind.annotation.*;\n"
+                "@RestController public class A {\n"
+                "  @GetMapping(\"/r\") public void r(@RequestParam String q) throws Exception {\n"
+                "    Runtime.getRuntime().exec(q); } }",
+        }
+        for rel, content in files.items():
+            path = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(content)
+        return tmp
+
+    def test_detect_languages_finds_both(self):
+        self.assertEqual(sorted(detect_languages(self._monorepo())), ["java", "php"])
+
+    def test_scan_covers_both_languages(self):
+        r = ScanEngine(ScanOptions()).scan(self._monorepo())
+        self.assertEqual(sorted(r.languages), ["java", "php"])
+        self.assertEqual(r.files_scanned, 2)
+        self.assertEqual({f.language for f in r.findings}, {"php", "java"})
+
+    def test_framework_detected_from_submodule_manifests(self):
+        """The root holds no manifest; frameworks come from the modules."""
+        r = ScanEngine(ScanOptions()).scan(self._monorepo())
+        self.assertEqual(r.frameworks.get("php"), "Laravel")
+        self.assertEqual(r.frameworks.get("java"), "Spring Boot")
+
+    def test_single_language_result_unchanged(self):
+        r = _scan({"a.php": "<?php echo $_GET['x'];"})
+        self.assertEqual(r.languages, ["php"])
+        self.assertEqual(r.language, "php")
+
+
+class TestScanLimits(unittest.TestCase):
+    def test_max_file_size_skips_large_files(self):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "small.php"), "w") as fh:
+            fh.write("<?php system($_GET['a']);")
+        with open(os.path.join(tmp, "big.php"), "w") as fh:
+            fh.write("<?php\n" + "$z = 1;\n" * 50000)
+
+        r = ScanEngine(ScanOptions(max_file_bytes=1024)).scan(tmp)
+        self.assertEqual(r.files_scanned, 1)
+        self.assertEqual(r.files_skipped.get("too_large"), 1)
+
+    def test_max_files_truncates(self):
+        tmp = tempfile.mkdtemp()
+        for i in range(5):
+            with open(os.path.join(tmp, f"f{i}.php"), "w") as fh:
+                fh.write("<?php echo $_GET['x'];")
+        r = ScanEngine(ScanOptions(max_files=2)).scan(tmp)
+        self.assertEqual(r.files_scanned, 2)
+        self.assertEqual(r.files_skipped.get("truncated"), 3)
+
+
+class TestAdvisoryFreshness(unittest.TestCase):
+    def test_export_records_generated_at(self):
+        db = AdvisoryDB()
+        db.add(Advisory(package="vendor/pkg", ranges=["<1.0.0"], cve="CVE-2025-1"))
+        tmp = os.path.join(tempfile.mkdtemp(), "adv.json")
+        db.export(tmp)
+        with open(tmp) as fh:
+            payload = json.load(fh)
+        self.assertIn("generated_at", payload)
+        self.assertEqual(len(payload["advisories"]), 1)
+
+        reloaded = AdvisoryDB()
+        reloaded.load_file(tmp)
+        self.assertEqual(reloaded.generated_at, payload["generated_at"])
+        self.assertEqual(len(reloaded.advisories), 1)
+
+    def test_legacy_bare_list_still_loads(self):
+        tmp = os.path.join(tempfile.mkdtemp(), "legacy.json")
+        with open(tmp, "w") as fh:
+            json.dump([{"package": "vendor/pkg", "ranges": ["<1.0.0"]}], fh)
+        db = AdvisoryDB()
+        db.load_file(tmp)
+        self.assertEqual(len(db.advisories), 1)
+        self.assertTrue(db.generated_at)  # falls back to file mtime
+
+    def test_scan_reports_db_provenance(self):
+        r = _scan({"a.php": "<?php echo 1;"})
+        self.assertGreater(r.advisory_count, 0)
+        self.assertTrue(r.advisory_db_date)
+
+
+class TestSarifMetadata(unittest.TestCase):
+    def test_information_uri_points_at_this_project(self):
+        r = _scan({"a.php": "<?php echo $_GET['x'];"})
+        doc = json.loads(render_sarif(r))
+        self.assertEqual(doc["runs"][0]["tool"]["driver"]["informationUri"],
+                         "https://github.com/akcjsajzak/sast")
 
 
 if __name__ == "__main__":

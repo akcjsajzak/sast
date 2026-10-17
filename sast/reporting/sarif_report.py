@@ -91,7 +91,7 @@ def render_sarif(result: ScanResult) -> str:
                 "driver": {
                     "name": "sast",
                     "version": __version__,
-                    "informationUri": "https://github.com/Twigpine/openclaude",
+                    "informationUri": "https://github.com/akcjsajzak/sast",
                     "rules": rules,
                 }
             },

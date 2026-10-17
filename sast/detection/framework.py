@@ -50,6 +50,9 @@ class ProjectProfile:
     version: Optional[str] = None
     manifest_files: list = field(default_factory=list)
     notes: list = field(default_factory=list)
+    # Directories holding a dependency manifest. For a single-module project
+    # this is just [root]; for a monorepo it is every module found.
+    module_dirs: list = field(default_factory=list)
 
     @property
     def is_framework(self) -> bool:
@@ -63,7 +66,35 @@ class ProjectProfile:
             "version": self.version,
             "manifest_files": self.manifest_files,
             "notes": self.notes,
+            "module_dirs": self.module_dirs,
         }
+
+
+# How deep below the scan root to look for module manifests.
+_MAX_MANIFEST_DEPTH = 4
+
+
+def find_manifest_dirs(root: str, names: tuple, max_depth: int = _MAX_MANIFEST_DEPTH) -> list[str]:
+    """Directories under `root` containing any of `names`, shallowest first.
+
+    Lets a monorepo or multi-module Maven build be recognised instead of
+    resolving to "raw" because the root holds no manifest of its own.
+    """
+    from .language import IGNORED_DIRS
+
+    found: list[str] = []
+    root = os.path.abspath(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath[len(root):].count(os.sep)
+        if depth >= max_depth:
+            dirnames[:] = []
+        dirnames[:] = [
+            d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")
+        ]
+        if any(n in filenames for n in names):
+            found.append(dirpath)
+    found.sort(key=lambda p: (p[len(root):].count(os.sep), p))
+    return found
 
 
 def _read_json(path: str) -> dict:
@@ -74,47 +105,59 @@ def _read_json(path: str) -> dict:
         return {}
 
 
-def _detect_php_framework(root: str) -> tuple[str, Optional[str], list[str], list[str]]:
-    composer_path = os.path.join(root, "composer.json")
-    if not os.path.isfile(composer_path):
-        return "raw", None, [], []
-    data = _read_json(composer_path)
-    if not data:
-        return "raw", None, [composer_path], ["composer.json unreadable"]
+def _detect_php_framework(root: str) -> tuple[str, Optional[str], list[str], list[str], list[str]]:
+    module_dirs = find_manifest_dirs(root, ("composer.json",))
+    if not module_dirs:
+        return "raw", None, [], [], []
 
-    deps = {}
-    deps.update(data.get("require", {}) or {})
-    deps.update(data.get("require-dev", {}) or {})
+    manifests: list[str] = []
+    notes: list[str] = []
+    fallback_symfony = False
 
-    for pkg, framework in COMPOSER_FRAMEWORKS:
-        if pkg in deps:
-            version = deps[pkg]
-            return framework, version, [composer_path], []
+    for mod in module_dirs:
+        composer_path = os.path.join(mod, "composer.json")
+        manifests.append(composer_path)
+        data = _read_json(composer_path)
+        if not data:
+            notes.append(f"{composer_path} unreadable")
+            continue
 
-    # Symfony components without the full framework bundle.
-    symfony_components = [k for k in deps if k.startswith("symfony/")]
-    if symfony_components:
-        return "Symfony", None, [composer_path], []
+        deps = {}
+        deps.update(data.get("require", {}) or {})
+        deps.update(data.get("require-dev", {}) or {})
 
-    return "raw", None, [composer_path], []
+        for pkg, framework in COMPOSER_FRAMEWORKS:
+            if pkg in deps:
+                return framework, deps[pkg], manifests, notes, module_dirs
+
+        # Symfony components without the full framework bundle.
+        if any(k.startswith("symfony/") for k in deps):
+            fallback_symfony = True
+
+    if fallback_symfony:
+        return "Symfony", None, manifests, notes, module_dirs
+    return "raw", None, manifests, notes, module_dirs
 
 
-def _detect_java_framework(root: str, source_files: list[str]) -> tuple[str, Optional[str], list[str], list[str]]:
+def _detect_java_framework(root: str, source_files: list[str]) -> tuple[str, Optional[str], list[str], list[str], list[str]]:
     manifest_files: list[str] = []
     notes: list[str] = []
 
-    pom = os.path.join(root, "pom.xml")
-    gradle = os.path.join(root, "build.gradle")
-
+    # Aggregate every module's manifest, so a multi-module build whose root
+    # pom declares nothing still resolves to the right framework.
+    module_dirs = find_manifest_dirs(root, ("pom.xml", "build.gradle", "build.gradle.kts"))
     manifest_text = ""
-    if os.path.isfile(pom):
-        manifest_files.append(pom)
-        with open(pom, "r", encoding="utf-8", errors="replace") as fh:
-            manifest_text += fh.read()
-    if os.path.isfile(gradle):
-        manifest_files.append(gradle)
-        with open(gradle, "r", encoding="utf-8", errors="replace") as fh:
-            manifest_text += fh.read()
+    for mod in module_dirs:
+        for name in ("pom.xml", "build.gradle", "build.gradle.kts"):
+            path = os.path.join(mod, name)
+            if not os.path.isfile(path):
+                continue
+            manifest_files.append(path)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    manifest_text += fh.read()
+            except OSError:
+                notes.append(f"{path} unreadable")
 
     found = None
     found_version = None
@@ -130,7 +173,7 @@ def _detect_java_framework(root: str, source_files: list[str]) -> tuple[str, Opt
             break
 
     if found:
-        return found, found_version, manifest_files, notes
+        return found, found_version, manifest_files, notes, module_dirs
 
     # Fall back to scanning source for Spring annotations.
     for sf in source_files[:200]:
@@ -140,21 +183,21 @@ def _detect_java_framework(root: str, source_files: list[str]) -> tuple[str, Opt
         except OSError:
             continue
         if _SPRING_BOOT_RE.search(text):
-            return "Spring Boot", None, manifest_files, notes
+            return "Spring Boot", None, manifest_files, notes, module_dirs
         if _SPRING_RE.search(text):
-            return "Spring", None, manifest_files, notes
+            return "Spring", None, manifest_files, notes, module_dirs
 
-    return "raw", None, manifest_files, notes
+    return "raw", None, manifest_files, notes, module_dirs
 
 
 def detect_framework(root: str, language: str, source_files: list[str]) -> ProjectProfile:
     """Auto-detect the framework (if any) for a project."""
     if language == "php":
-        framework, version, manifests, notes = _detect_php_framework(root)
+        framework, version, manifests, notes, modules = _detect_php_framework(root)
     elif language == "java":
-        framework, version, manifests, notes = _detect_java_framework(root, source_files)
+        framework, version, manifests, notes, modules = _detect_java_framework(root, source_files)
     else:
-        framework, version, manifests, notes = "raw", None, [], []
+        framework, version, manifests, notes, modules = "raw", None, [], [], []
 
     return ProjectProfile(
         root=root,
@@ -163,4 +206,5 @@ def detect_framework(root: str, language: str, source_files: list[str]) -> Proje
         version=version,
         manifest_files=manifests,
         notes=notes,
+        module_dirs=modules or [root],
     )
