@@ -92,11 +92,20 @@ def _sinks() -> list[SinkRule]:
     # name is the only thing that differs. Matching `SqlCommand` alone meant a
     # MySQL or Postgres application — WebGoat.NET included — had none of its
     # SQL sinks recognised.
+    # Both SQLite spellings are real: System.Data.SQLite has SQLiteCommand
+    # and Microsoft.Data.Sqlite has SqliteCommand. Each needs matching, but
+    # they lowercase to one id, so the id is disambiguated rather than one of
+    # the classes being dropped.
+    seen_ids: set = set()
     for prefix in ("Sql", "MySql", "Npgsql", "SQLite", "Sqlite", "Oracle",
                    "OleDb", "Odbc", "Db", "Firebird", "Fb"):
         for suffix in ("Command", "DataAdapter"):
             cls = prefix + suffix
-            sink(f"cs-sqli-{cls.lower()}", cls,
+            rule_id = f"cs-sqli-{cls.lower()}"
+            if rule_id in seen_ids:
+                rule_id = f"cs-sqli-{prefix}{suffix}".lower() + "-alt"
+            seen_ids.add(rule_id)
+            sink(rule_id, cls,
                  f"SQL injection via {cls}", "high", "CWE-89", A03,
                  "sql-injection",
                  "The command text is built from untrusted data.",

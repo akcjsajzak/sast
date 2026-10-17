@@ -196,7 +196,10 @@ def _sinks() -> list[SinkRule]:
              "passed as a bound parameter.",
              "Use parameterised queries ($1 / ? placeholders) or the query builder.",
              _SQL, arg_index=0)
-    for m in ("$where", "where", "find", "findOne", "updateOne", "deleteOne"):
+    # `$where` and `where` both reduce to the same id once the `$` is
+    # stripped, which silently gave two rules one identity. `$where` is the
+    # dangerous Mongo operator and is matched by the `where` entry anyway.
+    for m in ("where", "find", "findOne", "updateOne", "deleteOne"):
         sink(f"js-nosqli-{m.replace('$','')}", "call", m,
              f"NoSQL injection via {m}()", "high", "CWE-943", A03, "nosql-injection",
              "A query object built from request data lets an attacker inject "
@@ -299,7 +302,8 @@ def _sinks() -> list[SinkRule]:
          _XSS + ["header"], arg_index=1, obj_hint="res", confidence="medium")
 
     # --- Prototype pollution through a merge of parsed input ---
-    for m in ("assign", "assignIn", "defaultsDeep", "extend"):
+    # `defaultsDeep` is already covered by the lodash merge group below.
+    for m in ("assign", "assignIn", "extend"):
         sink(f"js-proto-{m.lower()}", "call", m,
              f"Prototype pollution via {m}()", "high", "CWE-1321", A03,
              "prototype-pollution",

@@ -2473,6 +2473,84 @@ class TestJsResponseSinks(unittest.TestCase):
         self.assertIn("js-cmdi-spawn", rules)
 
 
+class TestRuleSetConsistency(unittest.TestCase):
+    """Catch rules that cannot fire, whatever they look like in the file.
+
+    The probes kept turning up the same failure: a rule asking for a taint tag
+    no source in its own rule set produces, or a kind no engine implements. It
+    looks complete in the rule file and detects nothing — PHP's `mail()` sat
+    dead on an `email` tag for exactly this reason, as did the JS header rules
+    on a `header` tag. These checks make that class impossible to reintroduce
+    without a test failing.
+    """
+
+    LANGUAGES = ("php", "java", "javascript", "python", "go", "csharp", "c")
+
+    # Kinds the engines actually dispatch on. Adding a rule with a kind that
+    # is not here silently does nothing, so the list has to be updated
+    # deliberately alongside the engine that handles it.
+    SINK_KINDS = {
+        "call", "method", "function", "static", "index", "property_assign",
+        "object_create", "echo", "print", "include", "shell", "jsx_attribute",
+        "dynamic_call", "variable_variable",
+    }
+    SOURCE_KINDS = {"call", "method", "function", "static", "member",
+                    "identifier", "superglobal"}
+
+    def _rules(self, language):
+        from sast.rules import registry
+        return getattr(registry, f"build_{'js' if language == 'javascript' else language}_rules")()
+
+    def test_every_sink_tag_is_reachable(self):
+        for language in self.LANGUAGES:
+            rules = self._rules(language)
+            produced = set()
+            for source in rules.sources:
+                produced |= set(source.tags)
+            for sink in rules.sinks:
+                if not sink.tags:
+                    continue  # reported on sight; needs no taint at all
+                self.assertTrue(
+                    set(sink.tags) & produced,
+                    f"{language}: {sink.rule_id} needs "
+                    f"{sorted(set(sink.tags) - produced)}, which no source "
+                    "in this rule set produces, so it can never fire")
+
+    def test_every_kind_is_implemented(self):
+        for language in self.LANGUAGES:
+            rules = self._rules(language)
+            for sink in rules.sinks:
+                self.assertIn(sink.kind, self.SINK_KINDS,
+                              f"{language}: {sink.rule_id}")
+            for source in rules.sources:
+                self.assertIn(source.kind, self.SOURCE_KINDS,
+                              f"{language}: source for {source.match}")
+
+    def test_pattern_regexes_compile(self):
+        import re
+        for language in self.LANGUAGES:
+            for rule in self._rules(language).patterns:
+                if not rule.regex:
+                    continue
+                try:
+                    re.compile(rule.match)
+                except re.error as exc:
+                    self.fail(f"{language}: {rule.rule_id} — {exc}")
+                if rule.absent:
+                    try:
+                        re.compile(rule.absent)
+                    except re.error as exc:
+                        self.fail(f"{language}: {rule.rule_id} absent — {exc}")
+
+    def test_rule_ids_are_unique_within_a_language(self):
+        for language in self.LANGUAGES:
+            rules = self._rules(language)
+            ids = [r.rule_id for r in rules.sinks] + \
+                  [r.rule_id for r in rules.patterns]
+            duplicates = {i for i in ids if ids.count(i) > 1}
+            self.assertEqual(duplicates, set(), language)
+
+
 class TestFindingDeduplication(unittest.TestCase):
     def test_one_finding_per_rule_and_location(self):
         """A sink reached from several sources is still one line to fix."""

@@ -481,7 +481,9 @@ def _sinks() -> list[SinkRule]:
     ))
 
     # --- Directory listing by an attacker-controlled path ---
-    for fn in ("scandir", "opendir", "glob", "dir", "rmdir", "mkdir",
+    # `rmdir` is covered by the file-operation rules below, which treat it as
+    # a write rather than a listing.
+    for fn in ("scandir", "opendir", "glob", "dir", "mkdir",
                "is_dir", "disk_free_space"):
         k.append(SinkRule(
             rule_id=f"php-path-{fn}", kind="function", match=fn,
