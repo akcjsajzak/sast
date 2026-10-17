@@ -36,6 +36,10 @@ class Advisory:
         }
 
 
+class AdvisoryDBError(ValueError):
+    """An advisory database the user asked for could not be loaded."""
+
+
 class AdvisoryDB:
     def __init__(self, seed_path: str = None) -> None:
         self.advisories: list[Advisory] = []
@@ -47,13 +51,25 @@ class AdvisoryDB:
         if seed_path and os.path.isfile(seed_path):
             self.load_file(seed_path)
 
-    def load_file(self, path: str) -> int:
-        """Load an advisory JSON file (our internal format). Returns count added."""
+    def load_file(self, path: str, strict: bool = False) -> int:
+        """Load an advisory JSON file (our internal format). Returns count added.
+
+        A bundled seed that cannot be read is skipped. A database the user
+        named is loaded with `strict`, which raises instead: a scan that
+        quietly ran without the advisories it was pointed at reports clean
+        dependencies it never checked.
+        """
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            if strict:
+                raise AdvisoryDBError(
+                    f"cannot load advisory database {path}: {exc}") from exc
             return 0
+        if strict and not isinstance(data, (list, dict)):
+            raise AdvisoryDBError(
+                f"advisory database {path} is not a JSON object or list")
         if isinstance(data, list):
             entries = data
             # A bare list carries no metadata; fall back to the file's mtime.

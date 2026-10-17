@@ -3195,3 +3195,69 @@ class TestScanCaches(unittest.TestCase):
         # One evaluation per gated rule for this one file, however many
         # expressions consulted it.
         self.assertEqual(len(calls), len(set(calls)))
+
+
+class TestCliCorrectness(unittest.TestCase):
+    EXPRESS = os.path.join(os.path.dirname(__file__), "..", "examples",
+                           "express-app")
+
+    def _main(self, argv):
+        import contextlib
+        from sast.cli import main
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = main(argv)
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_unknown_min_severity_is_rejected(self):
+        code, _, err = self._main(["scan", self.EXPRESS, "--min-severity",
+                                   "bogus", "--format", "json", "-q"])
+        self.assertEqual(code, 2)
+        self.assertIn("invalid choice", err)
+
+    def test_min_severity_filters_dependency_issues_too(self):
+        everything = ScanEngine(ScanOptions()).scan(self.EXPRESS)
+        self.assertTrue(any(d.severity != Severity.CRITICAL
+                            for d in everything.dependency_issues))
+        critical = ScanEngine(ScanOptions(min_severity="critical")).scan(
+            self.EXPRESS)
+        self.assertTrue(critical.dependency_issues)
+        self.assertTrue(all(d.severity == Severity.CRITICAL
+                            for d in critical.dependency_issues))
+
+    def test_missing_advisory_db_fails_the_scan(self):
+        code, out, err = self._main(["scan", self.EXPRESS, "--format", "json",
+                                     "-q", "--advisory-db",
+                                     "/nonexistent/advisories.json"])
+        self.assertEqual(code, 2)
+        self.assertIn("/nonexistent/advisories.json", err)
+        self.assertEqual(out, "")
+
+    def test_malformed_advisory_db_fails_the_scan(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as fh:
+            fh.write("{not json")
+        self.addCleanup(os.remove, fh.name)
+        code, _, err = self._main(["scan", self.EXPRESS, "--format", "json",
+                                   "-q", "--advisory-db", fh.name])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot load advisory database", err)
+
+    def test_scan_of_a_missing_directory_fails(self):
+        code, _, err = self._main(["scan", "/nonexistent/project",
+                                   "--format", "json", "-q"])
+        self.assertEqual(code, 2)
+        self.assertIn("not a directory", err)
+
+    def test_import_feed_reports_failure_in_exit_status(self):
+        tmp = tempfile.mkdtemp()
+        out_db = os.path.join(tmp, "out.json")
+        code, _, err = self._main(["import-feed",
+                                   os.path.join(tmp, "missing-feed.json"),
+                                   "-o", out_db])
+        self.assertEqual(code, 1)
+        self.assertIn("missing-feed.json", err)
+        self.assertTrue(os.path.isfile(out_db))

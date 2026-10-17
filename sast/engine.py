@@ -58,8 +58,6 @@ class ScanOptions:
     # skipped rather than allowed to stall the whole scan.
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
     max_files: int = 0  # 0 = unlimited
-    # Templates and configuration files are scanned alongside source; these
-    # exist so a noisy repo can turn either off.
     # Each scanner can be turned off independently, so a repo can be scanned
     # for one concern at a time.
     scan_code: bool = True
@@ -96,6 +94,11 @@ class ScanEngine:
     def scan(self, root: str) -> ScanResult:
         start = time.time()
         root = os.path.abspath(root)
+        # Loaded first, so a database the user named but that cannot be read
+        # fails the scan before the code analysis rather than after it.
+        db = load_seed_db(self._seed_paths())
+        for extra in (self.options.advisory_dbs or []):
+            db.load_file(extra, strict=True)
 
         # A repository with no application source at all is still worth
         # scanning: it may be nothing but Terraform, Kubernetes manifests or a
@@ -193,11 +196,6 @@ class ScanEngine:
             findings.extend(scan_secrets(secret_files, root))
 
         # Dependency analysis, per language and per module.
-        db = load_seed_db(self._seed_paths())
-        for extra in (self.options.advisory_dbs or []):
-            if os.path.isfile(extra):
-                db.load_file(extra)
-
         dep_issues: list = []
         if self.options.scan_dependencies:
             self._progress("Checking dependencies")
@@ -239,6 +237,8 @@ class ScanEngine:
         # Filter + sort.
         min_order = SEVERITY_ORDER.get(_sev_enum(self.options.min_severity or "info"), 99)
         findings = [f for f in findings if SEVERITY_ORDER.get(f.severity, 99) <= min_order]
+        dep_issues = [d for d in dep_issues
+                      if SEVERITY_ORDER.get(d.severity, 99) <= min_order]
         findings.sort(key=lambda f: (exposure_rank(f),
                                      SEVERITY_ORDER.get(f.severity, 99),
                                      f.location.file, f.location.line))

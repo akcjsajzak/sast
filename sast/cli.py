@@ -6,11 +6,11 @@ import os
 import sys
 
 from . import __version__
-from .advisory.db import AdvisoryDB
+from .advisory.db import AdvisoryDB, AdvisoryDBError
 from .advisory.importers import import_feed
 from .engine import ScanEngine, ScanOptions
 from .fetch_feeds import fetch
-from .models import SEVERITY_ORDER, Severity
+from .models import Severity
 from .reporting import render_html, render_json, render_sarif
 
 
@@ -50,8 +50,15 @@ def cmd_scan(args) -> int:
         progress=None if args.quiet else _stderr_progress,
         audit=args.audit,
     )
+    if not os.path.isdir(args.path):
+        print(f"error: not a directory: {args.path}", file=sys.stderr)
+        return 2
     engine = ScanEngine(options)
-    result = engine.scan(args.path)
+    try:
+        result = engine.scan(args.path)
+    except AdvisoryDBError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.ignore_unreachable:
         result.dependency_issues = [
@@ -141,31 +148,27 @@ def print_summary(result, stream=None) -> None:
 def cmd_import_feed(args) -> int:
     db = AdvisoryDB()
     if args.db and os.path.isfile(args.db):
-        db.load_file(args.db)
-    total = 0
+        try:
+            db.load_file(args.db, strict=True)
+        except AdvisoryDBError as exc:
+            # Merging into a database that failed to load would overwrite it
+            # with only the new feeds.
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    failed = 0
     for feed in args.feeds:
         try:
             kind, count = import_feed(feed, db, args.package_map)
             print(f"Imported {count} advisories from {feed} (format: {kind})")
-            total += count
-        except ValueError as e:
-            print(f"error: {e}", file=sys.stderr)
+        except (OSError, ValueError) as e:
+            print(f"error: {feed}: {e}", file=sys.stderr)
+            failed += 1
     out = args.output or args.db or "advisories.json"
     db.export(out)
     print(f"\nWrote {len(db.advisories)} total advisories to {out}")
-    return 0
-
-
-def cmd_package_map(args) -> int:
-    # Helper: inspect a package map file.
-    if not args.map or not os.path.isfile(args.map):
-        print("No package map file provided.", file=sys.stderr)
-        return 1
-    import json
-    with open(args.map, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    print(json.dumps(data, indent=2))
-    return 0
+    # The good feeds are still written, but a script running this must be
+    # able to tell that some were not imported.
+    return 1 if failed else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -181,7 +184,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("-o", "--output", help="Output report file")
     p_scan.add_argument("--format", choices=["html", "json", "sarif"], default="html")
     p_scan.add_argument("--min-severity", default="info",
-                        help=f"Minimum severity to report ({_severity_choices()})")
+                        choices=[s.value for s in Severity],
+                        help="Minimum severity to report, for code findings "
+                             f"and dependencies alike ({_severity_choices()})")
     p_scan.add_argument("--fail-on", default="none",
                         choices=[*(s.value for s in Severity), "none"],
                         help="Exit with status 1 if any finding or vulnerable "

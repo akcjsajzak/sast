@@ -270,12 +270,15 @@ sast scan . --format sarif -o results.sarif --fail-on high
 ```
 
 Anything at or above the threshold — code findings and vulnerable dependencies
-both — makes the command exit 1.
+both — makes the command exit 1. A scan that could not run as asked exits 2
+instead: a path that is not a directory, or an `--advisory-db` that is
+missing or not valid JSON, so a typo cannot pass the gate by quietly
+checking dependencies against less data than intended.
 
 ## Usage reference
 
 ```bash
-# Minimum severity
+# Minimum severity (applies to code findings and dependencies alike)
 sast scan /path/to/project --min-severity high
 
 # Extra advisory databases (repeatable)
