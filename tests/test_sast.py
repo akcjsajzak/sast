@@ -2912,6 +2912,129 @@ class TestBrokenAccessControl(unittest.TestCase):
             [f for f in res.findings if f.rule_id == "authz-missing-check"], [])
 
 
+class TestReportTriage(unittest.TestCase):
+    """Marking findings real / to investigate / false positive.
+
+    The report is where an audit actually happens, so the verdict has to
+    survive: on the server when the page is served, in the browser when the
+    file is opened directly, and across a re-scan either way — which is what
+    the fingerprint is for.
+    """
+
+    def _report(self):
+        res = _scan({"a.py": "import os, flask\n"
+                             "app = flask.Flask(__name__)\n"
+                             "@app.route('/r')\n"
+                             "def r():\n"
+                             "    os.system(flask.request.args.get('cmd'))\n"},
+                    {"requirements.txt": "flask\n"})
+        return res, render_html(res)
+
+    def test_every_card_carries_a_stable_id(self):
+        res, html = self._report()
+        ids = re.findall(r'data-fid="([0-9a-f]{16})"', html)
+        self.assertEqual(len(ids), len(res.findings))
+        self.assertEqual(len(set(ids)), len(ids), "fingerprints must be unique")
+        for f in res.findings:
+            self.assertIn(f.fingerprint(res.root), ids)
+
+    def test_fingerprint_survives_a_line_shift(self):
+        """Inserting code above a finding must not lose its verdict."""
+        from sast.models import Finding, Location, Severity
+        def make(line):
+            return Finding(
+                rule_id="r", title="t", severity=Severity("low"), cwe="",
+                owasp="", category="c", description="", remediation="",
+                confidence="high", framework="raw", language="python",
+                location=Location(file="/root/a.py", line=line, column=1,
+                                  code="  os.system(cmd)  "))
+        self.assertEqual(make(5).fingerprint("/root"),
+                         make(900).fingerprint("/root"))
+
+    def test_triage_controls_and_filters_render(self):
+        _res, html = self._report()
+        for marker in ('data-triage-set="real"',
+                       'data-triage-set="investigate"',
+                       'data-triage-set="false"',
+                       'data-triage-filter="untriaged"',
+                       'id="triage-export"', "/api/triage/"):
+            self.assertIn(marker, html, marker)
+
+    def test_store_round_trip_and_validation(self):
+        from sast.web.store import ScanStore
+        store = ScanStore(tempfile.mkdtemp())
+        scan_id = store.create("path", "demo").id
+        fid = "a1b2c3d4e5f60718"
+        store.set_triage(scan_id, {fid: "real",
+                                   "other": "not-a-verdict",
+                                   "": "real"})
+        self.assertEqual(store.triage(scan_id), {fid: "real"},
+                         "only known verdicts are stored")
+        store.set_triage(scan_id, {fid: "false"})
+        self.assertEqual(store.triage(scan_id)[fid], "false")
+        store.set_triage(scan_id, {fid: ""})
+        self.assertEqual(store.triage(scan_id), {}, "empty clears the verdict")
+
+    def test_store_created_before_triage_existed_still_opens(self):
+        """An existing history.db must not need deleting to upgrade."""
+        import sqlite3
+        from sast.web.store import ScanStore
+        data_dir = tempfile.mkdtemp()
+        probe = ScanStore(data_dir)
+        db_path = probe.db_path
+        del probe
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE IF EXISTS triage")
+        conn.commit()
+        conn.close()
+        reopened = ScanStore(data_dir)
+        scan_id = reopened.create("path", "demo").id
+        reopened.set_triage(scan_id, {"abc": "investigate"})
+        self.assertEqual(reopened.triage(scan_id), {"abc": "investigate"})
+
+
+class TestReportCategoryFilter(unittest.TestCase):
+    """A per-category display filter, everything on by default."""
+
+    def _html(self):
+        res = _scan({"a.py": "import os, flask, hashlib\n"
+                             "app = flask.Flask(__name__)\n"
+                             "@app.route('/r')\n"
+                             "def r():\n"
+                             "    os.system(flask.request.args.get('cmd'))\n"
+                             "    return hashlib.md5(b'x').hexdigest()\n"},
+                    {"requirements.txt": "flask\n"})
+        return res, render_html(res)
+
+    def test_a_chip_per_category_all_enabled(self):
+        res, html = self._html()
+        chips = re.findall(r'data-cat-filter="([^"]+)"', html)
+        categories = {f.category for f in res.findings}
+        if len(categories) < 2:
+            self.skipTest("needs at least two categories to filter between")
+        self.assertEqual(set(chips), categories)
+        # "on" is the default so the first view is the whole report.
+        self.assertEqual(html.count('class="tbtn catchip on"'), len(chips))
+
+    def test_cards_carry_their_category(self):
+        res, html = self._html()
+        on_cards = set(re.findall(r'data-cat="([^"]*)"', html))
+        self.assertTrue({f.category for f in res.findings} <= on_cards)
+
+    def test_bulk_toggles_exist(self):
+        _res, html = self._html()
+        self.assertIn('id="cat-all"', html)
+        self.assertIn('id="cat-none"', html)
+
+    def test_single_category_renders_no_filter_row(self):
+        """One category is not a choice; the row would be clutter."""
+        res = _scan({"a.py": "import os\nos.system(input())\n"})
+        html = render_html(res)
+        if len({f.category for f in res.findings}) > 1:
+            self.skipTest("fixture produced more than one category")
+        self.assertNotIn('id="cat-bar"', html)
+
+
 class TestRuleSetConsistency(unittest.TestCase):
     """Catch rules that cannot fire, whatever they look like in the file.
 

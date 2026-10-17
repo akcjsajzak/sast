@@ -214,6 +214,25 @@ actuators, disabled TLS and committed secrets.
 HTML (a single self-contained file), JSON, and SARIF 2.1.0. SARIF drops
 straight into GitHub code scanning and any other SARIF-aware tool.
 
+The HTML report is built to be worked through rather than just read:
+
+- **Triage.** Mark each finding **real**, **to investigate** or **false
+  positive**, filter to any of those (or to what you have not reviewed yet),
+  and export the verdicts as JSON. A dismissed finding stays on the page,
+  struck through and dimmed, instead of vanishing.
+- **Category filter.** One toggle per rule category — injection, memory
+  safety, access control, misconfiguration and so on — all on by default,
+  with All/None. They are independent toggles, so narrowing to two related
+  categories works, which a single-choice filter cannot do.
+- Severity chips and full-text search, all four filters combining.
+
+Verdicts are keyed on a fingerprint built from the rule, the relative path
+and the text of the offending line — not the line number — so they survive a
+re-scan that shifts code around. Served by `./sast server`, they are stored
+in the scan history and shared between reviewers; opened as a local file,
+they fall back to that browser's storage, and the report says which of the
+two it is doing.
+
 ## Web interface
 
 `sast server` serves a browser UI that scans a local path, an uploaded ZIP, or
@@ -389,5 +408,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-270 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+279 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.
