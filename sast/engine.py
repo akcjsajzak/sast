@@ -26,6 +26,9 @@ from .analysis.js_symbols import build_js_symbols
 from .analysis.lang_profile import PROFILES
 from .analysis.reachability import annotate as annotate_reachability
 from .analysis.reachability import build_import_index, rank as reach_rank
+from .analysis.routes import (bind_entry_points, exposure_rank,
+                              scan_routes)
+from .analysis.requests import build_requests
 from .analysis.secrets import collect_scannable_files, scan_secrets
 from .analysis.symbols import build_symbol_table
 from .detection import (
@@ -93,6 +96,7 @@ class ScanEngine:
         # Dockerfile, which is exactly where cloud exposure lives.
         languages = detect_languages(root)
         findings: list = []
+        routes: list = []
         # Values from the repository's .properties files, read once and handed
         # to the engines that can resolve a configured constant at a call
         # site: a hash or cipher chosen in configuration is invisible to both
@@ -127,11 +131,14 @@ class ScanEngine:
                 f"Scanning {language}: {len(source_files)} file(s), "
                 f"framework {profile.framework}",
             )
-            lang_findings, parsed_count, unreadable = self._analyze(
-                language, profile.framework, rules, source_files,
+            lang_findings, parsed_count, unreadable, lang_routes = self._analyze(
+                language, profile.framework, rules, source_files, root,
             )
-            self._progress(f"{language}: {len(lang_findings)} finding(s)")
+            self._progress(
+                f"{language}: {len(lang_findings)} finding(s), "
+                f"{len(lang_routes)} route(s)")
             findings.extend(lang_findings)
+            routes.extend(lang_routes)
             files_scanned += parsed_count
             if unreadable:
                 skipped["unreadable"] = skipped.get("unreadable", 0) + unreadable
@@ -213,10 +220,21 @@ class ScanEngine:
             index = build_import_index(all_source_files)
             annotate_reachability(dep_issues, index, package_language)
 
+        # Tie each finding to the request that reaches it, then rank by how
+        # exposed that request is. A finding on a route with no guard found
+        # is where an audit starts; one behind an authorisation check needs
+        # credentials before it can even be tried.
+        if routes and findings:
+            self._progress("Resolving entry points")
+            bound = bind_entry_points(findings, routes)
+            self._progress(f"{bound} finding(s) tied to an entry point")
+            build_requests(findings)
+
         # Filter + sort.
         min_order = SEVERITY_ORDER.get(_sev_enum(self.options.min_severity or "info"), 99)
         findings = [f for f in findings if SEVERITY_ORDER.get(f.severity, 99) <= min_order]
-        findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 99),
+        findings.sort(key=lambda f: (exposure_rank(f),
+                                     SEVERITY_ORDER.get(f.severity, 99),
                                      f.location.file, f.location.line))
         # Reachable issues first, then by severity: a called vulnerability in a
         # medium-severity package usually matters more than a critical one in a
@@ -234,6 +252,7 @@ class ScanEngine:
             files_scanned=files_scanned,
             files_skipped=skipped,
             findings=findings,
+            routes=routes,
             dependency_issues=dep_issues,
             advisory_count=len(db.advisories),
             advisory_db_date=db.generated_at,
@@ -241,8 +260,13 @@ class ScanEngine:
         )
 
     # ------------------------------------------------------------------
-    def _analyze(self, language, framework, rules, source_files):
-        """Parse and taint-analyse one language. Returns (findings, parsed, unreadable)."""
+    def _analyze(self, language, framework, rules, source_files, root):
+        """Parse, taint-analyse and map the routes of one language.
+
+        Returns (findings, parsed, unreadable, routes). Route extraction
+        reuses the trees the taint engine just parsed, so the attack surface
+        costs one extra walk rather than a second parse.
+        """
         if language == "php":
             php_files = [f for f in source_files if not f.endswith(".blade.php")]
             blade_files = [f for f in source_files if f.endswith(".blade.php")]
@@ -252,27 +276,30 @@ class ScanEngine:
             findings = engine.analyze(parsed)
             if framework == "Laravel":
                 findings.extend(scan_blade(blade_files))
-            return findings, len(parsed), unreadable
+            return (findings, len(parsed), unreadable,
+                    scan_routes(parsed, language, framework, root))
 
         if language == "java":
             parsed, unreadable = self._parse_all(JavaParser(), source_files)
             symbols = build_java_symbols(parsed)
             engine = JavaTaintEngine(symbols, rules, framework, language,
                                      properties=self._properties)
-            return engine.analyze(parsed), len(parsed), unreadable
+            return (engine.analyze(parsed), len(parsed), unreadable,
+                    scan_routes(parsed, language, framework, root))
 
         if language == "javascript":
             parsed, unreadable = self._parse_all(JsParser(), source_files)
             symbols = build_js_symbols(parsed)
             engine = JsTaintEngine(symbols, rules, framework, language)
-            return engine.analyze(parsed), len(parsed), unreadable
+            return (engine.analyze(parsed), len(parsed), unreadable,
+                    scan_routes(parsed, language, framework, root))
 
         # Python, Go, C#, C and C++ share one engine, configured by profile.
         profile = PROFILES.get(language)
         if profile is not None:
             parser = GenericParser(language)
             if not parser.available:
-                return [], 0, 0
+                return [], 0, 0, []
             parsed, unreadable = self._parse_all(parser, source_files)
             symbols = build_symbols(parsed, profile)
             engine = GenericTaintEngine(profile, rules, framework, language,
@@ -283,9 +310,10 @@ class ScanEngine:
             # wherever its value came from.
             if language in ("c", "cpp"):
                 findings.extend(scan_memory_safety(parsed, language))
-            return findings, len(parsed), unreadable
+            return (findings, len(parsed), unreadable,
+                    scan_routes(parsed, language, framework, root))
 
-        return [], 0, 0
+        return [], 0, 0, []
 
     @staticmethod
     def _parse_all(parser, paths):

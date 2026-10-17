@@ -2632,6 +2632,161 @@ class TestJsResponseSinks(unittest.TestCase):
         self.assertIn("js-cmdi-spawn", rules)
 
 
+
+
+# Route extraction is exercised directly against parsed trees so a test can
+# pin one framework's shape without standing up a whole project layout.
+_ROUTE_PARSERS = {}
+
+
+def _routes_for(path, source, language, framework, root="/app"):
+    from sast.analysis.routes import scan_routes
+    if language == "javascript":
+        from sast.parsing.javascript import JsParser as P
+    elif language == "java":
+        from sast.parsing.java import JavaParser as P
+    elif language == "php":
+        from sast.parsing.php import PhpParser as P
+    else:
+        from sast.parsing.generic import GenericParser
+        parser = _ROUTE_PARSERS.setdefault(language, GenericParser(language))
+        sf = parser.parse(path, source.encode())
+        return scan_routes([sf], language, framework, root)
+    parser = _ROUTE_PARSERS.setdefault(language, P())
+    sf = parser.parse(path, source.encode())
+    return scan_routes([sf], language, framework, root)
+
+
+class TestRouteExtraction(unittest.TestCase):
+    """The attack surface: method, path, handler and any guard, per framework.
+
+    Each case is one framework's own idiom. The guard assertions matter as
+    much as the paths: a route wrongly marked guarded sinks a real finding to
+    the bottom of the report, so the negatives (no guard found) are checked
+    explicitly.
+    """
+
+    def _sig(self, routes):
+        return {r.signature for r in routes}
+
+    def test_flask_decorator(self):
+        routes = _routes_for("/app/v.py",
+            "@app.route('/items/<int:item_id>', methods=['GET','POST'])\n"
+            "def show(item_id):\n    return request.args.get('q')\n",
+            "python", "Flask")
+        self.assertIn("GET /items/<int:item_id>", self._sig(routes))
+        self.assertIn("POST /items/<int:item_id>", self._sig(routes))
+        show = [r for r in routes if r.handler == "show"][0]
+        self.assertIn("item_id", show.params)
+        self.assertTrue(show.open)
+
+    def test_flask_login_required_is_a_guard(self):
+        routes = _routes_for("/app/v.py",
+            "@app.route('/admin')\n@login_required\ndef admin():\n    return 1\n",
+            "python", "Flask")
+        admin = [r for r in routes if r.path == "/admin"][0]
+        self.assertFalse(admin.open)
+        self.assertIn("login_required", admin.guards)
+
+    def test_express_registration_and_chain(self):
+        routes = _routes_for("/app/r.js",
+            "router.get('/public', (req, res) => res.end());\n"
+            "router.post('/u', requireAuth, ctrl.update);\n"
+            "router.route('/upload').post(validateToken, ctrl.post);\n",
+            "javascript", "Express")
+        sig = self._sig(routes)
+        self.assertIn("GET /public", sig)
+        self.assertIn("POST /u", sig)
+        self.assertIn("POST /upload", sig)
+        u = [r for r in routes if r.path == "/u"][0]
+        self.assertIn("requireAuth", u.guards)
+        up = [r for r in routes if r.path == "/upload"][0]
+        self.assertIn("validateToken", up.guards)
+        pub = [r for r in routes if r.path == "/public"][0]
+        self.assertTrue(pub.open)
+
+    def test_spring_class_prefix_joins_method_path(self):
+        routes = _routes_for("/app/C.java",
+            "@RestController\n@RequestMapping(\"/api\")\n"
+            "class C {\n  @GetMapping(\"/users\")\n"
+            "  String list() { return \"x\"; }\n}\n",
+            "java", "Spring")
+        self.assertIn("GET /api/users", self._sig(routes))
+
+    def test_gin_nested_middleware_guard(self):
+        routes = _routes_for("/app/m.go",
+            'func reg(r *gin.Engine){\n'
+            '  r.GET("/x", mw.AuthCheck(handler))\n'
+            '  r.GET("/login", LoginView)\n}\n',
+            "go", "Gin")
+        x = [r for r in routes if r.path == "/x"][0]
+        self.assertIn("mw.AuthCheck", x.guards)
+        login = [r for r in routes if r.path == "/login"][0]
+        self.assertTrue(login.open)
+
+    def test_admin_in_a_handler_name_is_not_a_guard(self):
+        """`controller.adminCreateUser` is the thing protected, not a guard."""
+        routes = _routes_for("/app/r.js",
+            "router.post('/create', controller.adminCreateUser);\n",
+            "javascript", "Express")
+        r = routes[0]
+        self.assertTrue(r.open, r.guards)
+
+    def test_php_file_is_a_route(self):
+        routes = _routes_for("/app/login.php",
+            "<?php $u = $_POST['user']; echo $u; ?>",
+            "php", "raw", root="/app")
+        self.assertTrue(routes)
+        self.assertEqual(routes[0].path, "/login.php")
+        self.assertIn("user", routes[0].params)
+
+
+class TestEntryPointBinding(unittest.TestCase):
+    """A finding carries the route that reaches it, ranked by exposure."""
+
+    def test_finding_binds_to_its_handler_and_gets_a_request(self):
+        res = _scan({"app.py":
+            "import flask\n"
+            "app = flask.Flask(__name__)\n"
+            "@app.route('/run')\n"
+            "def run():\n"
+            "    import os\n"
+            "    cmd = flask.request.args.get('cmd')\n"
+            "    os.system(cmd)\n"
+            "    return 'ok'\n"},
+            {"requirements.txt": "flask\n"})
+        cmdi = [f for f in res.findings if f.entry_point
+                and f.category == "command-injection"]
+        self.assertTrue(cmdi, "command injection should bind to /run")
+        ep = cmdi[0].entry_point
+        self.assertEqual(ep.path, "/run")
+        self.assertTrue(cmdi[0].request.startswith("curl"))
+        self.assertIn("cmd", cmdi[0].request)
+
+    def test_open_routes_rank_before_guarded(self):
+        from sast.analysis.routes import exposure_rank, EXPOSURE_OPEN
+        from sast.analysis.routes import EXPOSURE_GUARDED, EXPOSURE_UNKNOWN
+        self.assertLess(EXPOSURE_OPEN, EXPOSURE_UNKNOWN)
+        self.assertLess(EXPOSURE_UNKNOWN, EXPOSURE_GUARDED)
+
+    def test_request_skeleton_carries_no_payload(self):
+        """The skeleton marks the parameter; it does not ship an exploit."""
+        res = _scan({"app.py":
+            "import flask\n"
+            "app = flask.Flask(__name__)\n"
+            "@app.route('/run')\n"
+            "def run():\n"
+            "    import os\n"
+            "    cmd = flask.request.args.get('cmd')\n"
+            "    os.system(cmd)\n"
+            "    return 'ok'\n"},
+            {"requirements.txt": "flask\n"})
+        reqs = [f.request for f in res.findings if f.request]
+        self.assertTrue(reqs)
+        self.assertTrue(any("<command-injection payload>" in r for r in reqs))
+
+
+
 class TestRuleSetConsistency(unittest.TestCase):
     """Catch rules that cannot fire, whatever they look like in the file.
 

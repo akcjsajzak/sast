@@ -74,6 +74,47 @@ class TaintStep:
 
 
 @dataclass
+class EntryPoint:
+    """The HTTP route that reaches a finding.
+
+    A finding without this says what is wrong. With it, it says what to
+    send: `POST /api/user/update` with a tainted `name` parameter is a test
+    case, where `SQL injection at Foo.java:42` is a reading exercise.
+    """
+    method: str
+    path: str
+    handler: str = ""
+    guards: list = field(default_factory=list)
+    file: str = ""
+    line: int = 0
+
+    @property
+    def guarded(self) -> bool:
+        """True when an authorisation guard was found at the declaration.
+
+        The negative is weaker than it looks: authorisation can live in a
+        filter, a security config or a gateway, none of which is visible
+        here. False means nothing was found, not that nothing exists.
+        """
+        return bool(self.guards)
+
+    @property
+    def signature(self) -> str:
+        return f"{self.method} {self.path}"
+
+    def to_dict(self) -> dict:
+        return {
+            "method": self.method,
+            "path": self.path,
+            "handler": self.handler,
+            "guards": self.guards,
+            "guarded": self.guarded,
+            "file": self.file,
+            "line": self.line,
+        }
+
+
+@dataclass
 class Finding:
     """A single validated security finding."""
     rule_id: str
@@ -91,6 +132,10 @@ class Finding:
     source: Optional[Location] = None  # the taint source location
     trace: list = field(default_factory=list)
     tags: list = field(default_factory=list)
+    # The route that reaches this finding, when one could be established.
+    entry_point: Optional[EntryPoint] = None
+    # A ready-to-send request reproducing the entry point, when one applies.
+    request: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -109,6 +154,8 @@ class Finding:
             "source": self.source.to_dict() if self.source else None,
             "trace": [s.to_dict() for s in self.trace],
             "tags": self.tags,
+            "entry_point": self.entry_point.to_dict() if self.entry_point else None,
+            "request": self.request,
         }
 
 
@@ -163,6 +210,9 @@ class ScanResult:
     frameworks: dict = field(default_factory=dict)
     # Files left out of the scan, keyed by reason ('tests', 'too_large', ...).
     files_skipped: dict = field(default_factory=dict)
+    # Every HTTP entry point found, so a report can state the attack
+    # surface and tie findings to the request that reaches them.
+    routes: list = field(default_factory=list)
     # Offline advisory database provenance.
     advisory_count: int = 0
     advisory_db_date: str = ""

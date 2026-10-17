@@ -107,6 +107,32 @@ surfaces:
 - Division by zero, both the literal case and a divisor an attacker
   controls — one request is enough to crash the process.
 
+### Attack surface
+
+Before the findings, the scanner maps the application's HTTP entry points —
+the first thing an audit builds by hand. It reads the route constructs of the
+detected framework (Spring `@*Mapping` and servlets, Express/Koa/Fastify,
+Flask/FastAPI/Django, Gin/Echo/Gorilla, Laravel/Symfony, ASP.NET including
+WebForms code-behind, and raw PHP files served by path) and reports each as
+method, path, handler and any authorisation guard found in scope.
+
+Two things follow from it:
+
+- **Findings are tied to the request that reaches them.** A finding stops
+  reading "SQL injection at `Foo.java:42`" and becomes `POST /api/user`,
+  parameter `name`, with a `curl` skeleton that targets exactly that input.
+  The skeleton marks the parameter; it does not ship a payload — confirming
+  the bug is the tester's call.
+- **Findings are ranked by exposure.** A bug on a route with no guard found
+  sorts above the same bug behind an authorisation check, ahead of severity,
+  because it is where an unauthenticated audit starts.
+
+On guards the tool states only what it saw: a route with none found is
+reported as "no guard found", never as "unauthenticated". Authorisation can
+live in a servlet filter, a security config, a reverse proxy or a gateway,
+none of which is visible at the route declaration — so absence of a detected
+guard is a lead to check, not a conclusion.
+
 ### Dependencies
 
 `composer.lock`, `pom.xml`/`build.gradle`, and `package-lock.json`/`yarn.lock`/
@@ -300,6 +326,12 @@ The limits are documented rather than hidden:
   smart pointers, so it says nothing about C++ allocation. Covering it needs
   a correct-C++ corpus to measure false positives against first; guessing
   without one is how a checker becomes noise.
+- Route extraction reads static declarations. Routes built by a loop, a
+  factory or a plugin registry are missed, and a handler whose name is
+  defined in several files is left unbound rather than tied to the wrong one
+  — a wrong entry point sends a tester to the wrong request, which is worse
+  than none. A finding with no entry point is ranked between open and
+  guarded, never buried, since a library or a CLI tool has no routes at all.
 
 ### Maybe in the future
 
@@ -322,5 +354,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-252 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+262 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.

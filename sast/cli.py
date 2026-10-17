@@ -118,6 +118,10 @@ def print_summary(result, stream=None) -> None:
     for sev in ("critical", "high", "medium", "low", "info"):
         if stats.get(sev):
             p(f"    {sev:<10} {stats[sev]}")
+    if result.routes:
+        openc = sum(1 for r in result.routes if r.open)
+        p(f"  Attack surface: {len(result.routes)} route(s), "
+          f"{openc} with no guard found")
     p(f"  Dependencies with known vulns: {len(result.dependency_issues)}")
     reach: dict = {}
     for d in result.dependency_issues:

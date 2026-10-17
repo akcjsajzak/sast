@@ -21,6 +21,12 @@ def render_json(result: ScanResult) -> str:
             "generated_at": result.advisory_db_date,
         },
         "summary": result.stats(),
+        "attack_surface": {
+            "total": len(result.routes),
+            "open": sum(1 for r in result.routes if r.open),
+            "guarded": sum(1 for r in result.routes if not r.open),
+            "routes": [r.to_dict() for r in result.routes],
+        },
         "findings": [f.to_dict() for f in result.findings],
         "dependency_issues": [d.to_dict() for d in result.dependency_issues],
     }

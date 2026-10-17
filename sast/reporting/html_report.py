@@ -135,11 +135,45 @@ def render_html(result: ScanResult) -> str:
         title=f"SAST Report — {_esc(os.path.basename(root.rstrip('/')) or root)}",
         meta_items=meta_items,
         summary=summary,
+        surface=_surface_section(result.routes, root),
         total=total_cards,
         finding_count=len(findings),
         dep_count=len(deps),
         rows=finding_rows,
         dep_rows=dep_rows,
+    )
+
+
+def _surface_section(routes: list, root: str) -> str:
+    """The attack-surface inventory: the target list, with findings aside.
+
+    Collapsed by default so it never buries the findings, but present on
+    every scan that found routes because on an unfamiliar app it is the first
+    thing an auditor builds by hand.
+    """
+    if not routes:
+        return ""
+    openc = sum(1 for r in routes if r.open)
+    rows = []
+    for r in sorted(routes, key=lambda r: (r.open is False, r.path, r.method)):
+        guard = (f'<span class="ep-guard ep-guarded">'
+                 f'{_esc(", ".join(r.guards))}</span>' if r.guards
+                 else '<span class="ep-guard ep-open">no guard found</span>')
+        handler = _esc(r.handler) if r.handler else ""
+        rows.append(
+            f'<tr><td class="mono"><span class="ep-method">{_esc(r.method)}</span></td>'
+            f'<td class="mono">{_esc(r.path)}</td>'
+            f'<td class="mono rt-h">{handler}</td>'
+            f'<td>{guard}</td>'
+            f'<td class="mono rt-f">{_rel(root, r.file)}:{_esc(r.line)}</td></tr>'
+        )
+    return (
+        '<details class="surface"><summary>Attack surface '
+        f'<span class="n">{len(routes)}</span> '
+        f'<span class="surface-sub">{openc} with no guard found</span></summary>'
+        '<table class="rt"><thead><tr><th>Method</th><th>Path</th>'
+        '<th>Handler</th><th>Guard</th><th>Declared</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table></details>'
     )
 
 
@@ -185,6 +219,8 @@ def _finding_card(i: int, f, root: str) -> str:
             f'<div class="rem-b">{_esc(f.remediation)}</div></div>'
         )
 
+    entry = _entry_point_line(f)
+    request = _request_block(f)
     trace = _trace_timeline(f, root)
 
     return f"""
@@ -198,16 +234,47 @@ def _finding_card(i: int, f, root: str) -> str:
           </div>
           <h3 class="title">{_esc(f.title)}</h3>
           <div class="sink mono"><span class="lbl">Sink</span>{sink_loc}</div>
+          {entry}
           <div class="chips">{chips}</div>
         </header>
         <div class="fb">
           <p class="desc">{_esc(f.description)}</p>
+          {request}
           {remediation}
           {tags}
           {trace}
         </div>
       </div>
     </article>"""
+
+
+def _entry_point_line(f) -> str:
+    """The route reaching a finding, and whether a guard was found on it."""
+    entry = getattr(f, "entry_point", None)
+    if entry is None:
+        return ""
+    if entry.guards:
+        badge = (f'<span class="ep-guard ep-guarded">guarded · '
+                 f'{_esc(", ".join(entry.guards))}</span>')
+    else:
+        badge = '<span class="ep-guard ep-open">no guard found</span>'
+    handler = f' → {_esc(entry.handler)}' if entry.handler else ""
+    return (
+        '<div class="entry mono"><span class="lbl">Entry</span>'
+        f'<span class="ep-method">{_esc(entry.method)}</span> '
+        f'{_esc(entry.path)}{handler} {badge}</div>'
+    )
+
+
+def _request_block(f) -> str:
+    """The reproduction request skeleton, when one applies."""
+    request = getattr(f, "request", "")
+    if not request:
+        return ""
+    return (
+        '<div class="req"><span class="lbl">Reproduce</span>'
+        f'<pre class="req-b mono">{_esc(request)}</pre></div>'
+    )
 
 
 def _trace_timeline(f, root: str) -> str:
@@ -455,6 +522,30 @@ h2.sec .n {{
 .rem .lbl {{ color:var(--rem-fg); }}
 .rem-b {{ color:var(--rem-fg); font-size:13px; margin-top:3px; }}
 
+.entry {{ font-size:12.5px; color:var(--muted-2); margin-bottom:9px;
+  word-break:break-all; display:flex; align-items:center; flex-wrap:wrap; gap:6px; }}
+.ep-method {{ font-weight:700; color:var(--chip-v); }}
+.ep-guard {{ font-size:10.5px; font-weight:650; padding:1px 7px; border-radius:6px;
+  text-transform:uppercase; letter-spacing:.03em; }}
+.ep-open {{ background:rgba(239,68,68,.14); color:#ef4444; }}
+.ep-guarded {{ background:rgba(100,116,139,.16); color:var(--muted-2); }}
+.req {{ background:var(--chip-bg); border:1px solid var(--border); border-radius:7px;
+  padding:9px 13px; margin:10px 0; }}
+.req-b {{ margin:4px 0 0; font-size:12px; color:var(--chip-v); white-space:pre-wrap;
+  word-break:break-all; }}
+
+.surface {{ background:var(--card); border:1px solid var(--border); border-radius:10px;
+  margin:0 0 18px; padding:4px 6px; }}
+.surface > summary {{ cursor:pointer; padding:10px 12px; font-weight:650;
+  font-size:14px; color:var(--fg); }}
+.surface-sub {{ font-weight:500; font-size:12px; color:var(--muted-2); margin-left:6px; }}
+.rt {{ width:100%; border-collapse:collapse; font-size:12px; margin:4px 0 8px; }}
+.rt th {{ text-align:left; padding:6px 10px; color:var(--muted-2); font-size:10.5px;
+  text-transform:uppercase; letter-spacing:.03em; border-bottom:1px solid var(--border); }}
+.rt td {{ padding:5px 10px; border-bottom:1px solid var(--border); vertical-align:top; }}
+.rt-h {{ color:var(--muted-2); }}
+.rt-f {{ color:var(--muted-2); font-size:11px; word-break:break-all; }}
+
 .reach {{
   display:flex; align-items:baseline; gap:9px; flex-wrap:wrap;
   margin:2px 0 11px; font-size:12.5px;
@@ -553,6 +644,7 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
 <div class="summary">{summary}</div>
 
 <main>
+  {surface}
   <h2 class="sec">Code Findings <span class="n">{finding_count}</span></h2>
   <div id="list">{rows}</div>
 
