@@ -2219,6 +2219,83 @@ class TestConfiguredCrypto(unittest.TestCase):
         self.assertNotIn("java-crypto-weak-hash-algorithm", rules)
 
 
+class TestMemorySafety(unittest.TestCase):
+    """Use-after-free and double-free in C.
+
+    These are the dominant C vulnerability class and no taint path reaches
+    them: the bug exists wherever the values came from. The negative cases
+    matter as much as the positive ones — flagging `free(p); p = NULL;`, the
+    recommended idiom, would make the checker unusable.
+    """
+
+    def _rules(self, body):
+        return {f.rule_id for f in
+                _scan({"m.c": "#include <stdlib.h>\n#include <stdio.h>\n"
+                              + body}).findings}
+
+    def test_correct_code_is_silent(self):
+        cases = {
+            "NULL after free":
+                "void f(void) { char *p = malloc(10); free(p); p = NULL;"
+                " if (p) free(p); }",
+            "reallocated between frees":
+                "void f(void) { char *p = malloc(10); free(p);"
+                " p = malloc(10); free(p); }",
+            "either-or frees":
+                "void f(int c) { char *p = malloc(10); char *q = malloc(10);"
+                " if (c) free(p); else free(q); }",
+            "ownership returned":
+                "char *f(void) { char *p = malloc(10); return p; }",
+            "freed once at the end":
+                "void f(void) { char *p = malloc(10); p[0] = 'a'; free(p); }",
+            "NULL store under a label":
+                "void f(char *p) { goto done; done: if (p) { free(p);"
+                " p = NULL; } }",
+        }
+        for label, body in cases.items():
+            found = {r for r in self._rules(body) if "free" in r}
+            self.assertEqual(found, set(), label)
+
+    def test_bugs_are_found(self):
+        cases = {
+            "double free":
+                ("void f(void) { char *p = malloc(10); free(p); free(p); }",
+                 "c-double-free"),
+            "use after free":
+                ("void f(void) { char *p = malloc(10); free(p);"
+                 ' printf("%c", p[0]); }',
+                 "c-use-after-free"),
+            "write through an alias":
+                ("void f(void) { char *p = malloc(10); char *q = p;"
+                 " free(p); q[0] = 'x'; }",
+                 "c-use-after-free"),
+            "freed parameter then used":
+                ("void f(char *p) { free(p); p[0] = 'z'; }",
+                 "c-use-after-free"),
+            "realloc frees the old pointer":
+                ("void f(void) { char *p = malloc(10);"
+                 " char *n = realloc(p, 20); p[0] = 'a'; free(n); }",
+                 "c-use-after-free"),
+        }
+        for label, (body, rule_id) in cases.items():
+            self.assertIn(rule_id, self._rules(body), label)
+
+    def test_conditional_free_is_reported_as_conditional(self):
+        """Freed on one path only: real, but not certain."""
+        rules = self._rules(
+            "void f(int c) { char *p = malloc(10); if (c) free(p);"
+            " p[0] = 'b'; }")
+        self.assertIn("c-use-after-free-conditional", rules)
+        self.assertNotIn("c-use-after-free", rules)
+
+    def test_goto_disables_the_function(self):
+        """A goto reorders execution, so the linear walk cannot judge it."""
+        rules = self._rules(
+            "void f(int c) { char *p = malloc(10); if (c) goto skip;"
+            " free(p); skip: free(p); }")
+        self.assertEqual({r for r in rules if "free" in r}, set())
+
+
 class TestFindingDeduplication(unittest.TestCase):
     def test_one_finding_per_rule_and_location(self):
         """A sink reached from several sources is still one line to fix."""

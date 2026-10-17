@@ -17,6 +17,7 @@ from .analysis.dataflow import TaintEngine
 from .analysis.templates import collect_template_files, scan_templates
 from .analysis.java_dataflow import JavaTaintEngine
 from .analysis.java_symbols import build_java_symbols
+from .analysis.memory_safety import scan_memory_safety
 from .analysis.generic_dataflow import GenericTaintEngine, build_symbols
 from .analysis.iac import collect_iac_files, scan_iac
 from .analysis.js_dataflow import JsTaintEngine
@@ -258,7 +259,13 @@ class ScanEngine:
             symbols = build_symbols(parsed, profile)
             engine = GenericTaintEngine(profile, rules, framework, language,
                                         symbols)
-            return engine.analyze(parsed), len(parsed), unreadable
+            findings = engine.analyze(parsed)
+            # C and C++ carry a vulnerability class the taint engines cannot
+            # express: a pointer freed and then used, or freed twice, is a bug
+            # wherever its value came from.
+            if language in ("c", "cpp"):
+                findings.extend(scan_memory_safety(parsed, language))
+            return findings, len(parsed), unreadable
 
         return [], 0, 0
 
