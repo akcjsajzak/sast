@@ -1,24 +1,27 @@
-"""Self-contained HTML report rendering."""
+"""Self-contained HTML report rendering.
+
+The report is a single static HTML file with inline CSS/JS (no external
+resources — the tool runs fully offline). It supports light and dark colour
+schemes, severity filtering, full-text search, and renders each finding's
+source-to-sink trace as a readable vertical timeline.
+"""
 from __future__ import annotations
 
 import html
+import os
 from datetime import datetime
 
-from ..models import OWASP_2021, ScanResult
+from ..models import ScanResult
 
+_SEV_ORDER = ("critical", "high", "medium", "low", "info")
+
+# Accent colour per severity (used for badges, card accents, stat cards).
 _SEV_COLOR = {
-    "critical": "#b91c1c",
-    "high": "#dc2626",
+    "critical": "#dc2626",
+    "high": "#ea580c",
     "medium": "#d97706",
     "low": "#2563eb",
     "info": "#64748b",
-}
-_SEV_BG = {
-    "critical": "#fee2e2",
-    "high": "#fef2f2",
-    "medium": "#fef3c7",
-    "low": "#dbeafe",
-    "info": "#f1f5f9",
 }
 
 
@@ -27,134 +30,238 @@ def _esc(s) -> str:
 
 
 def _badge(severity: str) -> str:
-    sev = severity.lower()
+    sev = (severity or "info").lower()
+    return f'<span class="sev sev-{_esc(sev)}">{_esc(sev.upper())}</span>'
+
+
+def _rel(root: str, path: str) -> str:
+    """Shorten an absolute file path relative to the scan root for display."""
+    if not path:
+        return ""
+    try:
+        rel = os.path.relpath(path, root)
+    except ValueError:
+        return path
+    # Don't climb out of the root with ../../ noise — fall back to the full path.
+    return rel if not rel.startswith("..") else path
+
+
+def _chip(label: str, value) -> str:
+    value = _esc(value)
+    if not value:
+        return ""
     return (
-        f'<span class="sev" style="background:{_SEV_BG.get(sev, "#f1f5f9")};'
-        f'color:{_SEV_COLOR.get(sev, "#64748b")}">{_esc(severity.upper())}</span>'
+        f'<span class="chip"><span class="chip-k">{_esc(label)}</span>'
+        f'<span class="chip-v">{value}</span></span>'
     )
 
 
+def _code(text: str) -> str:
+    return f'<pre class="code">{_esc(text)}</pre>'
+
+
+# ---------------------------------------------------------------------------
+# Top-level
+# ---------------------------------------------------------------------------
 def render_html(result: ScanResult) -> str:
-    stats = result.stats()
+    root = result.root
     findings = result.findings
     deps = result.dependency_issues
+    stats = result.stats()
 
-    total = len(findings)
-    rows = []
-    for i, f in enumerate(findings):
-        rows.append(_finding_card(i, f))
-
-    dep_rows = []
+    # Combined severity counts (findings + dependency issues) drive the filter
+    # chips and the "showing N of M" counter.
+    combined: dict[str, int] = {s: 0 for s in _SEV_ORDER}
+    for f in findings:
+        combined[f.severity.value] = combined.get(f.severity.value, 0) + 1
     for d in deps:
-        dep_rows.append(_dep_card(d))
+        combined[d.severity.value] = combined.get(d.severity.value, 0) + 1
+    total_cards = len(findings) + len(deps)
 
-    rows_html = "\n".join(rows) if rows else '<div class="empty">No findings.</div>'
-    dep_rows_html = "\n".join(dep_rows) if dep_rows else '<div class="empty">No known vulnerable dependencies.</div>'
+    finding_rows = "\n".join(_finding_card(i, f, root) for i, f in enumerate(findings))
+    if not findings:
+        finding_rows = '<div class="empty">No code findings. 🎉</div>'
 
-    summary = "".join(
-        f'<div class="stat" style="border-left-color:{_SEV_COLOR.get(k, "#64748b")}">'
-        f'<div class="n" style="color:{_SEV_COLOR.get(k, "#64748b")}">{v}</div>'
-        f'<div class="l">{_esc(k)}</div></div>'
-        for k, v in stats.items()
-    )
+    dep_rows = "\n".join(_dep_card(i, d) for i, d in enumerate(deps))
+    if not deps:
+        dep_rows = '<div class="empty">No known vulnerable dependencies.</div>'
+
+    # Summary / filter chips. Each is clickable and filters the list.
+    summary_cards = [_stat_card("all", "All", total_cards, active=True)]
+    for sev in _SEV_ORDER:
+        summary_cards.append(_stat_card(sev, sev, combined[sev]))
+    summary = "".join(summary_cards)
 
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    meta_items = "".join(
+        f'<div class="hmeta"><span class="hk">{_esc(k)}</span>'
+        f'<span class="hv">{_esc(v)}</span></div>'
+        for k, v in (
+            ("Project", root),
+            ("Language", result.language.upper()),
+            ("Framework", result.framework),
+            ("Files scanned", result.files_scanned),
+            ("Duration", f"{result.duration_seconds}s"),
+            ("Generated", generated),
+        )
+    )
+
     return _PAGE.format(
-        title=f"SAST Report — {_esc(result.root)}",
-        generated=generated,
-        root=_esc(result.root),
-        language=_esc(result.language.upper()),
-        framework=_esc(result.framework),
-        files=_esc(result.files_scanned),
-        duration=_esc(result.duration_seconds),
-        total=total,
+        title=f"SAST Report — {_esc(os.path.basename(root.rstrip('/')) or root)}",
+        meta_items=meta_items,
         summary=summary,
-        rows=rows_html,
-        dep_rows=dep_rows_html,
+        total=total_cards,
+        finding_count=len(findings),
         dep_count=len(deps),
+        rows=finding_rows,
+        dep_rows=dep_rows,
     )
 
 
-def _finding_card(i: int, f) -> str:
-    trace_rows = []
-    for step in f.trace:
+def _stat_card(key: str, label: str, count: int, active: bool = False) -> str:
+    color = _SEV_COLOR.get(key, "#64748b") if key != "all" else "#0ea5e9"
+    cls = "stat" + (" on" if active else "")
+    return (
+        f'<button class="{cls}" data-filter="{_esc(key)}" '
+        f'style="--accent:{color}">'
+        f'<span class="stat-n">{count}</span>'
+        f'<span class="stat-l">{_esc(label)}</span></button>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Finding card
+# ---------------------------------------------------------------------------
+def _finding_card(i: int, f, root: str) -> str:
+    sink_loc = f"{_rel(root, f.location.file)}:{_esc(f.location.line)}"
+
+    chips = "".join(
+        c for c in (
+            _chip("Rule", f.rule_id),
+            _chip("CWE", f.cwe),
+            _chip("OWASP", f.owasp),
+            _chip("Confidence", f.confidence),
+            _chip("Framework", f.framework),
+        ) if c
+    )
+
+    tags = ""
+    if f.tags:
+        tags = (
+            '<div class="tags"><span class="lbl">Tags</span>'
+            + "".join(f'<span class="tag">{_esc(t)}</span>' for t in f.tags)
+            + "</div>"
+        )
+
+    remediation = ""
+    if f.remediation:
+        remediation = (
+            '<div class="rem"><span class="lbl">Remediation</span>'
+            f'<div class="rem-b">{_esc(f.remediation)}</div></div>'
+        )
+
+    trace = _trace_timeline(f, root)
+
+    return f"""
+    <article class="finding" data-sev="{_esc(f.severity.value)}">
+      <div class="accent sev-bar-{_esc(f.severity.value)}"></div>
+      <div class="finding-main">
+        <header class="fh">
+          <div class="fh-top">
+            {_badge(f.severity.value)}
+            <span class="cat">{_esc(f.category)}</span>
+          </div>
+          <h3 class="title">{_esc(f.title)}</h3>
+          <div class="sink mono"><span class="lbl">Sink</span>{sink_loc}</div>
+          <div class="chips">{chips}</div>
+        </header>
+        <div class="fb">
+          <p class="desc">{_esc(f.description)}</p>
+          {remediation}
+          {tags}
+          {trace}
+        </div>
+      </div>
+    </article>"""
+
+
+def _trace_timeline(f, root: str) -> str:
+    steps = f.trace
+    if not steps:
+        return ""
+    items = []
+    n = len(steps)
+    for idx, step in enumerate(steps):
         loc = step.location
-        trace_rows.append(
-            "<tr>"
-            f'<td class="mono loc"><a href="#f{i}">{_esc(loc.file)}:{_esc(loc.line)}</a></td>'
-            f"<td>{_esc(step.description)}</td>"
-            f'<td class="code">{_esc(step.code)}</td>'
-            "</tr>"
+        if idx == 0:
+            kind, tag = "src", '<span class="step-tag st-src">SOURCE</span>'
+        elif idx == n - 1:
+            kind, tag = "sink", '<span class="step-tag st-sink">SINK</span>'
+        else:
+            kind, tag = "hop", ""
+        loc_str = f"{_rel(root, loc.file)}:{_esc(loc.line)}" if loc and loc.file else ""
+        code = _code(step.code) if step.code else ""
+        items.append(
+            f'<li class="step step-{kind}">'
+            f'<span class="dot">{idx + 1}</span>'
+            f'<div class="step-body">'
+            f'<div class="step-desc">{tag}{_esc(step.description)}</div>'
+            f'{f"<div class=\'step-loc mono\'>{loc_str}</div>" if loc_str else ""}'
+            f'{code}'
+            f'</div></li>'
         )
-
-    source_ln = f.source.line if f.source else ""
-    source_file = f.source.file if f.source else ""
-    source_html = ""
-    if f.source:
-        source_html = (
-            '<div class="src">'
-            f'<span class="lbl">Source</span> '
-            f'<span class="mono">{_esc(source_file)}:{_esc(source_ln)}</span>'
-            f'<div class="code">{_esc(f.source.code)}</div></div>'
-        )
-
-    tags = " ".join(f'<span class="tag">{_esc(t)}</span>' for t in f.tags)
-
-    return f"""
-    <div class="finding" id="f{i}" data-sev="{_esc(f.severity.value)}" data-cat="{_esc(f.category)}">
-      <div class="fh">
-        {_badge(f.severity.value)}
-        <div class="ft">
-          <div class="title">{_esc(f.title)}</div>
-          <div class="meta mono">
-            {_esc(f.rule_id)} ·
-            {_esc(f.location.file)}:{_esc(f.location.line)} ·
-            {_esc(f.cwe)} · {_esc(f.owasp)} ·
-            confidence: {_esc(f.confidence)} · framework: {_esc(f.framework)}
-          </div>
-        </div>
-        <div class="cat">{_esc(f.category)}</div>
-      </div>
-      <div class="fb">
-        <div class="desc">{_esc(f.description)}</div>
-        {source_html}
-        <div class="rem"><span class="lbl">Remediation</span> {_esc(f.remediation)}</div>
-        {tags}
-        <details class="trace">
-          <summary>Source-to-sink trace ({len(f.trace)} steps)</summary>
-          <table class="tt">
-            <thead><tr><th>Location</th><th>Step</th><th>Code</th></tr></thead>
-            <tbody>{''.join(trace_rows)}</tbody>
-          </table>
-        </details>
-      </div>
-    </div>"""
-
-
-def _dep_card(d) -> str:
-    refs = "".join(
-        f'<li><a href="{_esc(r)}" rel="noreferrer">{_esc(r)}</a></li>' for r in d.references
+    return (
+        '<details class="trace" open>'
+        f'<summary>Data-flow trace · {n} step{"s" if n != 1 else ""} '
+        '<span class="hint">(source → sink)</span></summary>'
+        f'<ol class="timeline">{"".join(items)}</ol>'
+        '</details>'
     )
+
+
+# ---------------------------------------------------------------------------
+# Dependency card
+# ---------------------------------------------------------------------------
+def _dep_card(i: int, d) -> str:
+    chips = "".join(
+        c for c in (
+            _chip("Package", f"{d.package} @ {d.version}"),
+            _chip("CVE", d.cve),
+            _chip("CWE", d.cwe),
+            _chip("Fixed in", d.fixed_in),
+        ) if c
+    )
+    refs = ""
+    if d.references:
+        items = "".join(
+            f'<li><a href="{_esc(r)}" rel="noreferrer noopener" target="_blank">{_esc(r)}</a></li>'
+            for r in d.references
+        )
+        refs = f'<div class="refs"><span class="lbl">References</span><ul>{items}</ul></div>'
+
     return f"""
-    <div class="finding dep" data-sev="{_esc(d.severity.value)}" data-cat="dependency">
-      <div class="fh">
-        {_badge(d.severity.value)}
-        <div class="ft">
-          <div class="title">{_esc(d.title)}</div>
-          <div class="meta mono">
-            {_esc(d.package)} @ {_esc(d.version)} · {_esc(d.cve)} · {_esc(d.cwe)}
-            · fixed in {_esc(d.fixed_in)}
+    <article class="finding" data-sev="{_esc(d.severity.value)}">
+      <div class="accent sev-bar-{_esc(d.severity.value)}"></div>
+      <div class="finding-main">
+        <header class="fh">
+          <div class="fh-top">
+            {_badge(d.severity.value)}
+            <span class="cat">dependency</span>
           </div>
+          <h3 class="title">{_esc(d.title or d.package)}</h3>
+          <div class="chips">{chips}</div>
+        </header>
+        <div class="fb">
+          <p class="desc">{_esc(d.description)}</p>
+          {refs}
         </div>
-        <div class="cat">dependency</div>
       </div>
-      <div class="fb">
-        <div class="desc">{_esc(d.description)}</div>
-        {f'<ul class="refs">{refs}</ul>' if refs else ''}
-      </div>
-    </div>"""
+    </article>"""
 
 
+# ---------------------------------------------------------------------------
+# Page shell
+# ---------------------------------------------------------------------------
 _PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -162,96 +269,292 @@ _PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-:root {{ color-scheme: light; }}
-* {{ box-sizing: border-box; }}
-body {{ margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background:#f8fafc; color:#0f172a; }}
-header {{ background:#0f172a; color:#e2e8f0; padding:20px 28px; }}
-header h1 {{ margin:0 0 6px; font-size:20px; font-weight:600; color:#fff; }}
-header .sub {{ color:#94a3b8; font-size:13px; }}
-header .sub b {{ color:#cbd5e1; font-weight:600; }}
-.toolbar {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; padding:14px 28px; background:#fff; border-bottom:1px solid #e2e8f0; position:sticky; top:0; }}
-.toolbar input {{ padding:8px 12px; border:1px solid #cbd5e1; border-radius:8px; font-size:13px; min-width:220px; }}
-.btn {{ padding:8px 12px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; cursor:pointer; font-size:13px; }}
-.btn.on {{ background:#0f172a; color:#fff; border-color:#0f172a; }}
-.summary {{ display:flex; gap:14px; flex-wrap:wrap; padding:16px 28px; }}
-.stat {{ background:#fff; border:1px solid #e2e8f0; border-left:4px solid #64748b; border-radius:10px; padding:10px 18px; min-width:90px; }}
-.stat .n {{ font-size:26px; font-weight:700; }}
-.stat .l {{ font-size:12px; color:#64748b; text-transform:uppercase; letter-spacing:.03em; }}
-.container {{ padding:0 28px 60px; max-width:1180px; }}
-.finding {{ background:#fff; border:1px solid #e2e8f0; border-radius:12px; margin:14px 0; overflow:hidden; }}
-.fh {{ display:flex; align-items:flex-start; gap:12px; padding:14px 18px; }}
-.sev {{ font-size:11px; font-weight:700; padding:3px 9px; border-radius:999px; white-space:nowrap; }}
-.ft {{ flex:1; }}
-.title {{ font-size:15px; font-weight:600; line-height:1.3; }}
-.meta {{ font-size:12px; color:#64748b; margin-top:3px; }}
-.cat {{ font-size:12px; color:#475569; background:#f1f5f9; padding:4px 10px; border-radius:999px; white-space:nowrap; }}
-.fb {{ padding:0 18px 16px; }}
-.desc {{ font-size:13.5px; color:#334155; margin:4px 0 10px; }}
-.src {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px 12px; margin:8px 0; }}
-.lbl {{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; color:#64748b; }}
-.rem {{ font-size:13px; color:#0f766e; background:#f0fdfa; border-left:3px solid #14b8a6; padding:8px 12px; border-radius:6px; margin:8px 0; }}
-.tag {{ display:inline-block; font-size:11px; background:#eef2ff; color:#4338ca; padding:2px 8px; border-radius:999px; margin:2px 4px 0 0; }}
-.mono, .code {{ font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace; }}
-.code {{ font-size:12px; color:#1e293b; background:#0f172a; color:#e2e8f0; padding:6px 9px; border-radius:6px; overflow-x:auto; white-space:pre; }}
-details.trace {{ margin-top:10px; }}
-details.trace summary {{ cursor:pointer; font-size:13px; font-weight:600; color:#334155; }}
-table.tt {{ width:100%; border-collapse:collapse; margin-top:8px; font-size:12.5px; }}
-table.tt th {{ text-align:left; background:#f1f5f9; padding:7px 9px; border:1px solid #e2e8f0; color:#475569; }}
-table.tt td {{ padding:7px 9px; border:1px solid #e2e8f0; vertical-align:top; }}
-table.tt td.loc {{ white-space:nowrap; }}
-table.tt td.code {{ color:#e2e8f0; }}
-.refs {{ margin:8px 0 0; padding-left:18px; font-size:12.5px; }}
-.refs a {{ color:#2563eb; }}
-.empty {{ text-align:center; color:#64748b; padding:40px; }}
-h2.sec {{ font-size:16px; font-weight:600; margin:28px 0 4px; }}
+:root {{
+  --bg:#f1f5f9; --panel:#ffffff; --panel-2:#f8fafc; --border:#e2e8f0;
+  --text:#0f172a; --muted:#64748b; --muted-2:#475569;
+  --code-bg:#0f172a; --code-fg:#e2e8f0; --code-border:#1e293b;
+  --link:#2563eb; --accent:#0ea5e9;
+  --rem-bg:#f0fdfa; --rem-fg:#0f766e; --rem-bar:#14b8a6;
+  --chip-bg:#f1f5f9; --chip-k:#64748b; --chip-v:#334155;
+  --shadow:0 1px 2px rgba(15,23,42,.06), 0 1px 3px rgba(15,23,42,.08);
+}}
+@media (prefers-color-scheme: dark) {{
+  :root:not([data-theme="light"]) {{
+    --bg:#0b1120; --panel:#111827; --panel-2:#0f172a; --border:#1f2937;
+    --text:#e5e7eb; --muted:#94a3b8; --muted-2:#cbd5e1;
+    --code-bg:#020617; --code-fg:#e2e8f0; --code-border:#1e293b;
+    --link:#60a5fa; --accent:#38bdf8;
+    --rem-bg:#042f2e; --rem-fg:#5eead4; --rem-bar:#14b8a6;
+    --chip-bg:#1e293b; --chip-k:#94a3b8; --chip-v:#cbd5e1;
+    --shadow:0 1px 2px rgba(0,0,0,.4);
+  }}
+}}
+:root[data-theme="dark"] {{
+  --bg:#0b1120; --panel:#111827; --panel-2:#0f172a; --border:#1f2937;
+  --text:#e5e7eb; --muted:#94a3b8; --muted-2:#cbd5e1;
+  --code-bg:#020617; --code-fg:#e2e8f0; --code-border:#1e293b;
+  --link:#60a5fa; --accent:#38bdf8;
+  --rem-bg:#042f2e; --rem-fg:#5eead4; --rem-bar:#14b8a6;
+  --chip-bg:#1e293b; --chip-k:#94a3b8; --chip-v:#cbd5e1;
+  --shadow:0 1px 2px rgba(0,0,0,.4);
+}}
+
+/* Severity accents — shared by badges and card bars. */
+.sev-critical,.sev-bar-critical {{ --sv:#dc2626; }}
+.sev-high,.sev-bar-high         {{ --sv:#ea580c; }}
+.sev-medium,.sev-bar-medium     {{ --sv:#d97706; }}
+.sev-low,.sev-bar-low           {{ --sv:#2563eb; }}
+.sev-info,.sev-bar-info         {{ --sv:#64748b; }}
+
+* {{ box-sizing:border-box; }}
+html {{ scroll-behavior:smooth; }}
+body {{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  font-size:14px; line-height:1.5;
+}}
+a {{ color:var(--link); }}
+.mono {{ font-family:"SFMono-Regular",ui-monospace,Menlo,Consolas,"Liberation Mono",monospace; }}
+.lbl {{
+  display:inline-block; font-size:10.5px; font-weight:700; text-transform:uppercase;
+  letter-spacing:.05em; color:var(--muted); margin-right:8px;
+}}
+
+/* Header */
+header.page {{
+  background:linear-gradient(135deg,#0f172a,#1e293b); color:#e2e8f0;
+  padding:22px 16px;
+}}
+header.page .wrap {{ max-width:1100px; margin:0 auto; }}
+header.page h1 {{ margin:0 0 14px; font-size:20px; font-weight:650; color:#fff; letter-spacing:-.01em; }}
+.hmeta-grid {{ display:flex; flex-wrap:wrap; gap:10px 26px; }}
+.hmeta {{ display:flex; flex-direction:column; gap:2px; min-width:0; }}
+.hmeta .hk {{ font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:#94a3b8; }}
+.hmeta .hv {{ font-size:13px; color:#e2e8f0; font-weight:550; word-break:break-word; }}
+
+/* Toolbar */
+.toolbar {{
+  position:sticky; top:0; z-index:20; background:var(--panel);
+  border-bottom:1px solid var(--border); box-shadow:var(--shadow);
+  padding:12px 16px;
+}}
+.toolbar .wrap {{
+  max-width:1100px; margin:0 auto; display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+}}
+#q {{
+  flex:1 1 240px; min-width:0; padding:9px 13px; border:1px solid var(--border);
+  border-radius:9px; font-size:13.5px; background:var(--panel-2); color:var(--text);
+}}
+#q:focus {{ outline:2px solid var(--accent); outline-offset:-1px; }}
+#count {{ font-size:12.5px; color:var(--muted); white-space:nowrap; }}
+#theme {{
+  padding:9px 12px; border:1px solid var(--border); border-radius:9px; cursor:pointer;
+  background:var(--panel-2); color:var(--text); font-size:13px;
+}}
+
+/* Summary / filter chips */
+.summary {{ max-width:1100px; margin:0 auto; padding:18px 16px 4px; display:flex; gap:10px; flex-wrap:wrap; }}
+.stat {{
+  flex:1 1 120px; min-width:104px; text-align:left; cursor:pointer;
+  background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--accent);
+  border-radius:11px; padding:11px 14px; box-shadow:var(--shadow); color:var(--text);
+  display:flex; flex-direction:column; gap:1px; transition:transform .08s ease, box-shadow .12s ease;
+  font:inherit;
+}}
+.stat:hover {{ transform:translateY(-1px); }}
+.stat.on {{ outline:2px solid var(--accent); outline-offset:0; }}
+.stat .stat-n {{ font-size:25px; font-weight:750; color:var(--accent); line-height:1.1; }}
+.stat .stat-l {{ font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }}
+
+/* Layout */
+main {{ max-width:1100px; margin:0 auto; padding:10px 16px 72px; }}
+h2.sec {{
+  font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--muted); margin:28px 0 10px; display:flex; align-items:center; gap:8px;
+}}
+h2.sec .n {{
+  background:var(--chip-bg); color:var(--chip-v); border-radius:999px;
+  padding:1px 9px; font-size:12px; font-weight:650; letter-spacing:0;
+}}
+
+/* Finding card */
+.finding {{
+  display:flex; background:var(--panel); border:1px solid var(--border);
+  border-radius:12px; margin:12px 0; overflow:hidden; box-shadow:var(--shadow);
+}}
+.accent {{ flex:0 0 5px; background:var(--sv,#64748b); }}
+.finding-main {{ flex:1; min-width:0; }}
+.fh {{ padding:15px 18px 10px; }}
+.fh-top {{ display:flex; align-items:center; gap:8px; margin-bottom:8px; }}
+.sev {{
+  font-size:10.5px; font-weight:750; letter-spacing:.03em; padding:3px 10px; border-radius:999px;
+  color:#fff; background:var(--sv,#64748b);
+}}
+.cat {{
+  font-size:11.5px; color:var(--chip-v); background:var(--chip-bg);
+  padding:3px 10px; border-radius:999px;
+}}
+.title {{ margin:0 0 7px; font-size:16px; font-weight:650; line-height:1.3; letter-spacing:-.01em; }}
+.sink {{ font-size:12.5px; color:var(--muted-2); margin-bottom:9px; word-break:break-all; }}
+.chips {{ display:flex; flex-wrap:wrap; gap:6px; }}
+.chip {{
+  display:inline-flex; align-items:center; font-size:11.5px;
+  border:1px solid var(--border); border-radius:7px; overflow:hidden;
+}}
+.chip-k {{ background:var(--chip-bg); color:var(--chip-k); padding:2px 7px; font-weight:650;
+  text-transform:uppercase; letter-spacing:.03em; font-size:10px; }}
+.chip-v {{ padding:2px 8px; color:var(--chip-v); font-family:"SFMono-Regular",ui-monospace,Menlo,Consolas,monospace; }}
+
+.fb {{ padding:4px 18px 16px; }}
+.desc {{ margin:4px 0 12px; color:var(--muted-2); font-size:13.5px; }}
+
+.rem {{
+  background:var(--rem-bg); border-left:3px solid var(--rem-bar); border-radius:7px;
+  padding:9px 13px; margin:10px 0;
+}}
+.rem .lbl {{ color:var(--rem-fg); }}
+.rem-b {{ color:var(--rem-fg); font-size:13px; margin-top:3px; }}
+
+.tags {{ margin:10px 0; }}
+.tag {{
+  display:inline-block; font-size:11px; background:var(--chip-bg); color:var(--chip-v);
+  padding:2px 9px; border-radius:999px; margin:0 5px 4px 0;
+}}
+
+/* Code blocks */
+.code {{
+  margin:7px 0 0; background:var(--code-bg); color:var(--code-fg);
+  border:1px solid var(--code-border); border-radius:7px; padding:9px 11px;
+  font-family:"SFMono-Regular",ui-monospace,Menlo,Consolas,"Liberation Mono",monospace;
+  font-size:12.5px; line-height:1.45; white-space:pre-wrap; word-break:break-word; overflow-x:auto;
+}}
+
+/* Trace timeline */
+details.trace {{ margin-top:14px; border-top:1px solid var(--border); padding-top:10px; }}
+details.trace summary {{
+  cursor:pointer; font-size:12.5px; font-weight:650; color:var(--muted-2);
+  list-style:none; user-select:none;
+}}
+details.trace summary::-webkit-details-marker {{ display:none; }}
+details.trace summary::before {{ content:"▸ "; color:var(--muted); }}
+details.trace[open] summary::before {{ content:"▾ "; }}
+details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
+.timeline {{ list-style:none; margin:12px 0 2px; padding:0 0 0 6px; }}
+.step {{ position:relative; padding:0 0 16px 28px; }}
+.step::before {{
+  content:""; position:absolute; left:10px; top:19px; bottom:-3px; width:2px; background:var(--border);
+}}
+.step:last-child::before {{ display:none; }}
+.step .dot {{
+  position:absolute; left:0; top:0; width:22px; height:22px; border-radius:999px;
+  background:var(--panel-2); border:2px solid var(--border); color:var(--muted);
+  font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center;
+}}
+.step-src .dot {{ background:#dc2626; border-color:#dc2626; color:#fff; }}
+.step-sink .dot {{ background:var(--sv,#0f172a); border-color:var(--sv,#0f172a); color:#fff; }}
+.step-desc {{ font-size:13px; color:var(--text); font-weight:500; }}
+.step-tag {{
+  display:inline-block; font-size:9.5px; font-weight:750; letter-spacing:.04em;
+  padding:1px 6px; border-radius:5px; margin-right:7px; vertical-align:1px; color:#fff;
+}}
+.step-tag.st-src {{ background:#dc2626; }}
+.step-tag.st-sink {{ background:#334155; }}
+.step-loc {{ font-size:11.5px; color:var(--muted); margin-top:2px; word-break:break-all; }}
+
+.refs {{ margin:10px 0 0; }}
+.refs ul {{ margin:5px 0 0; padding-left:20px; font-size:12.5px; }}
+.refs a {{ word-break:break-all; }}
+
+.empty {{
+  text-align:center; color:var(--muted); padding:36px; background:var(--panel);
+  border:1px dashed var(--border); border-radius:12px;
+}}
+.no-results {{ display:none; }}
+
+@media (max-width:640px) {{
+  .stat {{ flex:1 1 84px; min-width:84px; }}
+  .stat .stat-n {{ font-size:21px; }}
+}}
+@media print {{
+  .toolbar, #theme {{ display:none !important; }}
+  .finding {{ break-inside:avoid; box-shadow:none; }}
+  details.trace {{ }}
+}}
 </style>
 </head>
 <body>
-<header>
-  <h1>SAST Security Report</h1>
-  <div class="sub">Root: <b>{root}</b> &nbsp;·&nbsp; Language: <b>{language}</b> &nbsp;·&nbsp; Framework: <b>{framework}</b> &nbsp;·&nbsp; Files scanned: <b>{files}</b> &nbsp;·&nbsp; Duration: <b>{duration}s</b> &nbsp;·&nbsp; Generated: <b>{generated}</b></div>
+<header class="page">
+  <div class="wrap">
+    <h1>SAST Security Report</h1>
+    <div class="hmeta-grid">{meta_items}</div>
+  </div>
 </header>
+
 <div class="toolbar">
-  <input id="q" type="text" placeholder="Filter by title, file, CWE, rule…">
-  <button class="btn" data-sev="all">All ({total})</button>
-  <button class="btn" data-sev="critical">Critical</button>
-  <button class="btn" data-sev="high">High</button>
-  <button class="btn" data-sev="medium">Medium</button>
-  <button class="btn" data-sev="low">Low</button>
-  <button class="btn" data-sev="info">Info</button>
+  <div class="wrap">
+    <input id="q" type="search" placeholder="Filter by title, file, CWE, rule, package…" autocomplete="off">
+    <span id="count"></span>
+    <button id="theme" type="button" title="Toggle light / dark">◐ Theme</button>
+  </div>
 </div>
+
 <div class="summary">{summary}</div>
-<div class="container">
-  <h2 class="sec">Findings ({total})</h2>
+
+<main>
+  <h2 class="sec">Code Findings <span class="n">{finding_count}</span></h2>
   <div id="list">{rows}</div>
-  <h2 class="sec">Dependency Vulnerabilities ({dep_count})</h2>
+
+  <h2 class="sec">Dependency Vulnerabilities <span class="n">{dep_count}</span></h2>
   <div id="deps">{dep_rows}</div>
-</div>
+
+  <div id="noresults" class="empty no-results">No findings match the current filter.</div>
+</main>
+
 <script>
 (function(){{
   var q = document.getElementById('q');
+  var stats = Array.prototype.slice.call(document.querySelectorAll('.stat'));
+  var countEl = document.getElementById('count');
+  var noResults = document.getElementById('noresults');
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.finding'));
+  var total = cards.length;
   var active = 'all';
-  var btns = document.querySelectorAll('.btn');
+
   function apply(){{
-    var term = q.value.toLowerCase();
-    var cards = document.querySelectorAll('.finding');
+    var term = q.value.trim().toLowerCase();
+    var shown = 0;
     cards.forEach(function(c){{
-      var sev = c.getAttribute('data-sev');
-      var showSev = (active === 'all' || active === sev);
-      var showTerm = !term || c.textContent.toLowerCase().indexOf(term) !== -1;
-      c.style.display = (showSev && showTerm) ? '' : 'none';
+      var okSev = (active === 'all') || (c.getAttribute('data-sev') === active);
+      var okTerm = !term || c.textContent.toLowerCase().indexOf(term) !== -1;
+      var show = okSev && okTerm;
+      c.style.display = show ? '' : 'none';
+      if (show) shown++;
     }});
+    countEl.textContent = 'Showing ' + shown + ' of ' + total;
+    noResults.style.display = (shown === 0 && total > 0) ? 'block' : 'none';
   }}
-  btns.forEach(function(b){{
-    b.addEventListener('click', function(){{
-      btns.forEach(function(x){{ x.classList.remove('on'); }});
-      b.classList.add('on');
-      active = b.getAttribute('data-sev');
+
+  stats.forEach(function(s){{
+    s.addEventListener('click', function(){{
+      stats.forEach(function(x){{ x.classList.remove('on'); }});
+      s.classList.add('on');
+      active = s.getAttribute('data-filter');
       apply();
     }});
   }});
   q.addEventListener('input', apply);
-  btns[0].classList.add('on');
+
+  // Theme toggle (persists for the session only; file is static).
+  var themeBtn = document.getElementById('theme');
+  var root = document.documentElement;
+  themeBtn.addEventListener('click', function(){{
+    var cur = root.getAttribute('data-theme');
+    var isDark = cur ? cur === 'dark'
+      : window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    root.setAttribute('data-theme', isDark ? 'light' : 'dark');
+  }});
+
+  apply();
 }})();
 </script>
 </body>
