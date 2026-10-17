@@ -13,6 +13,8 @@ from .analysis.dataflow import TaintEngine
 from .analysis.templates import collect_template_files, scan_templates
 from .analysis.java_dataflow import JavaTaintEngine
 from .analysis.java_symbols import build_java_symbols
+from .analysis.js_dataflow import JsTaintEngine
+from .analysis.js_symbols import build_js_symbols
 from .analysis.symbols import build_symbol_table
 from .detection import (
     collect_source_files_detailed,
@@ -23,6 +25,7 @@ from .detection import (
 from .detection.language import DEFAULT_MAX_FILE_BYTES
 from .models import ScanResult, SEVERITY_ORDER
 from .parsing.java import JavaParser
+from .parsing.javascript import JsParser
 from .parsing.php import PhpParser
 from .rules.registry import Registry
 
@@ -159,6 +162,12 @@ class ScanEngine:
             parsed, unreadable = self._parse_all(JavaParser(), source_files)
             symbols = build_java_symbols(parsed)
             engine = JavaTaintEngine(symbols, rules, framework, language)
+            return engine.analyze(parsed), len(parsed), unreadable
+
+        if language == "javascript":
+            parsed, unreadable = self._parse_all(JsParser(), source_files)
+            symbols = build_js_symbols(parsed)
+            engine = JsTaintEngine(symbols, rules, framework, language)
             return engine.analyze(parsed), len(parsed), unreadable
 
         return [], 0, 0

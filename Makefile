@@ -8,11 +8,11 @@
 #   make clean      # remove build artifacts
 #
 # The produced binary is fully offline: it contains the tool AND the downloaded
-# advisory database (Packagist + Maven by default).
+# advisory database (Packagist + Maven + npm by default).
 
 PYTHON      ?= python3
 VENV        := .venv
-FEEDS       ?= Packagist Maven
+FEEDS       ?= Packagist Maven npm
 ADVISORY_DIR := sast/data/advisories
 DOWNLOADED  := $(ADVISORY_DIR)/downloaded.json
 

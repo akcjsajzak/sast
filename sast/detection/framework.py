@@ -32,6 +32,29 @@ MAVEN_FRAMEWORKS = [
     ("javax.servlet", "Jakarta EE"),
 ]
 
+# JavaScript frameworks — npm package → framework name. Ordered so the most
+# specific wins: a Next.js app also depends on react, and NestJS on express.
+NPM_FRAMEWORKS = [
+    ("@angular/core", "Angular"),
+    ("@nestjs/core", "NestJS"),
+    ("next", "Next.js"),
+    ("react", "React"),
+    ("react-dom", "React"),
+    ("express", "Express"),
+    ("koa", "Koa"),
+    ("fastify", "Fastify"),
+    ("vue", "Vue"),
+    ("@sveltejs/kit", "SvelteKit"),
+]
+
+# Source markers, used when package.json is absent or uninformative.
+_ANGULAR_RE = re.compile(r"@(?:Component|NgModule|Injectable)\s*\(|@angular/core")
+_REACT_RE = re.compile(r"from\s+['\"]react['\"]|require\(['\"]react['\"]\)|"
+                       r"React\.(?:createElement|Component)|useState\s*\(")
+_EXPRESS_RE = re.compile(r"require\(['\"]express['\"]\)|from\s+['\"]express['\"]")
+_NODE_RE = re.compile(r"require\(['\"](?:fs|path|child_process|http|crypto)['\"]\)|"
+                      r"from\s+['\"]node:|module\.exports|process\.env")
+
 # Spring Boot / Spring annotation markers in source.
 _SPRING_BOOT_RE = re.compile(r"@SpringBootApplication\b")
 _SPRING_RE = re.compile(
@@ -190,12 +213,60 @@ def _detect_java_framework(root: str, source_files: list[str]) -> tuple[str, Opt
     return "raw", None, manifest_files, notes, module_dirs
 
 
+def _detect_js_framework(root: str, source_files: list[str]) -> tuple:
+    """Detect the JS framework from package.json, then from source markers."""
+    module_dirs = find_manifest_dirs(root, ("package.json",))
+    manifests: list[str] = []
+    notes: list[str] = []
+    best: tuple = ()
+
+    for mod in module_dirs:
+        pkg_path = os.path.join(mod, "package.json")
+        manifests.append(pkg_path)
+        data = _read_json(pkg_path)
+        if not data:
+            notes.append(f"{pkg_path} unreadable")
+            continue
+        deps = {}
+        for section in ("dependencies", "devDependencies", "peerDependencies"):
+            deps.update(data.get(section, {}) or {})
+        for index, (pkg, framework) in enumerate(NPM_FRAMEWORKS):
+            if pkg in deps:
+                # Keep the earliest (most specific) match across all modules.
+                if not best or index < best[0]:
+                    best = (index, framework, deps[pkg])
+                break
+
+    if best:
+        return best[1], best[2], manifests, notes, module_dirs
+
+    # No manifest match — fall back to markers in the source itself.
+    found = None
+    for sf in source_files[:200]:
+        try:
+            with open(sf, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(20000)
+        except OSError:
+            continue
+        if _ANGULAR_RE.search(text):
+            return "Angular", None, manifests, notes, module_dirs
+        if _REACT_RE.search(text):
+            return "React", None, manifests, notes, module_dirs
+        if _EXPRESS_RE.search(text):
+            return "Express", None, manifests, notes, module_dirs
+        if found is None and _NODE_RE.search(text):
+            found = "Node.js"
+    return found or "raw", None, manifests, notes, module_dirs
+
+
 def detect_framework(root: str, language: str, source_files: list[str]) -> ProjectProfile:
     """Auto-detect the framework (if any) for a project."""
     if language == "php":
         framework, version, manifests, notes, modules = _detect_php_framework(root)
     elif language == "java":
         framework, version, manifests, notes, modules = _detect_java_framework(root, source_files)
+    elif language == "javascript":
+        framework, version, manifests, notes, modules = _detect_js_framework(root, source_files)
     else:
         framework, version, manifests, notes, modules = "raw", None, [], [], []
 

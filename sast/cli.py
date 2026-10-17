@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_fetch = sub.add_parser("fetch-feeds", help="Download OSV feeds into the internal advisory format")
     p_fetch.add_argument("--ecosystems", nargs="*", default=None,
-                         choices=["Packagist", "Maven"],
+                         choices=["Packagist", "Maven", "npm"],
                          help="OSV ecosystems to fetch (default: both)")
     p_fetch.add_argument("-o", "--output", default="sast/data/advisories/downloaded.json")
     p_fetch.set_defaults(func=cmd_fetch_feeds)
@@ -183,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_fetch_feeds(args) -> int:
-    ecosystems = args.ecosystems or ["Packagist", "Maven"]
+    ecosystems = args.ecosystems or ["Packagist", "Maven", "npm"]
     fetch(ecosystems, args.output)
     return 0
 

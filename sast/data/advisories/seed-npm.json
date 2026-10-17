@@ -1,0 +1,137 @@
+{
+  "generated_at": "2026-10-17",
+  "advisories": [
+    {
+      "package": "lodash",
+      "ranges": [">=0.0.0,<4.17.21"],
+      "cve": "CVE-2021-23337",
+      "severity": "high",
+      "title": "lodash command injection via template",
+      "description": "lodash before 4.17.21 is vulnerable to command injection through the template function.",
+      "fixed_in": "4.17.21",
+      "cwe": "CWE-78",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2021-23337"]
+    },
+    {
+      "package": "lodash",
+      "ranges": [">=0.0.0,<4.17.12"],
+      "cve": "CVE-2019-10744",
+      "severity": "critical",
+      "title": "lodash prototype pollution in defaultsDeep",
+      "description": "lodash before 4.17.12 allows modification of Object.prototype via defaultsDeep.",
+      "fixed_in": "4.17.12",
+      "cwe": "CWE-1321",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2019-10744"]
+    },
+    {
+      "package": "minimist",
+      "ranges": [">=0.0.0,<1.2.6"],
+      "cve": "CVE-2021-44906",
+      "severity": "critical",
+      "title": "minimist prototype pollution",
+      "description": "minimist before 1.2.6 is vulnerable to prototype pollution via crafted arguments.",
+      "fixed_in": "1.2.6",
+      "cwe": "CWE-1321",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2021-44906"]
+    },
+    {
+      "package": "express",
+      "ranges": [">=0.0.0,<4.19.2"],
+      "cve": "CVE-2024-29041",
+      "severity": "medium",
+      "title": "Express open redirect via malformed URLs",
+      "description": "Express before 4.19.2 allows open redirect through improperly encoded redirect targets.",
+      "fixed_in": "4.19.2",
+      "cwe": "CWE-601",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2024-29041"]
+    },
+    {
+      "package": "axios",
+      "ranges": [">=0.0.0,<1.6.0"],
+      "cve": "CVE-2023-45857",
+      "severity": "medium",
+      "title": "axios leaks the XSRF-TOKEN header to third-party hosts",
+      "description": "axios before 1.6.0 sends the XSRF-TOKEN value in cross-origin requests, leaking the token.",
+      "fixed_in": "1.6.0",
+      "cwe": "CWE-200",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2023-45857"]
+    },
+    {
+      "package": "node-fetch",
+      "ranges": [">=0.0.0,<2.6.7"],
+      "cve": "CVE-2022-0235",
+      "severity": "high",
+      "title": "node-fetch forwards cookies and authorization headers across redirects",
+      "description": "node-fetch before 2.6.7 leaks sensitive headers when following a cross-site redirect.",
+      "fixed_in": "2.6.7",
+      "cwe": "CWE-200",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2022-0235"]
+    },
+    {
+      "package": "serialize-javascript",
+      "ranges": [">=0.0.0,<3.1.0"],
+      "cve": "CVE-2020-7660",
+      "severity": "high",
+      "title": "serialize-javascript cross-site scripting",
+      "description": "serialize-javascript before 3.1.0 allows XSS via untrusted data passed to serialize().",
+      "fixed_in": "3.1.0",
+      "cwe": "CWE-79",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2020-7660"]
+    },
+    {
+      "package": "jsonwebtoken",
+      "ranges": [">=0.0.0,<9.0.0"],
+      "cve": "CVE-2022-23540",
+      "severity": "high",
+      "title": "jsonwebtoken insecure default algorithm handling",
+      "description": "jsonwebtoken before 9.0.0 may verify tokens with an unexpected algorithm, enabling forgery.",
+      "fixed_in": "9.0.0",
+      "cwe": "CWE-347",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2022-23540"]
+    },
+    {
+      "package": "ejs",
+      "ranges": [">=0.0.0,<3.1.10"],
+      "cve": "CVE-2024-33883",
+      "severity": "high",
+      "title": "ejs template injection via prototype pollution",
+      "description": "ejs before 3.1.10 lacks pollution protection, allowing server-side template injection.",
+      "fixed_in": "3.1.10",
+      "cwe": "CWE-1321",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2024-33883"]
+    },
+    {
+      "package": "next",
+      "ranges": [">=13.0.0,<14.1.1"],
+      "cve": "CVE-2024-34351",
+      "severity": "high",
+      "title": "Next.js server-side request forgery in server actions",
+      "description": "Next.js before 14.1.1 allows SSRF through a crafted Host header in server actions.",
+      "fixed_in": "14.1.1",
+      "cwe": "CWE-918",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2024-34351"]
+    },
+    {
+      "package": "@angular/core",
+      "ranges": [">=0.0.0,<11.0.5"],
+      "cve": "CVE-2021-4231",
+      "severity": "medium",
+      "title": "Angular cross-site scripting in the sanitizer",
+      "description": "Angular before 11.0.5 permits XSS through improperly sanitized attribute values.",
+      "fixed_in": "11.0.5",
+      "cwe": "CWE-79",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2021-4231"]
+    },
+    {
+      "package": "react-dom",
+      "ranges": [">=16.0.0,<16.4.2"],
+      "cve": "CVE-2018-6341",
+      "severity": "medium",
+      "title": "react-dom cross-site scripting in server rendering",
+      "description": "react-dom before 16.4.2 allows XSS when rendering attacker-controlled attribute names server-side.",
+      "fixed_in": "16.4.2",
+      "cwe": "CWE-79",
+      "references": ["https://nvd.nist.gov/vuln/detail/CVE-2018-6341"]
+    }
+  ]
+}

@@ -19,8 +19,9 @@ OSV_BASE = "https://osv-vulnerabilities.storage.googleapis.com"
 
 # OSV ecosystem export name -> language (informational only).
 ECOSYSTEMS = {
-    "Packagist": "php",   # PHP / Composer
-    "Maven": "java",      # Java / Maven
+    "Packagist": "php",       # PHP / Composer
+    "Maven": "java",          # Java / Maven
+    "npm": "javascript",      # JavaScript / npm
 }
 
 _USER_AGENT = "sast-feed-fetch/1.0"

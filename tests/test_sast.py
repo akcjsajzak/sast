@@ -801,5 +801,272 @@ class TestTransitiveDependencies(unittest.TestCase):
         self.assertIn("org.apache.logging.log4j:log4j-core", pkgs)
 
 
+EXPRESS_PKG = json.dumps({"dependencies": {"express": "^4.18.0"}})
+REACT_PKG = json.dumps({"dependencies": {"react": "^18.2.0"}})
+ANGULAR_PKG = json.dumps({"dependencies": {"@angular/core": "^15.0.0"}})
+
+
+class TestJsDetection(unittest.TestCase):
+    def test_language_detected(self):
+        r = _scan({"a.js": "const x = 1;"})
+        self.assertEqual(r.language, "javascript")
+
+    def test_frameworks_from_package_json(self):
+        for pkg, expected in ((EXPRESS_PKG, "Express"), (REACT_PKG, "React"),
+                              (ANGULAR_PKG, "Angular")):
+            r = _scan({"package.json": pkg, "a.js": "const x = 1;"})
+            self.assertEqual(r.framework, expected)
+
+    def test_framework_from_source_markers(self):
+        r = _scan({"a.js": "const express = require('express');\nconst app = express();"})
+        self.assertEqual(r.framework, "Express")
+
+    def test_typescript_and_tsx_are_parsed(self):
+        r = _scan({"package.json": REACT_PKG,
+                   "C.tsx": "export function C(){ const u: string = location.hash;"
+                            " return <div dangerouslySetInnerHTML={{__html:u}} />; }"})
+        self.assertIn("react-xss-dangerously-set-inner-html",
+                      {f.rule_id for f in r.findings})
+
+    def test_minified_and_declaration_files_skipped(self):
+        r = _scan({"app.min.js": "eval(location.hash);",
+                   "types.d.ts": "declare const x: string;",
+                   "a.js": "const ok = 1;"})
+        self.assertEqual(r.files_scanned, 1)
+
+
+class TestJsTaintEngine(unittest.TestCase):
+    def _rules(self, code, filename="a.js", pkg=None):
+        files = {filename: code}
+        if pkg:
+            files["package.json"] = pkg
+        return {f.rule_id for f in _scan(files).findings}
+
+    def test_raw_dom_xss(self):
+        self.assertIn("js-xss-innerhtml",
+                      self._rules("el.innerHTML = location.hash;"))
+        self.assertIn("js-xss-document-write",
+                      self._rules("document.write(location.href);"))
+
+    def test_eval_of_url_data(self):
+        self.assertIn("js-code-eval", self._rules("const q=location.search; eval(q);"))
+
+    def test_template_literal_and_aliasing(self):
+        self.assertIn("js-xss-innerhtml", self._rules(
+            "const u = location.hash; const v = u; el.innerHTML = `<b>${v}</b>`;"))
+
+    def test_url_search_params_propagates(self):
+        self.assertIn("js-xss-innerhtml", self._rules(
+            "const b = new URLSearchParams(location.search).get('b');"
+            " el.innerHTML = b;"))
+
+    def test_express_request_sinks(self):
+        cases = {
+            "app.get('/x',(req,res)=>{ db.query('SELECT '+req.query.id); });":
+                "js-sqli-query",
+            "const cp=require('child_process');"
+            "app.get('/x',(req,res)=>{ cp.exec('ls '+req.query.d); });":
+                "js-cmdi-exec",
+            "const fs=require('fs');"
+            "app.get('/x',(req,res)=>{ fs.readFile(req.query.p, cb); });":
+                "js-path-readfile",
+            "app.get('/x',(req,res)=>{ res.redirect(req.query.n); });":
+                "js-redirect-res",
+            "app.get('/x',(req,res)=>{ fetch(req.query.u); });":
+                "js-ssrf-fetch",
+        }
+        for code, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules(code, pkg=EXPRESS_PKG), code)
+
+    def test_destructured_request_data(self):
+        self.assertIn("js-sqli-query", self._rules(
+            "app.get('/x',(req,res)=>{ const {id} = req.query;"
+            " db.query('SELECT '+id); });", pkg=EXPRESS_PKG))
+
+    def test_interprocedural_helper(self):
+        self.assertIn("js-cmdi-exec", self._rules(
+            "function run(c){ require('child_process').exec(c); }\n"
+            "app.get('/x',(req,res)=>{ run(req.query.c); });", pkg=EXPRESS_PKG))
+
+    def test_react_dangerously_set_inner_html(self):
+        self.assertIn("react-xss-dangerously-set-inner-html", self._rules(
+            "export default function C(){ const u=location.search;"
+            " return <div dangerouslySetInnerHTML={{__html:u}} />; }",
+            filename="C.jsx", pkg=REACT_PKG))
+
+    def test_react_safe_child_is_not_flagged(self):
+        self.assertEqual(self._rules(
+            "export function C(){ const u=location.hash; return <div>{u}</div>; }",
+            filename="C.jsx", pkg=REACT_PKG), set())
+
+    def test_angular_sanitizer_bypass(self):
+        rules = self._rules(
+            "@Component({}) export class C { constructor(private s: DomSanitizer){}"
+            " f(){ const u = location.hash; this.s.bypassSecurityTrustHtml(u); } }",
+            filename="c.ts", pkg=ANGULAR_PKG)
+        self.assertIn("angular-xss-bypasssecuritytrusthtml", rules)
+
+    def test_sanitizers_clear_taint(self):
+        self.assertEqual(self._rules(
+            "el.innerHTML = DOMPurify.sanitize(location.hash);"), set())
+        self.assertEqual(self._rules(
+            "app.get('/x',(req,res)=>{ db.query('SELECT '+parseInt(req.query.id)); });",
+            pkg=EXPRESS_PKG), set())
+
+    def test_second_order_process_env_is_low_confidence(self):
+        f = [x for x in _scan({"a.js": "const cp=require('child_process');"
+                                       " cp.exec(process.env.CMD);"}).findings
+             if x.rule_id == "js-cmdi-exec"]
+        self.assertTrue(f)
+        self.assertEqual(f[0].confidence, "low")
+
+    def test_pattern_rule_reports_once_per_occurrence(self):
+        """A text rule must not fire once per enclosing node."""
+        r = _scan({"package.json": ANGULAR_PKG,
+                   "c.ts": "import { DomSanitizer } from '@angular/platform-browser';\n"
+                           "@Component({}) export class C {\n"
+                           "  constructor(private s: DomSanitizer){}\n"
+                           "  f(){ return 1; }\n}"})
+        hits = [f for f in r.findings if f.rule_id == "angular-xss-bypass-import"]
+        self.assertEqual(len(hits), 1)
+
+
+class TestJsPatternRules(unittest.TestCase):
+    def _rules(self, code):
+        return {f.rule_id for f in _scan({"a.js": code}).findings}
+
+    def test_patterns_fire(self):
+        cases = {
+            "const t = Math.random();": "js-weak-random",
+            "crypto.createHash('md5');": "js-crypto-weak-hash",
+            "const apiKey = 'sk_live_AbCdEf123456';": "js-hardcoded-secret",
+            "const o = { rejectUnauthorized: false };": "js-tls-verify-disabled",
+            "jwt.verify(t, k, { algorithms: ['none'] });": "js-jwt-none-algorithm",
+        }
+        for code, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules(code), code)
+
+    def test_secure_equivalents_clean(self):
+        for code in ("const t = crypto.randomUUID();",
+                     "crypto.createHash('sha256');",
+                     "const o = { rejectUnauthorized: true };"):
+            self.assertEqual(self._rules(code), set(), code)
+
+
+class TestNpmDependencies(unittest.TestCase):
+    def test_package_json_direct_dependency(self):
+        r = _scan({"a.js": "const x=1;",
+                   "package.json": json.dumps({"dependencies": {"lodash": "4.17.11"}})})
+        self.assertIn("lodash", {d.package for d in r.dependency_issues})
+
+    def test_package_lock_finds_transitive(self):
+        lock = json.dumps({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app"},
+                "node_modules/express": {"version": "4.18.2"},
+                "node_modules/minimist": {"version": "1.2.0"},
+            },
+        })
+        r = _scan({"a.js": "const x=1;",
+                   "package.json": json.dumps({"dependencies": {"express": "^4.18.0"}}),
+                   "package-lock.json": lock})
+        # minimist is transitive: it is not in package.json at all.
+        self.assertIn("minimist", {d.package for d in r.dependency_issues})
+
+    def test_yarn_lock_parsed(self):
+        yarn = 'minimist@^1.2.0:\n  version "1.2.0"\n  resolved "https://x"\n'
+        r = _scan({"a.js": "const x=1;",
+                   "package.json": json.dumps({"dependencies": {"minimist": "^1.2.0"}}),
+                   "yarn.lock": yarn})
+        self.assertIn("minimist", {d.package for d in r.dependency_issues})
+
+    def test_non_registry_specs_ignored(self):
+        r = _scan({"a.js": "const x=1;",
+                   "package.json": json.dumps({"dependencies": {
+                       "local": "file:../local", "repo": "github:a/b", "any": "*"}})})
+        self.assertEqual(r.dependency_issues, [])
+
+
+class TestPolyglotWithJavaScript(unittest.TestCase):
+    """The JS engine must run alongside the PHP and Java engines."""
+
+    def _build(self, files):
+        tmp = tempfile.mkdtemp()
+        for rel, content in files.items():
+            path = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(content)
+        return ScanEngine(ScanOptions()).scan(tmp)
+
+    def test_php_backend_with_react_frontend(self):
+        r = self._build({
+            "backend/composer.json": json.dumps(
+                {"require": {"laravel/framework": "^9.0"}}),
+            "backend/app/C.php": "<?php $id=$_GET['id'];"
+                                 " mysqli_query($c, 'SELECT '.$id);",
+            "frontend/package.json": REACT_PKG,
+            "frontend/src/P.jsx": "export default function P(){"
+                                  " const b = location.search;"
+                                  " return <div dangerouslySetInnerHTML={{__html:b}} />; }",
+        })
+        self.assertEqual(sorted(r.languages), ["javascript", "php"])
+        self.assertEqual(r.frameworks.get("php"), "Laravel")
+        self.assertEqual(r.frameworks.get("javascript"), "React")
+        by_lang = {f.language for f in r.findings}
+        self.assertEqual(by_lang, {"php", "javascript"})
+
+    def test_java_backend_with_angular_frontend(self):
+        r = self._build({
+            "api/pom.xml": "<project><dependencies><dependency>"
+                           "<groupId>org.springframework.boot</groupId>"
+                           "<artifactId>spring-boot-starter-web</artifactId>"
+                           "<version>2.7.0</version></dependency></dependencies></project>",
+            "api/src/main/java/A.java":
+                "import org.springframework.web.bind.annotation.*;\n"
+                "@RestController public class A {\n"
+                " @GetMapping(\"/r\") public void r(@RequestParam String q) throws Exception {\n"
+                "  Runtime.getRuntime().exec(q); } }",
+            "web/package.json": ANGULAR_PKG,
+            "web/src/app.component.ts":
+                "@Component({}) export class C { f(){"
+                " this.sanitizer.bypassSecurityTrustHtml(location.hash); } }",
+        })
+        self.assertEqual(sorted(r.languages), ["java", "javascript"])
+        self.assertEqual(r.frameworks.get("java"), "Spring Boot")
+        self.assertEqual(r.frameworks.get("javascript"), "Angular")
+        self.assertEqual({f.language for f in r.findings}, {"java", "javascript"})
+
+    def test_node_apis_flagged_regardless_of_detected_framework(self):
+        """A React repo still runs Node in API routes and build scripts."""
+        r = self._build({
+            "package.json": REACT_PKG,
+            "src/api.js": "const fs=require('fs');"
+                          " export function f(req){ fs.readFile(req.query.p, cb); }",
+        })
+        self.assertIn("js-path-readfile", {f.rule_id for f in r.findings})
+
+    def test_three_languages_at_once(self):
+        r = self._build({
+            "api/pom.xml": "<project><dependencies><dependency>"
+                           "<groupId>org.springframework.boot</groupId>"
+                           "<artifactId>spring-boot-starter-web</artifactId>"
+                           "<version>2.7.0</version></dependency></dependencies></project>",
+            "api/src/main/java/A.java":
+                "import org.springframework.web.bind.annotation.*;\n"
+                "@RestController public class A {\n"
+                " @GetMapping(\"/r\") public void r(@RequestParam String q) throws Exception {\n"
+                "  Runtime.getRuntime().exec(q); } }",
+            "legacy/composer.json": json.dumps({"require": {"php": "^8.0"}}),
+            "legacy/index.php": "<?php system($_GET['c']);",
+            "web/package.json": REACT_PKG,
+            "web/src/a.js": "el.innerHTML = location.hash;",
+        })
+        self.assertEqual(sorted(r.languages), ["java", "javascript", "php"])
+        self.assertEqual({f.language for f in r.findings},
+                         {"java", "javascript", "php"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .base import RuleSet
 from .java_rules import build_java_rules
+from .js_rules import build_js_rules
 from .php_rules import build_php_rules, TAG_LABELS
 
 
@@ -11,6 +12,7 @@ class Registry:
         self._by_language = {
             "php": build_php_rules(),
             "java": build_java_rules(),
+            "javascript": build_js_rules(),
         }
         self.tag_labels = TAG_LABELS
 

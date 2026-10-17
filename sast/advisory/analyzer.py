@@ -5,6 +5,7 @@ from ..models import DependencyIssue, Severity
 from .composer import parse_composer_json, parse_composer_lock
 from .db import AdvisoryDB
 from .maven import parse_java_dependencies
+from .npm import parse_npm_dependencies
 
 
 def _packages_for(module: str, language: str) -> list[tuple[str, str]]:
@@ -16,6 +17,8 @@ def _packages_for(module: str, language: str) -> list[tuple[str, str]]:
         return packages
     if language == "java":
         return parse_java_dependencies(module)
+    if language == "javascript":
+        return parse_npm_dependencies(module)
     return []
 
 

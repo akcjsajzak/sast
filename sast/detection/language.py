@@ -8,7 +8,15 @@ from typing import Optional
 LANGUAGE_EXTENSIONS = {
     "php": {".php", ".php3", ".php4", ".php5", ".phtml", ".inc"},
     "java": {".java"},
+    # TypeScript is included under "javascript": Angular is .ts and React is
+    # frequently .tsx, so excluding it would miss both frameworks entirely.
+    "javascript": {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"},
 }
+
+# Build output and vendored bundles: minified, not first-party, and a rich
+# source of false positives.
+_JS_SKIP_SUFFIXES = (".min.js", ".bundle.js", ".chunk.js", ".min.mjs",
+                     ".d.ts", ".map")
 
 # Directories that should never be scanned (vendor dirs, build output, caches).
 IGNORED_DIRS = {
@@ -107,6 +115,8 @@ def collect_source_files_detailed(
             ext = os.path.splitext(fname)[1].lower()
             if ext not in exts:
                 continue
+            if language == "javascript" and fname.lower().endswith(_JS_SKIP_SUFFIXES):
+                continue
             path = os.path.join(dirpath, fname)
             rel = os.path.relpath(path, root)
             if not include_tests and is_test_path(rel):
@@ -129,7 +139,7 @@ def collect_source_files_detailed(
 
 def _language_counts(root: str) -> dict:
     """Weighted file counts per language (manifests count heavily)."""
-    counts = {"php": 0, "java": 0}
+    counts = {"php": 0, "java": 0, "javascript": 0}
 
     if os.path.isfile(os.path.join(root, "composer.json")):
         counts["php"] += 100
@@ -137,6 +147,8 @@ def _language_counts(root: str) -> dict:
         counts["java"] += 100
     if os.path.isfile(os.path.join(root, "build.gradle")):
         counts["java"] += 80
+    if os.path.isfile(os.path.join(root, "package.json")):
+        counts["javascript"] += 100
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
@@ -146,6 +158,9 @@ def _language_counts(root: str) -> dict:
                 counts["php"] += 1
             elif ext in LANGUAGE_EXTENSIONS["java"]:
                 counts["java"] += 1
+            elif (ext in LANGUAGE_EXTENSIONS["javascript"]
+                  and not fname.lower().endswith(_JS_SKIP_SUFFIXES)):
+                counts["javascript"] += 1
     return counts
 
 

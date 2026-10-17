@@ -1,0 +1,5 @@
+{
+  "name": "vulnerable-angular-app",
+  "version": "1.0.0",
+  "dependencies": { "@angular/core": "15.0.0", "minimist": "1.2.0" }
+}

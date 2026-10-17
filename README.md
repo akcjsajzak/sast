@@ -1,30 +1,42 @@
-# SAST — offline framework-aware static analysis for PHP & Java
+# SAST — offline framework-aware static analysis for PHP, Java & JavaScript
 
 A fully offline, dependency-free-at-runtime static application security testing
-(SAST) engine targeting **PHP** (Laravel, Symfony, raw) and **Java** (Spring,
-Spring Boot, raw). It auto-detects the framework, performs interprocedural
+(SAST) engine targeting **PHP** (Laravel, Symfony, raw), **Java** (Spring,
+Spring Boot, raw) and **JavaScript/TypeScript** (Node, Express, React, Angular,
+raw). It auto-detects the framework, performs interprocedural
 **source-to-sink taint analysis**, and reports validated findings as HTML,
 JSON, or **SARIF**.
+
+Every engine runs in the same pass, so a PHP or Java backend with a React or
+Angular frontend is scanned end to end in one command.
 
 Think of it as an offline, framework-aware Snyk / SonarQube.
 
 ## Features
 
 - **Framework auto-detection** — `composer.json` → Laravel / Symfony;
-  `pom.xml` / `build.gradle` + Spring annotations → Spring / Spring Boot.
+  `pom.xml` / `build.gradle` + Spring annotations → Spring / Spring Boot;
+  `package.json` → Express / NestJS / React / Next.js / Angular / Vue, with
+  source markers as a fallback.
 - **Source-to-sink taint analysis** — interprocedural, sanitizer-aware, with a
   full trace (source → intermediate hops → sink) and code citations.
 - **OWASP Top 10 + framework/dependency-specific rules**:
   - SQL injection (raw `mysqli`/PDO, Laravel `DB::raw`/`whereRaw`, Doctrine DQL,
-    JDBC/JPA/JdbcTemplate)
-  - XSS (echo/print, Blade `{!! !!}`, Servlet response writer)
+    JDBC/JPA/JdbcTemplate, `knex.raw`/`sequelize.query`) and NoSQL injection
+  - XSS (echo/print, Blade `{!! !!}`, Servlet response writer, `innerHTML`,
+    `document.write`, React `dangerouslySetInnerHTML`, Angular
+    `bypassSecurityTrust*`)
+  - Node/Express: command injection via `child_process`, path traversal via
+    `fs`/`res.sendFile`, open redirect, SSRF, prototype pollution, dynamic
+    `require()`, JWT `alg:none`, permissive CORS
   - Command injection, SSRF, path traversal/LFI, insecure deserialization,
     XXE, LDAP injection, open redirect, SpEL injection, mass assignment,
     CSRF/authorization misconfig, weak crypto.
 - **Dependency vulnerability scanning** — matches `composer.lock`,
-  `pom.xml`/`build.gradle` against a bundled offline advisory DB with semantic
-  version ranges; import OSV, NVD (1.1 & 2.0), or a custom JSON feed. Reports
-  state how old the bundled database is.
+  `pom.xml`/`build.gradle`, and `package-lock.json`/`yarn.lock`/`pnpm-lock.yaml`
+  against a bundled offline advisory DB with semantic version ranges; import
+  OSV, NVD (1.1 & 2.0), or a custom JSON feed. Reports state how old the
+  bundled database is.
 - **Confidence-aware taint sources** — `$_SERVER` is modelled key by key
   (`HTTP_*`, `REQUEST_URI`, … are tainted; `DOCUMENT_ROOT`, `REMOTE_ADDR` are
   not), and second-order sources such as `$_SESSION`, database reads and file
@@ -136,7 +148,8 @@ used to translate NVD CPEs into ecosystem package names.
 ## How it works
 
 1. **Detect** language and framework from manifests + source annotations.
-2. **Parse** every source file with tree-sitter (PHP & Java grammars).
+2. **Parse** every source file with tree-sitter (PHP, Java, JavaScript,
+   TypeScript and TSX grammars).
 3. **Index** functions/classes/methods into namespace-aware symbol tables.
 4. **Taint** — data from sources (superglobals, request accessors,
    `@RequestParam`/`@PathVariable`, …) propagates through assignments,
@@ -153,23 +166,30 @@ sast/
   analysis/    AST utils, symbol tables, taint engines (PHP + Java)
   advisory/    offline DB, semver, composer/maven parsing, feed importers
   detection/   language + framework auto-detection
-  parsing/     tree-sitter PHP/Java parsers
+  parsing/     tree-sitter PHP/Java/JavaScript parsers
   reporting/   HTML, JSON, SARIF renderers
-  rules/       declarative rule model + PHP/Java rule sets
+  rules/       declarative rule model + PHP/Java/JavaScript rule sets
   data/        bundled advisory seed databases
   engine.py    orchestration
   cli.py       command-line interface
-examples/      vulnerable fixtures (raw-php, laravel-app, symfony-app, spring-app)
+examples/      vulnerable fixtures (raw-php, laravel-app, symfony-app,
+               spring-app, express-app, react-app, angular-app)
 tests/         unittest suite
 ```
 
 ## Extending
 
 Rules are declarative. Add a `SinkRule`, `TaintSource`, `SanitizerRule`, or
-`PatternRule` to `sast/rules/php_rules.py` or `sast/rules/java_rules.py` and it
-is picked up automatically. Add advisory entries to
-`sast/data/advisories/seed.json` (Packagist) or `seed-java.json` (Maven
-`groupId:artifactId`).
+`PatternRule` to `sast/rules/php_rules.py`, `java_rules.py` or `js_rules.py`
+and it is picked up automatically. Add advisory entries to
+`sast/data/advisories/seed.json` (Packagist), `seed-java.json` (Maven
+`groupId:artifactId`) or `seed-npm.json` (npm package name).
+
+The JavaScript rules use these `kind` values: sources are `member` (a property
+read such as `req.query`) or `call`; sinks are `call`, `property_assign`
+(`el.innerHTML = …`) or `jsx_attribute` (`dangerouslySetInnerHTML`). An
+`obj_hint` scopes a rule to a receiver (`fs`, `res`, `req`, `location`), which
+is what keeps Node APIs matching regardless of which framework was detected.
 
 ## Tests
 
@@ -215,9 +235,12 @@ What the engine does **not** find, and why:
   network. Commit (or generate) a `gradle.lockfile` or `mvn dependency:tree`
   output as `dependency-tree.txt` and those are scanned too. `composer.lock`
   already lists the full tree, so PHP is unaffected.
-- **Client-side JavaScript** — no JS grammar is bundled, so DOM XSS and
-  secrets in frontend bundles are invisible.
 - **Variable variables** (`$$name`) in PHP.
+- **JavaScript module resolution** — identifiers are indexed globally by name
+  rather than per module, so two different helpers sharing a name are conflated
+  and a renamed import (`import { x as y }`) is not followed.
+- **Vue and Svelte** single-file components are not parsed; their `.js`/`.ts`
+  is, but `.vue`/`.svelte` templates are not.
 - Vendor/third-party code is modeled via rules rather than parsed; only
   first-party source is scanned.
 - Scanning is single-threaded by design (see "Scan scope and limits").
