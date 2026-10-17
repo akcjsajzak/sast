@@ -2342,21 +2342,66 @@ class TestNumericTaintAndIndexing(unittest.TestCase):
 
 
 class TestSameNamedFunctions(unittest.TestCase):
-    def test_every_definition_is_analysed(self):
-        """The symbol table keeps one implementation per bare name, so
-        iterating it analysed only one of two same-named functions. `static`
-        helpers called `init` or `main` in several C files are the norm."""
-        both = _scan({
-            "a.c": ("#include <stdlib.h>\n#include <stdio.h>\n"
-                    "void f(FILE *fp) { int n; fread(&n, 4, 1, fp);"
-                    " malloc(n); }\n"),
-            "b.c": ("#include <stdlib.h>\n#include <stdio.h>\n"
-                    "void f(FILE *fp) { int n; fread(&n, 4, 1, fp);"
-                    " malloc(n); }\n"),
-        })
-        files = {os.path.basename(x.location.file) for x in both.findings
-                 if x.rule_id == "c-int-malloc"}
-        self.assertEqual(files, {"a.c", "b.c"})
+    """Every engine's symbol table is keyed by name for *resolution*, and
+    every one of them was also used to drive analysis — so a second
+    declaration sharing a name was never analysed at all. A `static` helper
+    called `init` in several C files, two modules exporting `handle`, an
+    unnamespaced PHP `handle()`, and a Java method overload are all ordinary
+    code, not edge cases.
+    """
+
+    def _files_reporting(self, files: dict, rule_id: str) -> set:
+        return {os.path.basename(f.location.file)
+                for f in _scan(files).findings if f.rule_id == rule_id}
+
+    def test_c(self):
+        body = ("#include <stdlib.h>\n#include <stdio.h>\n"
+                "void f(FILE *fp) { int n; fread(&n, 4, 1, fp); malloc(n); }\n")
+        self.assertEqual(
+            self._files_reporting({"a.c": body, "b.c": body}, "c-int-malloc"),
+            {"a.c", "b.c"})
+
+    def test_php(self):
+        body = "<?php\nfunction handle() { system($_GET['a']); }\n"
+        self.assertEqual(
+            self._files_reporting({"a.php": body, "b.php": body},
+                                  "php-cmdi-system"),
+            {"a.php", "b.php"})
+
+    def test_javascript(self):
+        body = ("const { exec } = require('child_process');\n"
+                "function handle(req) { exec(req.query.a); }\n"
+                "module.exports = handle;\n")
+        self.assertEqual(
+            self._files_reporting({"a.js": body, "b.js": body},
+                                  "js-cmdi-exec"),
+            {"a.js", "b.js"})
+
+    def test_java_same_named_inner_classes(self):
+        def src(outer):
+            return ("import javax.servlet.http.*;\n"
+                    f"public class {outer} extends HttpServlet {{\n"
+                    "  private class Helper {\n"
+                    "    void go(HttpServletRequest r) throws Exception {\n"
+                    "      Runtime.getRuntime().exec(r.getParameter(\"x\"));\n"
+                    "    }\n  }\n}\n")
+        self.assertEqual(
+            self._files_reporting({"A.java": src("A"), "B.java": src("B")},
+                                  "java-cmdi-exec"),
+            {"A.java", "B.java"})
+
+    def test_java_method_overloads(self):
+        """Both `handle(r)` and `handle(r, n)` must be walked."""
+        result = _scan({"C.java":
+            "import javax.servlet.http.*;\n"
+            "public class C extends HttpServlet {\n"
+            "  void handle(HttpServletRequest r) throws Exception {\n"
+            "    Runtime.getRuntime().exec(r.getParameter(\"a\"));\n  }\n"
+            "  void handle(HttpServletRequest r, int n) throws Exception {\n"
+            "    Runtime.getRuntime().exec(r.getParameter(\"b\"));\n  }\n}\n"})
+        lines = sorted(f.location.line for f in result.findings
+                       if f.rule_id == "java-cmdi-exec")
+        self.assertEqual(len(lines), 2, lines)
 
 
 class TestFindingDeduplication(unittest.TestCase):

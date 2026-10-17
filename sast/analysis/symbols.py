@@ -47,6 +47,8 @@ class ClassSymbol:
     source: SourceFile
     parent: str = ""
     methods: dict = field(default_factory=dict)
+    # Every method declaration, overloads and redeclarations included.
+    all_methods: list = field(default_factory=list)
 
 
 def file_namespace(sf: SourceFile) -> str:
@@ -66,15 +68,27 @@ class SymbolTable:
         self.short_functions: dict[str, list] = {}              # short -> [symbols]
         self.classes: dict[str, ClassSymbol] = {}               # short -> symbol
         self.class_aliases: dict[str, str] = {}                 # fqn -> short
+        # Every declaration, including ones sharing a name. The dicts above
+        # are keyed for *resolution* and so keep one entry per name; analysing
+        # from them alone skipped a second `function handle()` in another file
+        # outright, and an unnamespaced helper repeated across files is
+        # ordinary PHP.
+        self.all_functions: list = []
+        self.all_classes: list = []
 
     def add_function(self, short: str, namespace: str, node: Node, source: SourceFile) -> None:
         fqn = f"{namespace}\\{short}" if namespace else short
         if fqn in self.functions:
+            # Keep it for analysis even though resolution already has one.
+            self.all_functions.append(FunctionSymbol(
+                name=fqn, short=short, namespace=namespace, node=node,
+                source=source, params=au.params_of(node)))
             return
         sym = FunctionSymbol(name=fqn, short=short, namespace=namespace,
                              node=node, source=source, params=au.params_of(node))
         self.functions[fqn] = sym
         self.short_functions.setdefault(short, []).append(sym)
+        self.all_functions.append(sym)
 
     def add_method(self, class_name: str, namespace: str, name: str, node: Node,
                    source: SourceFile, is_static: bool = False, visibility: str = "public") -> None:
@@ -82,12 +96,16 @@ class SymbolTable:
             class_name,
             ClassSymbol(name=class_name, namespace=namespace, node=node, source=source),
         )
-        if name and name not in cls.methods:
-            cls.methods[name] = MethodSymbol(
-                class_name=class_name, namespace=namespace, name=name, node=node,
-                source=source, params=au.params_of(node), is_static=is_static,
-                visibility=visibility,
-            )
+        if not name:
+            return
+        method = MethodSymbol(
+            class_name=class_name, namespace=namespace, name=name, node=node,
+            source=source, params=au.params_of(node), is_static=is_static,
+            visibility=visibility,
+        )
+        cls.all_methods.append(method)
+        if name not in cls.methods:
+            cls.methods[name] = method
 
     def register_class_alias(self, short: str, namespace: str) -> None:
         if namespace:
@@ -151,6 +169,7 @@ def build_symbol_table(files: list[SourceFile]) -> SymbolTable:
                 )
                 if parent:
                     cls.parent = parent
+                table.all_classes.append(cls)
                 for child in node.named_children:
                     if child.type == "declaration_list":
                         for member in child.named_children:

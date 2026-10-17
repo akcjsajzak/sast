@@ -258,11 +258,18 @@ class TaintEngine:
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
         for sf in files:
             self.analyze_top_level(sf)
-        for fsym in self.symbols.functions.values():
+        # Every declaration, not one per name: the symbol dicts are keyed for
+        # resolution, so a second `function handle()` in another file was
+        # never analysed at all.
+        for fsym in self.symbols.all_functions:
             body = au.body_of(fsym.node)
             if body is not None:
                 self.process_block(body, fsym.source, {}, Ctx(namespace=fsym.namespace))
-        for cls in self.symbols.classes.values():
+        seen_classes = set()
+        for cls in self.symbols.all_classes:
+            if id(cls) in seen_classes:
+                continue
+            seen_classes.add(id(cls))
             self.analyze_class(cls)
         for sf in files:
             self.run_patterns(sf)
@@ -280,7 +287,7 @@ class TaintEngine:
         """
         fields: dict = {}
         for _ in range(2):
-            for msym in cls.methods.values():
+            for msym in (cls.all_methods or cls.methods.values()):
                 body = au.body_of(msym.node)
                 if body is None:
                     continue

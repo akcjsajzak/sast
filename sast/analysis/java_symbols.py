@@ -26,11 +26,21 @@ class JavaClass:
     parent: str = ""
     methods: dict = field(default_factory=dict)
     taintable_fields: set = field(default_factory=set)
+    # Every method declaration, overloads included. `methods` keeps one per
+    # name for resolution; analysing from it alone meant `doGet(a)` and
+    # `doGet(a, b)` could not both be walked, and only one of them was.
+    all_methods: list = field(default_factory=list)
 
 
 class JavaSymbolTable:
     def __init__(self) -> None:
         self.classes: dict[str, JavaClass] = {}
+        # Every class declaration, including several sharing a bare name.
+        # `classes` is keyed by name for receiver-type resolution, so a second
+        # class called `Test` was dropped and its methods never analysed at
+        # all — and OWASP Benchmark declares `private class Test` in some 1900
+        # files.
+        self.all_classes: list[JavaClass] = []
 
     def lookup_method(self, class_name: str, method_name: str):
         cls = self.classes.get(class_name)
@@ -53,25 +63,37 @@ def build_java_symbols(files: list[SourceFile]) -> JavaSymbolTable:
             if t in ("class_declaration", "interface_declaration", "enum_declaration"):
                 cname = ja.class_name(node) or ""
                 parent = ja.class_parent(node) or ""
-                cls = table.classes.setdefault(
+                named = table.classes.setdefault(
                     cname, JavaClass(name=cname, node=node, source=sf, parent=parent)
                 )
                 if parent:
-                    cls.parent = parent
+                    named.parent = parent
+                # This declaration in its own right, so its methods are
+                # analysed even when another class shares its name.
+                this_one = (named if named.node is node else
+                            JavaClass(name=cname, node=node, source=sf,
+                                      parent=parent))
+                table.all_classes.append(this_one)
                 for child in node.named_children:
                     if child.type in ("class_body", "interface_body", "enum_body"):
                         for member in child.named_children:
                             if member.type in ("method_declaration", "constructor_declaration"):
                                 mname = ja.method_name(member) or ("<init>" if member.type == "constructor_declaration" else "")
-                                params = ja.formal_params(member)
-                                if mname and mname not in cls.methods:
-                                    cls.methods[mname] = JavaMethod(
-                                        class_name=cname, name=mname, node=member,
-                                        source=sf, params=params,
-                                    )
+                                if not mname:
+                                    continue
+                                method = JavaMethod(
+                                    class_name=cname, name=mname, node=member,
+                                    source=sf, params=ja.formal_params(member),
+                                )
+                                this_one.all_methods.append(method)
+                                if mname not in named.methods:
+                                    named.methods[mname] = method
     # Second pass: compute which instance fields can carry tainted data.
     for cls in table.classes.values():
         _compute_taintable_fields(cls)
+    for cls in table.all_classes:
+        if cls.node is not table.classes.get(cls.name, cls).node:
+            _compute_taintable_fields(cls)
     return table
 
 

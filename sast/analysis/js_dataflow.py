@@ -76,14 +76,18 @@ class JsTaintEngine:
         # Route handlers and component bodies are nested in callbacks, so a
         # second pass over every function body catches anything the top-level
         # walk did not reach with its own environment.
-        for fsym in self.symbols.functions.values():
+        # Every declaration, not one per name: the symbol dicts are keyed for
+        # resolution, so a second `function handle()` in another module was
+        # never analysed — and with module scoping ignored, two modules
+        # exporting the same name is the normal case.
+        for fsym in self.symbols.all_functions:
             body = ja.body_of(fsym.node)
             if body is not None:
                 self.process_block(body, fsym.source, {}, Ctx())
-        for cls in self.symbols.classes.values():
+        for cls in self.symbols.all_classes:
             fields: dict = {}
             for _ in range(2):
-                for msym in cls.methods.values():
+                for msym in (cls.all_methods or cls.methods.values()):
                     body = ja.body_of(msym.node)
                     if body is None:
                         continue

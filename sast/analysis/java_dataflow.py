@@ -384,8 +384,12 @@ class JavaTaintEngine:
 
     # ------------------------------------------------------------------
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
-        for cls in self.symbols.classes.values():
-            for m in cls.methods.values():
+        # Every declaration and every overload. Iterating `classes` and
+        # `cls.methods` walked one class per bare name and one method per
+        # name, so a second class called `Test` and a second `doGet` overload
+        # were never analysed at all.
+        for cls in self.symbols.all_classes:
+            for m in cls.all_methods:
                 env: dict = {}
                 tenv: dict = {}
                 for (name, typ, tainted) in m.params:
