@@ -149,16 +149,22 @@ def declarators(node: Node):
 
 
 def declarator_parts(node: Node):
-    """Return (name, value_node_or_None) for a variable_declarator."""
-    name = None
-    value = None
-    for c in node.named_children:
-        if c.type == "identifier" and name is None:
-            name = text(c)
-        elif c.type not in ("identifier",) and value is None:
-            value = c
-        elif c.type == "identifier" and name is not None:
-            pass
+    """Return (name, value_node_or_None) for a variable_declarator.
+
+    Uses the grammar's own `name`/`value` fields. Matching positionally
+    instead would misread `String s = q;`, whose initializer is itself an
+    identifier, as having no initializer at all — silently dropping taint
+    across the most ordinary assignment in Java.
+    """
+    name_node = node.child_by_field_name("name")
+    value = node.child_by_field_name("value")
+    name = text(name_node) if name_node is not None else None
+    if name is None:
+        # Defensive fallback for grammar versions without named fields.
+        for c in node.named_children:
+            if c.type == "identifier":
+                name = text(c)
+                break
     return name, value
 
 

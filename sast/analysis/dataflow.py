@@ -15,11 +15,38 @@ MAX_DEPTH = 8
 MAX_STEPS = 15
 
 # Built-in functions that forward taint from their arguments to their result.
+# Anything missing here silently terminates a trace, so this errs on the side
+# of being generous: a transform that preserves attacker-controlled bytes in
+# any form belongs in this set.
 PROPAGATORS = frozenset({
+    # Whitespace / case / slicing
     "trim", "ltrim", "rtrim", "substr", "strtolower", "strtoupper",
-    "ucfirst", "ucwords", "lcfirst", "sprintf", "vsprintf", "implode",
-    "join", "strval", "str_replace", "str_ireplace", "preg_replace",
-    "mb_strtolower", "mb_strtoupper", "mb_substr",
+    "ucfirst", "ucwords", "lcfirst", "mb_strtolower", "mb_strtoupper",
+    "mb_substr", "substr_replace", "strrev", "str_pad", "wordwrap", "nl2br",
+    "chunk_split", "strtr", "stripslashes", "stripcslashes",
+    # Formatting / joining
+    "sprintf", "vsprintf", "implode", "join", "strval", "strip_tags",
+    # Replacement
+    "str_replace", "str_ireplace", "preg_replace", "preg_replace_callback",
+    "preg_filter",
+    # Splitting — the element is as tainted as the whole
+    "explode", "preg_split", "str_split", "mb_str_split", "str_word_count",
+    # Decoding: the decoded value is still attacker-controlled. Omitting
+    # these is how `json_decode($_POST['x'])` used to lose its taint.
+    "json_decode", "base64_decode", "urldecode", "rawurldecode",
+    "html_entity_decode", "htmlspecialchars_decode", "unserialize",
+    "hex2bin", "bin2hex", "quoted_printable_decode", "convert_uudecode",
+    "gzinflate", "gzuncompress", "gzdecode", "utf8_decode", "utf8_encode",
+    "mb_convert_encoding", "iconv", "unpack",
+    # Array transforms that carry element taint through
+    "array_map", "array_filter", "array_merge", "array_values", "array_keys",
+    "array_slice", "array_splice", "array_reverse", "array_unique",
+    "array_combine", "array_flip", "array_column", "array_pop",
+    "array_shift", "current", "reset", "end", "next", "prev", "compact",
+    "iterator_to_array",
+    # filter_var only sanitizes when a filter is supplied; the single-argument
+    # form is a no-op, so taint has to keep flowing through it.
+    "filter_var",
 })
 
 # Numeric cast types neutralize string-based injection.
@@ -120,6 +147,64 @@ def _taint_key(t: "Taint"):
     return (frozenset(t.tags), origins, t.confidence)
 
 
+# Side-channel env keys. PHP variable names cannot contain NUL, so these
+# never collide with a real variable. They let the engine remember facts that
+# are not taint: the literal string a variable holds (for dynamic calls), the
+# class a variable was constructed from (to resolve $obj->method()), and the
+# closure a variable refers to.
+_LIT = "\0lit:"
+_TYPE = "\0type:"
+_FN = "\0fn:"
+_RESERVED = (_LIT, _TYPE, _FN)
+
+
+def _is_reserved(key: str) -> bool:
+    return isinstance(key, str) and key.startswith("\0")
+
+
+# Sentinel distinguishing "could not resolve this call" from "resolved, no
+# taint" — the latter must not fall through to the normal call handling.
+_UNRESOLVED = object()
+
+# Builtins taking a callable: name -> (callable arg index, first forwarded arg).
+_CALLABLE_TAKERS = {
+    "call_user_func": (0, 1),
+    "call_user_func_array": (0, 1),
+    "array_map": (0, 1),
+    "array_filter": (1, 0),
+    "array_walk": (1, 0),
+    "array_reduce": (1, 0),
+    "usort": (1, 0),
+    "uasort": (1, 0),
+    "uksort": (1, 0),
+    "iterator_apply": (1, 0),
+    "register_shutdown_function": (0, 1),
+    "forward_static_call": (0, 1),
+    "forward_static_call_array": (0, 1),
+}
+
+
+def _closure_params(closure: Node) -> list:
+    """Parameter names of an anonymous/arrow function node."""
+    names = []
+    for c in closure.named_children:
+        if c.type != "formal_parameters":
+            continue
+        for p in c.named_children:
+            for pc in p.named_children:
+                if pc.type == "variable_name":
+                    names.append(au.var_name(pc))
+                    break
+    return names
+
+
+def _is_property_key(key: str) -> bool:
+    """True for env keys naming an object or static property ($this->p, C::$s)."""
+    if _is_reserved(key):
+        return False
+    return key.startswith("$this->") or key.startswith("self::") or "::$" in key
+
+
 def _dedup(items: list):
     seen = set()
     out = []
@@ -151,6 +236,8 @@ class TaintEngine:
         self.findings: list[Finding] = []
         self._seen: set = set()
         self._call_memo: dict = {}
+        # Taint reaching module-level variables, so `global $g` can see it.
+        self._globals: dict = {}
 
     # ------------------------------------------------------------------
     # Entry points
@@ -163,14 +250,33 @@ class TaintEngine:
             if body is not None:
                 self.process_block(body, fsym.source, {}, Ctx(namespace=fsym.namespace))
         for cls in self.symbols.classes.values():
-            for msym in cls.methods.values():
-                body = au.body_of(msym.node)
-                if body is not None:
-                    self.process_block(body, msym.source, {},
-                                       Ctx(current_class=cls.name, namespace=msym.namespace))
+            self.analyze_class(cls)
         for sf in files:
             self.run_patterns(sf)
         return self.findings
+
+    def analyze_class(self, cls) -> None:
+        """Analyse a class's methods, carrying property taint between them.
+
+        Methods are visited twice: the first pass records what each one stores
+        into `$this->...` or a static property, the second re-runs them with
+        those properties already tainted. That catches the common shape of a
+        setter (or constructor) storing request data that a later method sinks,
+        without needing a full call graph. Duplicate findings from the two
+        passes are collapsed by the usual `_seen` de-duplication.
+        """
+        fields: dict = {}
+        for _ in range(2):
+            for msym in cls.methods.values():
+                body = au.body_of(msym.node)
+                if body is None:
+                    continue
+                env = dict(fields)
+                self.process_block(body, msym.source, env,
+                                   Ctx(current_class=cls.name, namespace=msym.namespace))
+                for key, val in env.items():
+                    if _is_property_key(key):
+                        fields[key] = val if key not in fields else fields[key].merge(val)
 
     def analyze_top_level(self, sf: SourceFile) -> None:
         env: dict = {}
@@ -184,6 +290,8 @@ class TaintEngine:
                     self.process_stmt(inner[0], sf, env, Ctx(namespace=ns))
             else:
                 self.process_stmt(child, sf, env, Ctx(namespace=ns))
+        # Module-level variables are what `global $x` inside a function sees.
+        _merge_env(self._globals, env)
 
     # ------------------------------------------------------------------
     # Statement handling
@@ -229,6 +337,18 @@ class TaintEngine:
             return self.handle_try(stmt, sf, env, ctx)
         if t in ("break_statement", "continue_statement", "throw_statement"):
             return None
+        if t == "global_declaration":
+            # `global $g;` pulls the module-level taint for $g into scope.
+            for c in stmt.named_children:
+                if c.type == "variable_name":
+                    name = au.var_name(c)
+                    gt = self._globals.get(name)
+                    if gt is not None:
+                        env[name] = gt
+                    for prefix in _RESERVED:
+                        if prefix + name in self._globals:
+                            env[prefix + name] = self._globals[prefix + name]
+            return None
         if t == "expression_statement":
             nc = stmt.named_children
             if nc:
@@ -245,6 +365,35 @@ class TaintEngine:
         lhs, rhs = nc[0], nc[-1]
         t = self.taint_of(rhs, sf, env, ctx)
         self.assign(lhs, t, sf, env)
+        self._record_facts(lhs, rhs, env)
+
+    def _record_facts(self, lhs: Node, rhs: Node, env: dict) -> None:
+        """Remember non-taint facts about a variable: the literal string it
+        holds, the class it was constructed from, or the closure it names.
+
+        These make `$fn = 'system'; $fn($x)`, `$o = new C(); $o->m($x)` and
+        `$f = function(...){...}; $f($x)` resolvable.
+        """
+        if lhs.type != "variable_name":
+            return
+        name = au.var_name(lhs)
+        if not name:
+            return
+        for prefix in _RESERVED:
+            env.pop(prefix + name, None)
+
+        inner = au.strip_wrappers(rhs) if hasattr(au, "strip_wrappers") else rhs
+        lit = au.literal_string(inner)
+        if lit:
+            env[_LIT + name] = lit
+        elif inner.type == "object_creation_expression":
+            for c in inner.named_children:
+                if c.type in ("name", "qualified_name"):
+                    env[_TYPE + name] = au.text(c)
+                    break
+        elif inner.type in ("anonymous_function", "arrow_function",
+                            "anonymous_function_creation_expression"):
+            env[_FN + name] = inner
 
     def assign(self, lhs: Node, t, sf: SourceFile, env: dict) -> None:
         if lhs.type == "variable_name":
@@ -264,7 +413,10 @@ class TaintEngine:
             if base is not None and base.type == "variable_name" and t is not None:
                 name = au.var_name(base)
                 env[name] = t if name not in env else env[name].merge(t)
-        elif lhs.type == "member_access_expression":
+        elif lhs.type in ("member_access_expression",
+                          "scoped_property_access_expression"):
+            # $this->prop, $obj->prop, and C::$staticProp are all keyed by
+            # their source text, so a later read of the same text matches.
             key = au.text(lhs)
             if t is not None:
                 env[key] = t.with_step(TaintStep(
@@ -406,15 +558,27 @@ class TaintEngine:
         it = self.taint_of(iterable, sf, env, ctx)
         if it is None:
             return
-        for c in named:
+        for c in named[1:]:
+            # `foreach ($x as $k => $v)` — the value half carries the taint.
             if c.type == "pair":
                 pc = c.named_children
-                if not pc:
-                    continue
-                value = pc[-1]
-                if value.type == "variable_name":
-                    env[au.var_name(value)] = it
-                break
+                if pc and pc[-1].type == "variable_name":
+                    env[au.var_name(pc[-1])] = it
+                return
+            # `foreach ($x as $v)` — a bare variable, by far the common form.
+            if c.type == "variable_name":
+                env[au.var_name(c)] = it
+                return
+            # `foreach ($x as [$a, $b])` / list(...) destructuring.
+            if c.type in ("list_literal", "array_creation_expression"):
+                for el in c.named_children:
+                    target = el
+                    if target.type == "array_element_initializer":
+                        ec = target.named_children
+                        target = ec[0] if ec else target
+                    if target.type == "variable_name":
+                        env[au.var_name(target)] = it
+                return
 
     def handle_switch(self, node: Node, sf: SourceFile, env: dict, ctx: Ctx):
         ret = None
@@ -468,7 +632,7 @@ class TaintEngine:
             return self.variable_taint(node, sf, env, ctx)
         if t == "subscript_expression":
             return self.subscript_taint(node, sf, env, ctx)
-        if t == "member_access_expression":
+        if t in ("member_access_expression", "scoped_property_access_expression"):
             return env.get(au.text(node))
         if t == "parenthesized_expression":
             nc = node.named_children
@@ -611,15 +775,42 @@ class TaintEngine:
             cls, callee = au.callee_parts(node)
         args = au.argument_values(node)
 
+        if kind == "function" and not callee:
+            # `$fn($x)` — resolve through a variable holding a function name
+            # or a closure.
+            resolved = self._resolve_dynamic_call(node, args, sf, env, ctx)
+            if resolved is not _UNRESOLVED:
+                return resolved
+        elif kind == "method" and not ctx.current_class:
+            # `$obj->m($x)` where $obj came from `new C()`.
+            recv_cls = self._receiver_class(node, env)
+            if recv_cls:
+                msym = self.symbols.lookup_method(recv_cls, callee, ctx.namespace)
+                if msym is not None and ctx.depth < MAX_DEPTH:
+                    return self.analyze_method_call(msym, args, node, sf, env, ctx)
+
+        # Builtins that take a callable: route the taint into the callee so
+        # array_map('system', $_GET['a']) is seen as a call to system().
+        if kind == "function" and callee in _CALLABLE_TAKERS:
+            cb = self._callable_taint(callee, args, node, sf, env, ctx)
+            if cb is not _UNRESOLVED:
+                return cb
+
+        # Sink check comes first: being a source is a fact about a call's
+        # return value, being a sink is a fact about its arguments, and a call
+        # can be both. file_get_contents($tainted) is an SSRF sink *and*
+        # returns attacker-influenced data; checking the source first would
+        # return early and silently lose the sink.
+        san = self.match_sanitizer(kind, callee, cls, args)
+        if san is None:
+            self.check_call_sink(kind, callee, cls, args, node, sf, env, ctx)
+
         st = self.source_taint(kind, callee, node, sf, cls, args)
         if st is not None:
             return st
 
-        san = self.match_sanitizer(kind, callee, cls)
         if san is not None:
             return self.sanitized_taint(san, args, sf, env, ctx)
-
-        self.check_call_sink(kind, callee, cls, args, node, sf, env, ctx)
 
         ut = self.user_call_taint(kind, callee, cls, args, node, sf, env, ctx)
         if ut is not None:
@@ -634,6 +825,114 @@ class TaintEngine:
             return merged
 
         return None
+
+    def _receiver_class(self, node: Node, env: dict):
+        """Class name of a method call's receiver, if it came from `new C()`."""
+        nc = node.named_children
+        if not nc or nc[0].type != "variable_name":
+            return None
+        name = au.var_name(nc[0])
+        return env.get(_TYPE + name) if name else None
+
+    def _resolve_dynamic_call(self, node: Node, args, sf, env, ctx):
+        """Resolve `$fn(...)` to a named function or an inline closure."""
+        nc = node.named_children
+        if not nc or nc[0].type != "variable_name":
+            return _UNRESOLVED
+        name = au.var_name(nc[0])
+        if not name:
+            return _UNRESOLVED
+
+        target = env.get(_LIT + name)
+        if target:
+            return self._dispatch_named(target, args, node, sf, env, ctx)
+
+        closure = env.get(_FN + name)
+        if closure is not None and ctx.depth < MAX_DEPTH:
+            return self._invoke_closure(closure, args, node, sf, env, ctx)
+        return _UNRESOLVED
+
+    def _dispatch_named(self, callee: str, args, node, sf, env, ctx):
+        """Treat `callee` as if it had been written literally at this call."""
+        st = self.source_taint("function", callee, node, sf, None, args)
+        if st is not None:
+            return st
+        san = self.match_sanitizer("function", callee, None, args)
+        if san is not None:
+            return self.sanitized_taint(san, args, sf, env, ctx)
+        self.check_call_sink("function", callee, None, args, node, sf, env, ctx)
+        ut = self.user_call_taint("function", callee, None, args, node, sf, env, ctx)
+        if ut is not None:
+            return ut
+        if callee in PROPAGATORS:
+            return self._merge_args(args, sf, env, ctx)
+        return None
+
+    def _invoke_closure(self, closure: Node, args, node, sf, env, ctx):
+        """Analyse a closure body with the call's arguments bound to params."""
+        params = au.param_names(closure) if hasattr(au, "param_names") else []
+        if not params:
+            params = _closure_params(closure)
+        new_env = {}
+        for i, p in enumerate(params):
+            if i < len(args):
+                t = self.taint_of(args[i], sf, env, ctx)
+                if t is not None:
+                    new_env[p] = t.with_step(TaintStep(
+                        location=make_loc(sf, node),
+                        description=f"argument flows into closure parameter {p}",
+                        code=sf.node_line(node),
+                    ))
+        body = au.body_of(closure)
+        sub = Ctx(depth=ctx.depth + 1, current_class=ctx.current_class,
+                  namespace=ctx.namespace)
+        if body is None:
+            # Arrow function: the body is a bare expression.
+            for c in closure.named_children:
+                if c.type not in ("formal_parameters",):
+                    return self.taint_of(c, sf, new_env, sub)
+            return None
+        return self.process_block(body, sf, new_env, sub)
+
+    def _callable_taint(self, callee: str, args, node, sf, env, ctx):
+        """Handle array_map/call_user_func style builtins.
+
+        The callable argument is dispatched with the remaining arguments, so a
+        sink reached only through a callback is still reported.
+        """
+        if not args:
+            return _UNRESOLVED
+        spec = _CALLABLE_TAKERS[callee]
+        cb_index, arg_start = spec
+        if len(args) <= cb_index:
+            return _UNRESOLVED
+        cb = au.strip_wrappers(args[cb_index]) if hasattr(au, "strip_wrappers") else args[cb_index]
+        rest = list(args[arg_start:])
+
+        target = au.literal_string(cb)
+        if not target and cb.type == "variable_name":
+            vname = au.var_name(cb)
+            target = env.get(_LIT + vname) if vname else None
+            if not target:
+                closure = env.get(_FN + vname) if vname else None
+                if closure is not None and ctx.depth < MAX_DEPTH:
+                    return self._invoke_closure(closure, rest, node, sf, env, ctx)
+        if not target and cb.type in ("anonymous_function", "arrow_function",
+                                      "anonymous_function_creation_expression"):
+            if ctx.depth < MAX_DEPTH:
+                return self._invoke_closure(cb, rest, node, sf, env, ctx)
+            return _UNRESOLVED
+        if not target:
+            return _UNRESOLVED
+        return self._dispatch_named(target, rest, node, sf, env, ctx)
+
+    def _merge_args(self, args, sf, env, ctx):
+        merged = None
+        for a in args:
+            tt = self.taint_of(a, sf, env, ctx)
+            if tt is not None:
+                merged = tt if merged is None else merged.merge(tt)
+        return merged
 
     def source_taint(self, kind, match, node, sf, cls=None, args=None, key=None):
         for src in self.rules.sources:
@@ -661,13 +960,18 @@ class TaintEngine:
             )
         return None
 
-    def match_sanitizer(self, kind, callee, cls):
+    def match_sanitizer(self, kind, callee, cls, args=None):
+        arg_texts = [au.text(a) for a in (args or [])]
         for san in self.rules.sanitizers:
             if san.kind != kind:
                 continue
             if not match_callee(callee, san.match):
                 continue
             if san.cls and not match_callee(cls, san.cls):
+                continue
+            # A rule whose preconditions are unmet does not sanitize; keep
+            # looking, so a weaker fallback rule for the same function wins.
+            if not san.args_satisfied(arg_texts):
                 continue
             return san
         return None
@@ -679,6 +983,20 @@ class TaintEngine:
         t = self.taint_of(args[idx], sf, env, ctx)
         if t is None:
             return None
+        if san.weak:
+            # Escaping happened, but it is bypassable or context-dependent.
+            # Keep the taint so the finding survives, at lower confidence.
+            node = args[idx]
+            step = TaintStep(
+                location=make_loc(sf, node),
+                description=san.note or f"weak sanitizer {san.match}() applied",
+                code=sf.node_line(node),
+            )
+            return Taint(
+                tags=set(t.tags), origins=list(t.origins),
+                steps=t.steps + [step],
+                confidence=weakest_confidence(t.confidence, "medium"),
+            )
         if "*" in san.neutralize:
             return None
         return self._neutralize(t, san.neutralize)
@@ -875,8 +1193,7 @@ class TaintEngine:
                 if value is None:
                     continue
                 if rule.regex:
-                    import re
-                    if not re.search(rule.match, value):
+                    if not rule.compiled().search(value):
                         continue
                 else:
                     if value != rule.match:
@@ -946,7 +1263,8 @@ def _merge_taint(a, b):
 
 def _merge_env(env: dict, other: dict) -> None:
     for k, t in other.items():
-        if k in env:
-            env[k] = env[k].merge(t)
-        else:
+        # Side-channel facts are plain values, not taints — overwrite them.
+        if _is_reserved(k) or k not in env:
             env[k] = t
+        else:
+            env[k] = env[k].merge(t)

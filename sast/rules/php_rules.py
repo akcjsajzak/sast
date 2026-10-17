@@ -95,12 +95,43 @@ def _sources() -> list[TaintSource]:
                     "only if the environment is externally influenced)",
     ))
 
-    # Raw request body and environment.
+    # Raw request body and environment. This arg_literal rule is listed before
+    # the generic file-read source below so php://input keeps high confidence.
     s.append(TaintSource(
         kind="function", match="file_get_contents", tags=_ALL_TAGS,
         description="Raw HTTP request body read via file_get_contents('php://input')",
         arg_literal=(0, "php://input"),
     ))
+
+    # --- Second-order sources -------------------------------------------
+    # Data read back out of storage. It is attacker-controlled whenever
+    # attacker input was written there earlier, which is exactly the shape of
+    # stored XSS and second-order SQL injection. Reported at low confidence
+    # because that depends on a write the scan may never see.
+    for fn in ("mysqli_fetch_assoc", "mysqli_fetch_array", "mysqli_fetch_row",
+               "mysqli_fetch_object", "mysqli_fetch_all", "pg_fetch_assoc",
+               "pg_fetch_array", "pg_fetch_row", "pg_fetch_object",
+               "pg_fetch_all", "pg_fetch_result", "sqlite_fetch_array",
+               "odbc_fetch_array", "odbc_result"):
+        s.append(TaintSource(
+            kind="function", match=fn, tags=_ALL_TAGS, confidence="low",
+            description=f"Row read back from the database via {fn}() "
+                        "(second-order: tainted if attacker data was stored)",
+        ))
+    for m in ("fetch", "fetchAll", "fetchColumn", "fetchObject"):
+        s.append(TaintSource(
+            kind="method", match=m, tags=_ALL_TAGS, confidence="low",
+            description=f"Row read back from the database via PDO ->{m}() "
+                        "(second-order: tainted if attacker data was stored)",
+        ))
+    for fn in ("file_get_contents", "file", "fgets", "fread", "fgetss",
+               "fscanf", "readfile", "stream_get_contents", "fgetcsv",
+               "parse_ini_file", "simplexml_load_file"):
+        s.append(TaintSource(
+            kind="function", match=fn, tags=_ALL_TAGS, confidence="low",
+            description=f"Data read from an external file or stream via {fn}() "
+                        "(trusted only if the file is)",
+        ))
     s.append(TaintSource(
         kind="function", match="getenv", tags=_ALL_TAGS, confidence="low",
         description="Environment variable (potentially attacker influenced)",
@@ -554,25 +585,58 @@ def _sinks() -> list[SinkRule]:
 
 def _sanitizers() -> list[SanitizerRule]:
     s = []
-    # HTML escaping neutralizes XSS.
-    for fn in ("htmlspecialchars", "htmlentities", "strip_tags"):
+    # HTML escaping. Order matters: the first rule whose preconditions hold
+    # wins, so the sound variants are listed before the weak fallbacks.
+
+    # htmlspecialchars/htmlentities are treated as sound for XSS. Since PHP
+    # 8.1 the default flags are ENT_QUOTES|ENT_SUBSTITUTE, so single quotes
+    # are escaped without being asked for; requiring an explicit ENT_QUOTES
+    # would flag correct modern code. What remains unsound is the *context*
+    # (inside <script>, or an unquoted attribute), which needs template
+    # analysis the engine does not have — see README "Limitations".
+    for fn in ("htmlspecialchars", "htmlentities"):
         s.append(SanitizerRule(kind="function", match=fn, neutralize=["xss"]))
-    # Laravel's e() helper.
-    s.append(SanitizerRule(kind="function", match="e", neutralize=["xss"], frameworks=("Laravel",)))
-    s.append(SanitizerRule(kind="function", match="htmlspecialchars", neutralize=["xss"]))
-    # SQL escaping.
-    for fn in ("addslashes", "mysqli_real_escape_string", "mysql_real_escape_string",
+    # strip_tags removes tags but escapes nothing, so quotes and event-handler
+    # payloads survive in any attribute context — unsound at any PHP version.
+    s.append(SanitizerRule(
+        kind="function", match="strip_tags", neutralize=["xss"], weak=True,
+        note="strip_tags() does not escape quotes; unsafe in an attribute context",
+    ))
+    # Laravel's e() defaults to ENT_QUOTES.
+    s.append(SanitizerRule(kind="function", match="e", neutralize=["xss"],
+                           frameworks=("Laravel",)))
+
+    # SQL escaping. The driver-aware functions are sound; addslashes is not.
+    for fn in ("mysqli_real_escape_string", "mysql_real_escape_string",
                "pg_escape_string", "pg_escape_literal", "sqlite_escape_string"):
         s.append(SanitizerRule(kind="function", match=fn, neutralize=["sql"]))
+    s.append(SanitizerRule(
+        kind="function", match="addslashes", neutralize=["sql"], weak=True,
+        note="addslashes() is not connection-charset aware and is bypassable "
+             "under multibyte charsets (e.g. GBK); use prepared statements",
+    ))
     s.append(SanitizerRule(kind="method", match="quote", neutralize=["sql"], cls="PDO"))
-    # Command escaping.
-    for fn in ("escapeshellarg", "escapeshellcmd"):
-        s.append(SanitizerRule(kind="function", match=fn, neutralize=["cmd"]))
+
+    # Command escaping. escapeshellarg quotes a single argument correctly;
+    # escapeshellcmd only escapes shell metacharacters and still permits
+    # argument injection (e.g. a leading "-" turning into a flag).
+    s.append(SanitizerRule(kind="function", match="escapeshellarg", neutralize=["cmd"]))
+    s.append(SanitizerRule(
+        kind="function", match="escapeshellcmd", neutralize=["cmd"], weak=True,
+        note="escapeshellcmd() does not quote individual arguments and still "
+             "allows argument injection; use escapeshellarg() per argument",
+    ))
+
     # Numeric coercion neutralizes string injection.
     for fn in ("intval", "floatval", "doubleval", "abs"):
         s.append(SanitizerRule(kind="function", match=fn, neutralize=["sql", "cmd", "xss", "ssrf", "lfi", "xxe", "ldap"]))
-    # filter_var with sanitize/validate filters.
-    s.append(SanitizerRule(kind="function", match="filter_var", neutralize=["sql", "cmd", "xss", "ssrf", "lfi", "ldap"]))
+    # filter_var only filters when a filter is actually supplied; the
+    # single-argument form defaults to FILTER_DEFAULT, which does nothing.
+    s.append(SanitizerRule(
+        kind="function", match="filter_var",
+        neutralize=["sql", "cmd", "xss", "ssrf", "lfi", "ldap"],
+        min_args=2,
+    ))
     # URL encoding.
     s.append(SanitizerRule(kind="function", match="urlencode", neutralize=["redirect"]))
     s.append(SanitizerRule(kind="function", match="rawurlencode", neutralize=["redirect"]))
@@ -584,6 +648,8 @@ def _sanitizers() -> list[SanitizerRule]:
 
 
 def _patterns() -> list[PatternRule]:
+    A02 = "A02:2021 — Cryptographic Failures"
+    A05 = "A05:2021 — Security Misconfiguration"
     p = []
     p.append(PatternRule(
         rule_id="php-code-eval", node_type="function_call_expression", match="eval",
@@ -608,6 +674,89 @@ def _patterns() -> list[PatternRule]:
         category="weak-crypto",
         description="MD5 is cryptographically broken. If used for passwords or integrity this is a weakness.",
         remediation="Use password_hash()/password_verify() for passwords and SHA-256+ for integrity.",
+    ))
+    p.append(PatternRule(
+        rule_id="php-crypto-sha1", node_type="function_call_expression", match="sha1",
+        match_field="callee", title="Weak cryptographic hash (SHA-1)",
+        severity="low", cwe="CWE-328", owasp=A02, category="weak-crypto",
+        description="SHA-1 is collision-prone and unsuitable for signatures, "
+                    "integrity checks or password storage.",
+        remediation="Use password_hash()/password_verify() for passwords and SHA-256+ otherwise.",
+    ))
+    for fn in ("rand", "mt_rand", "lcg_value", "uniqid", "shuffle", "str_shuffle",
+               "array_rand", "mt_srand", "srand"):
+        p.append(PatternRule(
+            rule_id=f"php-weak-random-{fn}", node_type="function_call_expression",
+            match=fn, match_field="callee",
+            title="Predictable random number generator",
+            severity="medium", cwe="CWE-338", owasp=A02, category="weak-random",
+            description=f"{fn}() is not cryptographically secure. Using it for tokens, "
+                        "session identifiers, password resets or nonces makes them guessable.",
+            remediation="Use random_bytes() or random_int() for anything security-relevant.",
+            confidence="medium",
+        ))
+    p.append(PatternRule(
+        rule_id="php-hardcoded-secret", node_type="assignment_expression",
+        match=r"\$(?:[a-z_]*(?:password|passwd|pwd|secret|api[_-]?key|apikey|token|"
+              r"private[_-]?key|access[_-]?key))[a-z_]*\s*=\s*['\"][^'\"]{6,}['\"]",
+        match_field="text", regex=True, ignore_case=True,
+        title="Hardcoded credential",
+        severity="medium", cwe="CWE-798",
+        owasp="A07:2021 — Identification and Authentication Failures",
+        category="hardcoded-secret",
+        description="A credential or secret literal is assigned inline in source, "
+                    "so it lands in version control and in every deployed copy.",
+        remediation="Load secrets from the environment or a secrets manager.",
+        confidence="medium",
+    ))
+    p.append(PatternRule(
+        rule_id="php-tls-verify-disabled", node_type="function_call_expression",
+        match=r"CURLOPT_SSL_VERIFY(?:PEER|HOST)\s*,\s*(?:false|0|FALSE)",
+        match_field="text", regex=True,
+        title="TLS certificate verification disabled",
+        severity="high", cwe="CWE-295", owasp=A02, category="insecure-transport",
+        description="Disabling CURLOPT_SSL_VERIFYPEER/VERIFYHOST accepts any certificate, "
+                    "making the connection trivially machine-in-the-middle-able.",
+        remediation="Leave verification enabled and fix the trust store instead.",
+    ))
+    p.append(PatternRule(
+        rule_id="php-crypto-ecb", node_type="function_call_expression",
+        match=r"['\"][a-z0-9-]*-ecb['\"]", match_field="text", regex=True,
+        title="Insecure cipher mode (ECB)",
+        severity="medium", cwe="CWE-327", owasp=A02, category="weak-crypto",
+        description="ECB encrypts identical plaintext blocks to identical ciphertext "
+                    "blocks, leaking structure in the plaintext.",
+        remediation="Use an authenticated mode such as AES-GCM, or AES-CBC with a random IV and a MAC.",
+    ))
+    p.append(PatternRule(
+        rule_id="php-cookie-insecure", node_type="function_call_expression",
+        match=r"setcookie\s*\([^;]*?,\s*(?:false|0)\s*,\s*(?:false|0)\s*\)",
+        match_field="text", regex=True,
+        title="Cookie set without Secure and HttpOnly",
+        severity="medium", cwe="CWE-1004", owasp=A05, category="security-misconfiguration",
+        description="A cookie is set with both the secure and httponly flags off, so it "
+                    "is sent over plaintext HTTP and is readable from JavaScript.",
+        remediation="Set secure=true and httponly=true, and add SameSite.",
+        confidence="medium",
+    ))
+    p.append(PatternRule(
+        rule_id="php-xxe-entity-loader", node_type="function_call_expression",
+        match=r"libxml_disable_entity_loader\s*\(\s*(?:false|0|FALSE)\s*\)",
+        match_field="text", regex=True,
+        title="XML external entity loading re-enabled",
+        severity="high", cwe="CWE-611", owasp=A05, category="xxe",
+        description="libxml_disable_entity_loader(false) re-enables external entity "
+                    "resolution, exposing the parser to XXE.",
+        remediation="Leave entity loading disabled, or parse without LIBXML_NOENT/LIBXML_DTDLOAD.",
+    ))
+    p.append(PatternRule(
+        rule_id="php-xxe-noent", node_type="function_call_expression",
+        match=r"LIBXML_(?:NOENT|DTDLOAD)", match_field="text", regex=True,
+        title="XML parsed with external entities enabled",
+        severity="high", cwe="CWE-611", owasp=A05, category="xxe",
+        description="LIBXML_NOENT/LIBXML_DTDLOAD substitute external entities while "
+                    "parsing, which is the XXE primitive.",
+        remediation="Parse without these flags.",
     ))
     return p
 

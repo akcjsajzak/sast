@@ -8,11 +8,18 @@ from dataclasses import dataclass, field
 from .advisory.analyzer import analyze_dependencies
 from .advisory.db import AdvisoryDB
 from .analysis.blade import scan_blade
+from .analysis.config_scan import collect_config_files, scan_configs
 from .analysis.dataflow import TaintEngine
+from .analysis.templates import collect_template_files, scan_templates
 from .analysis.java_dataflow import JavaTaintEngine
 from .analysis.java_symbols import build_java_symbols
 from .analysis.symbols import build_symbol_table
-from .detection import collect_source_files_detailed, detect_framework, detect_languages
+from .detection import (
+    collect_source_files_detailed,
+    detect_framework,
+    detect_languages,
+    is_test_path,
+)
 from .detection.language import DEFAULT_MAX_FILE_BYTES
 from .models import ScanResult, SEVERITY_ORDER
 from .parsing.java import JavaParser
@@ -31,6 +38,10 @@ class ScanOptions:
     # skipped rather than allowed to stall the whole scan.
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
     max_files: int = 0  # 0 = unlimited
+    # Templates and configuration files are scanned alongside source; these
+    # exist so a noisy repo can turn either off.
+    scan_templates: bool = True
+    scan_configs: bool = True
 
 
 class ScanEngine:
@@ -75,6 +86,24 @@ class ScanEngine:
             files_scanned += parsed_count
             if unreadable:
                 skipped["unreadable"] = skipped.get("unreadable", 0) + unreadable
+
+        # Templates and configuration are scanned independently of the
+        # detected source languages: they are where rendering and deployment
+        # posture actually live, and neither is PHP or Java source.
+        primary = languages[0]
+        if self.options.scan_templates:
+            tpl_files = collect_template_files(root)
+            if not self.options.include_tests:
+                tpl_files = [(p, k) for (p, k) in tpl_files
+                             if not is_test_path(os.path.relpath(p, root))]
+            findings.extend(scan_templates(tpl_files))
+            files_scanned += len(tpl_files)
+        if self.options.scan_configs:
+            cfg_files = collect_config_files(root)
+            findings.extend(scan_configs(
+                cfg_files, language=primary, framework=frameworks.get(primary, "raw"),
+            ))
+            files_scanned += len(cfg_files)
 
         # Dependency analysis, per language and per module.
         db = AdvisoryDB()

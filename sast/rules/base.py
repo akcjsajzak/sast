@@ -82,16 +82,47 @@ class SinkRule:
 
 @dataclass
 class SanitizerRule:
-    """A call that neutralizes specific taint tags in its arguments."""
+    """A call that neutralizes specific taint tags in its arguments.
+
+    Escaping is only sound for the context it was designed for, and several
+    widely-used functions are conditional on their arguments. A rule that
+    clears taint unconditionally turns those cases into silent false
+    negatives, so a rule can instead be marked `weak` (lowers confidence but
+    keeps the finding) or be gated on `required_arg`.
+    """
     kind: str                 # 'function' | 'method' | 'static'
     match: str
     neutralize: list[str]     # tags to remove, or ['*'] for all
     frameworks: tuple = ALL
     cls: Optional[str] = None
     arg_index: int = 0        # which argument is sanitized
+    # Escapes, but with a documented bypass or a context caveat. The finding
+    # survives at reduced confidence instead of disappearing.
+    weak: bool = False
+    # Minimum argument count for the call to sanitize at all. filter_var($x)
+    # with no filter is a no-op, for example.
+    min_args: int = 0
+    # (index, (substring, ...)) — one of the substrings must appear in that
+    # argument, e.g. ENT_QUOTES for htmlspecialchars to escape single quotes.
+    required_arg: Optional[tuple] = None
+    # Explains the caveat; surfaced in the trace of a weak-sanitizer finding.
+    note: str = ""
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)
+
+    def args_satisfied(self, arg_texts: list) -> bool:
+        """True if the call's arguments meet this rule's preconditions."""
+        if len(arg_texts) < self.min_args:
+            return False
+        if self.required_arg:
+            idx, wanted = self.required_arg
+            if idx >= len(arg_texts):
+                return False
+            text = arg_texts[idx] or ""
+            if not any(w in text for w in wanted):
+                return False
+        return True
 
 
 @dataclass
@@ -111,9 +142,23 @@ class PatternRule:
     frameworks: tuple = ALL
     regex: bool = False
     confidence: str = "high"
+    # Match case-insensitively. Needed wherever identifiers are matched by
+    # name, since `$apiKey` and `api_key` are the same thing to a reader.
+    ignore_case: bool = False
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)
+
+    def compiled(self):
+        """Cached compiled regex for this rule (None when not a regex rule)."""
+        if not self.regex:
+            return None
+        cached = getattr(self, "_compiled", None)
+        if cached is None:
+            import re
+            cached = re.compile(self.match, re.IGNORECASE if self.ignore_case else 0)
+            object.__setattr__(self, "_compiled", cached)
+        return cached
 
 
 @dataclass

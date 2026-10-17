@@ -116,8 +116,74 @@ def parse_gradle(root: str) -> list[tuple[str, str]]:
     return result
 
 
+# Gradle dependency locking: "group:artifact:version=conf1,conf2". These are
+# fully resolved, so they include transitive dependencies.
+_GRADLE_LOCK_RE = re.compile(
+    r"^([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([^=\s]+)=", re.MULTILINE
+)
+
+# `mvn dependency:tree` text output, e.g.
+#   [INFO] +- org.apache.logging.log4j:log4j-core:jar:2.14.0:compile
+#   [INFO] |  \- com.example:lib:jar:1.0:runtime
+_MVN_TREE_RE = re.compile(
+    r"[|+\\\- ]*\b([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):(?:[a-z-]+:)?"
+    r"(?:[A-Za-z0-9_.\-]+:)?([0-9][A-Za-z0-9_.\-]*):(?:compile|provided|runtime|test|system)",
+    re.MULTILINE,
+)
+
+# Files that, when present, give a fully resolved dependency set.
+RESOLVED_FILES = (
+    "gradle.lockfile",
+    "dependency-tree.txt",
+    "dependencies.txt",
+    "deps.txt",
+    "maven-dependency-tree.txt",
+)
+
+
+def parse_resolved(root: str) -> list[tuple[str, str]]:
+    """Parse a resolved dependency listing, including transitive entries.
+
+    `pom.xml` and `build.gradle` only declare *direct* dependencies, so a
+    library pulled in transitively — the shape of the Log4Shell exposure, where
+    log4j-core arrived via spring-boot-starter — is invisible from them alone.
+    Resolving that properly needs the Maven/Gradle resolver and a network, so
+    instead we read a resolved listing when the project has committed or
+    generated one.
+    """
+    result: list[tuple[str, str]] = []
+    seen: set = set()
+    for name in RESOLVED_FILES:
+        path = os.path.join(root, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        regex = _GRADLE_LOCK_RE if name == "gradle.lockfile" else _MVN_TREE_RE
+        for m in regex.finditer(text):
+            pkg, version = f"{m.group(1)}:{m.group(2)}", m.group(3)
+            if (pkg, version) not in seen:
+                seen.add((pkg, version))
+                result.append((pkg, version))
+    return result
+
+
 def parse_java_dependencies(root: str) -> list[tuple[str, str]]:
+    """Declared dependencies, plus transitive ones when a resolved file exists."""
     deps = parse_pom(root)
     if not deps:
         deps = parse_gradle(root)
+
+    resolved = parse_resolved(root)
+    if not resolved:
+        return deps
+
+    seen = {(p, v) for p, v in deps}
+    for pkg, version in resolved:
+        if (pkg, version) not in seen:
+            seen.add((pkg, version))
+            deps.append((pkg, version))
     return deps

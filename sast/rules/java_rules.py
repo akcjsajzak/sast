@@ -38,6 +38,26 @@ def _sources() -> list[TaintSource]:
         kind="method", match="getName", tags=["path", "lfi"], obj_hint="zipentry",
         description="Untrusted path from archive entry ZipEntry.getName()",
     ))
+
+    # --- Second-order sources -------------------------------------------
+    # Values read back out of storage carry whatever was written there. This
+    # is the stored-XSS / second-order-SQLi shape; low confidence because the
+    # originating write may be outside the scanned code.
+    for m in ("getString", "getObject", "getNString", "getCharacterStream",
+              "getClob", "getBytes"):
+        s.append(TaintSource(
+            kind="method", match=m, tags=_ALL, obj_hint="resultset", confidence="low",
+            description=f"Column read back from the database via ResultSet.{m}() "
+                        "(second-order: tainted if attacker data was stored)",
+        ))
+    for m, hint in (("readLine", "reader"), ("readAllLines", "files"),
+                    ("readString", "files"), ("readAllBytes", "files"),
+                    ("nextLine", "scanner"), ("next", "scanner")):
+        s.append(TaintSource(
+            kind="method", match=m, tags=_ALL, obj_hint=hint, confidence="low",
+            description=f"Data read from an external file or stream via {m}() "
+                        "(trusted only if the source is)",
+        ))
     return s
 
 
@@ -483,7 +503,7 @@ def _patterns() -> list[PatternRule]:
     p.append(PatternRule(
         rule_id="java-hardcoded-secret", node_type="variable_declarator",
         match=r"(password|passwd|pwd|pass|secret|api[_-]?key|token)\s*=\s*\"[^\"]{4,}\"",
-        match_field="text", regex=True,
+        match_field="text", regex=True, ignore_case=True,
         title="Hardcoded credential",
         severity="low", cwe="CWE-798", owasp="A07:2021 — Identification and Authentication Failures",
         category="hardcoded-secret",

@@ -27,8 +27,14 @@ Think of it as an offline, framework-aware Snyk / SonarQube.
   state how old the bundled database is.
 - **Confidence-aware taint sources** — `$_SERVER` is modelled key by key
   (`HTTP_*`, `REQUEST_URI`, … are tainted; `DOCUMENT_ROOT`, `REMOTE_ADDR` are
-  not), and second-order sources such as `$_SESSION` report at lower
-  confidence than direct request input.
+  not), and second-order sources such as `$_SESSION`, database reads and file
+  reads report at lower confidence than direct request input.
+- **Template and configuration scanning** — Twig, JSP, Thymeleaf, FreeMarker
+  and Blade for unescaped output; `.env`, `application.properties`, `web.xml`
+  and `php.ini` for misconfiguration and committed secrets.
+- **Soundness-aware sanitizers** — bypassable escaping (`addslashes`,
+  `escapeshellcmd`, `strip_tags`, `filter_var` without a filter) downgrades a
+  finding's confidence instead of silently clearing it.
 - **Reports** — self-contained HTML, JSON, and SARIF 2.1.0 (GitHub code
   scanning, VS Code, SonarQube compatible).
 
@@ -171,11 +177,47 @@ is picked up automatically. Add advisory entries to
 python -m unittest tests.test_sast -v
 ```
 
+## Templates and configuration
+
+Rendering and deployment posture do not live in `.php` or `.java` files, so
+they are scanned separately:
+
+- **Templates** — Twig (`|raw`, `autoescape false`, `template_from_string`),
+  JSP (`<%= %>` of request data, `<c:out escapeXml="false">`, `${param.*}`),
+  Thymeleaf (`th:utext`, preprocessing expressions), FreeMarker (`#noescape`,
+  `?new()`), and Blade (`{!! !!}`).
+- **Configuration** — `.env`, `application.properties/yml`, `web.xml`,
+  `php.ini`: debug mode left on, Spring Actuator exposed, TLS disabled,
+  insecure session cookies, `allow_url_include`, and committed secrets.
+  Secret *values* are redacted in every report format.
+
+Disable either with `ScanOptions(scan_templates=False, scan_configs=False)`.
+
 ## Limitations
 
+What the engine does **not** find, and why:
+
+- **Access control, authorization and business logic** (OWASP A01/A04) —
+  `User::find($_GET['id'])` followed by printing the record is correct
+  dataflow and a critical IDOR. Deciding who may read what is not expressible
+  as source-to-sink, so these are out of scope by construction rather than
+  by omission. The same applies to authentication design, race
+  conditions/TOCTOU, and "insufficient logging".
+- **Context-sensitive escaping** — `htmlspecialchars()` is treated as sound
+  for XSS (since PHP 8.1 it escapes quotes by default), but it is *not* safe
+  inside `<script>` or an unquoted attribute. Judging that needs template
+  analysis the engine does not do. Escaping that is bypassable regardless of
+  context (`addslashes`, `escapeshellcmd`, `strip_tags`, `filter_var` with no
+  filter) is handled: the finding survives at reduced confidence instead of
+  being silently cleared.
+- **Maven transitive dependencies** — `pom.xml` declares only direct
+  dependencies, and resolving the rest needs the Maven resolver and a
+  network. Commit (or generate) a `gradle.lockfile` or `mvn dependency:tree`
+  output as `dependency-tree.txt` and those are scanned too. `composer.lock`
+  already lists the full tree, so PHP is unaffected.
+- **Client-side JavaScript** — no JS grammar is bundled, so DOM XSS and
+  secrets in frontend bundles are invisible.
+- **Variable variables** (`$$name`) in PHP.
 - Vendor/third-party code is modeled via rules rather than parsed; only
   first-party source is scanned.
-- Java interprocedural analysis resolves `this`/implicit and type-inferred
-  local receivers; arbitrary framework call graphs are modeled by rules.
-- Blade templates are analyzed by a dedicated unescaped-output (`{!! !!}`)
-  scanner, not full template taint.
+- Scanning is single-threaded by design (see "Scan scope and limits").

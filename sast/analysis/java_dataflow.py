@@ -22,6 +22,46 @@ _SKIP_TOP = {"package_declaration", "import_declaration", "class_declaration",
              "interface_declaration", "enum_declaration", "annotation_type_declaration",
              "comment", "block_comment", "line_comment", "record_declaration"}
 
+# Calls that write their arguments into the receiver, making the receiver
+# (a collection, map, or builder) carry the arguments' taint.
+MUTATING_WRITES = frozenset({
+    "append", "concat", "insert", "write", "add", "addAll", "addFirst",
+    "addLast", "put", "putAll", "putIfAbsent", "set", "setAll", "push",
+    "offer", "offerFirst", "offerLast", "merge", "replace",
+})
+
+# Static/utility calls whose result carries their arguments' taint, used when
+# the receiver itself is a class rather than a tainted value
+# (Base64.getDecoder().decode(x), URLDecoder.decode(x), String.join(...)).
+ARG_PROPAGATORS = frozenset({
+    "decode", "encode", "encodeToString", "join", "valueOf", "copyValueOf",
+    "parseString", "readValue", "fromJson", "deserialize", "unescapeHtml",
+    "unescapeHtml4", "toString",
+    # Collection factories — the collection inherits its elements' taint.
+    "asList", "of", "singletonList", "singleton", "copyOf",
+    "unmodifiableList", "unmodifiableCollection", "nCopies",
+})
+
+# Calls on a tainted receiver that yield a size, index or boolean rather than
+# attacker-controlled bytes — propagating through these only adds noise.
+NON_PROPAGATING = frozenset({
+    "size", "length", "isEmpty", "hashCode", "equals", "equalsIgnoreCase",
+    "compareTo", "compareToIgnoreCase", "indexOf", "lastIndexOf", "contains",
+    "containsKey", "containsValue", "startsWith", "endsWith", "matches",
+    "count", "hasNext", "canRead", "canWrite", "exists", "isDirectory",
+    "isFile", "charAt", "codePointAt", "ordinal", "compare",
+})
+
+
+def _constructed_type(value: Node):
+    """Class name from `new Foo(...)`, or None."""
+    if value is None or value.type != "object_creation_expression":
+        return None
+    for c in value.named_children:
+        if c.type in ("type_identifier", "generic_type", "scoped_type_identifier"):
+            return ja._base_type(c)
+    return None
+
 
 class JavaTaintEngine:
     def __init__(self, symbols: JavaSymbolTable, rules: RuleSet,
@@ -111,7 +151,13 @@ class JavaTaintEngine:
             for d in ja.declarators(stmt):
                 name, value = ja.declarator_parts(d)
                 if name:
-                    if typ:
+                    # Prefer the constructed type over the declared one, so
+                    # `I i = new Impl()` dispatches to Impl rather than to the
+                    # interface, whose method has no body to analyse.
+                    concrete = _constructed_type(value)
+                    if concrete:
+                        tenv[name] = concrete
+                    elif typ:
                         tenv[name] = typ
                     if value is not None:
                         vt = self.taint_of(value, sf, env, tenv, ctx)
@@ -157,6 +203,16 @@ class JavaTaintEngine:
         elif lhs.type in ("field_access",):
             vt = self.taint_of(rhs, sf, env, tenv, ctx)
             self._assign(ja.text(lhs), vt, sf, env, lhs)
+        elif lhs.type == "array_access":
+            # `arr[i] = tainted` taints the array as a whole; element-level
+            # precision is not worth the complexity here.
+            vt = self.taint_of(rhs, sf, env, tenv, ctx)
+            base = lhs.named_children[0] if lhs.named_children else None
+            if base is not None and vt is not None:
+                root = ja.text(base)
+                existing = env.get(root)
+                self._assign(root, vt if existing is None else existing.merge(vt),
+                             sf, env, lhs)
 
     def _assign(self, name, t, sf, env, node):
         if t is not None:
@@ -323,34 +379,49 @@ class JavaTaintEngine:
         if obj is not None:
             self.taint_of(obj, sf, env, tenv, ctx)
 
+        # Sink before source: a call can be both (reading a file with an
+        # attacker-controlled path is an SSRF/traversal sink *and* returns
+        # attacker-influenced data). Returning the source taint first would
+        # silently drop the sink.
+        san = self.match_sanitizer(mname)
+        if san is None:
+            self.check_method_sink(mname, obj, args, node, sf, env, tenv, ctx)
+
         st = self.source_taint(mname, obj, args, node, sf, env, tenv, ctx)
         if st is not None:
             return st
 
-        san = self.match_sanitizer(mname)
         if san is not None:
             return self.sanitized_taint(san, args, sf, env, tenv, ctx)
-
-        self.check_method_sink(mname, obj, args, node, sf, env, tenv, ctx)
 
         ut = self.user_method_taint(obj, mname, args, node, sf, env, tenv, ctx)
         if ut is not None:
             return ut
 
-        # String builder / concatenation propagators.
-        if mname in ("append", "concat"):
+        # Lambda arguments (stream/forEach/map/...): bind the lambda parameter
+        # to the receiver's taint and analyse its body, so a sink reached only
+        # inside the lambda is still found.
+        if obj is not None and ctx.depth < MAX_DEPTH:
+            lam = next((a for a in args if a.type == "lambda_expression"), None)
+            if lam is not None:
+                recv = self.taint_of(obj, sf, env, tenv, ctx)
+                if recv is not None:
+                    lt = self._invoke_lambda(lam, recv, node, sf, env, tenv, ctx)
+                    if lt is not None:
+                        return lt
+
+        # Mutating writes: the container/builder itself becomes tainted.
+        if mname in MUTATING_WRITES:
             merged = None
             for a in args:
                 tt = self.taint_of(a, sf, env, tenv, ctx)
                 if tt is not None:
                     merged = tt if merged is None else merged.merge(tt)
-            # Mutating builder: taint the root receiver variable too.
             root = self._root_receiver(obj)
             if root and merged is not None:
                 self._assign(root, merged, sf, env, node)
             return merged
-        if mname == "toString":
-            return self.taint_of(obj, sf, env, tenv, ctx) if obj is not None else None
+
         if mname == "format" and obj is not None and ja.text(obj) == "String":
             merged = None
             for a in args:
@@ -359,7 +430,58 @@ class JavaTaintEngine:
                     merged = tt if merged is None else merged.merge(tt)
             return merged
 
+        # Static decoders: Base64.getDecoder().decode(x), URLDecoder.decode(x).
+        if mname in ARG_PROPAGATORS:
+            merged = None
+            for a in args:
+                tt = self.taint_of(a, sf, env, tenv, ctx)
+                if tt is not None:
+                    merged = tt if merged is None else merged.merge(tt)
+            if merged is not None:
+                return merged
+
+        # Anything read off a tainted receiver stays tainted: DTO getters
+        # (@RequestBody), collection reads, String transforms and decoders all
+        # fall out of this one rule. Predicates returning a size or a boolean
+        # carry no attacker bytes, so they are excluded.
+        if obj is not None and mname not in NON_PROPAGATING:
+            recv = self.taint_of(obj, sf, env, tenv, ctx)
+            if recv is not None:
+                return recv
+
         return None
+
+    def _invoke_lambda(self, lam: Node, recv, node, sf, env, tenv, ctx):
+        """Analyse a lambda body with its parameters bound to `recv` taint."""
+        params = []
+        body = None
+        for c in lam.named_children:
+            if c.type == "identifier" and body is None:
+                params.append(ja.text(c))
+            elif c.type in ("inferred_parameters", "formal_parameters"):
+                for p in c.named_children:
+                    if p.type == "identifier":
+                        params.append(ja.text(p))
+                    else:
+                        nm = p.child_by_field_name("name")
+                        if nm is not None:
+                            params.append(ja.text(nm))
+            else:
+                body = c
+
+        new_env = dict(env)
+        for p in params:
+            new_env[p] = recv.with_step(TaintStep(
+                location=make_loc(sf, node),
+                description=f"element flows into lambda parameter {p}",
+                code=sf.node_line(node),
+            ))
+        if body is None:
+            return None
+        sub = Ctx(depth=ctx.depth + 1, current_class=ctx.current_class)
+        if body.type == "block":
+            return self.process_block(body, sf, new_env, dict(tenv), sub)
+        return self.taint_of(body, sf, new_env, dict(tenv), sub)
 
     def source_taint(self, mname, obj, args, node, sf, env, tenv, ctx):
         for src in self.rules.sources:
@@ -548,7 +670,7 @@ class JavaTaintEngine:
                 if value is None:
                     continue
                 if rule.regex:
-                    m = re.search(rule.match, value)
+                    m = rule.compiled().search(value)
                     if not m:
                         continue
                     idx = m.start()

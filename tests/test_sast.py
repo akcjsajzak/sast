@@ -550,5 +550,256 @@ class TestSarifMetadata(unittest.TestCase):
                          "https://github.com/akcjsajzak/sast")
 
 
+class TestPropagation(unittest.TestCase):
+    """Taint must survive the ways real code moves data around."""
+
+    def _php(self, body):
+        return _scan({"a.php": "<?php " + body}).findings
+
+    def _java(self, body):
+        pom = ("<project><dependencies><dependency>"
+               "<groupId>org.springframework.boot</groupId>"
+               "<artifactId>spring-boot-starter-web</artifactId>"
+               "<version>2.7.0</version></dependency></dependencies></project>")
+        src = ("import org.springframework.web.bind.annotation.*;\n"
+               "import java.util.*;\n@RestController public class A {\n" + body + "\n}\n")
+        return _scan({"pom.xml": pom, "A.java": src}).findings
+
+    def test_php_decoders_propagate(self):
+        for call in ("base64_decode($_GET['c'])",
+                     "json_decode($_GET['c'], true)[0]",
+                     "explode(',', $_GET['c'])[0]",
+                     "urldecode($_GET['c'])"):
+            self.assertTrue(self._php(f"system({call});"), call)
+
+    def test_php_foreach_binding(self):
+        self.assertTrue(self._php("foreach($_GET['a'] as $v){ system($v); }"))
+        self.assertTrue(self._php("$s=''; foreach($_GET['a'] as $v){ $s.=$v; } system($s);"))
+
+    def test_php_property_across_methods(self):
+        self.assertTrue(self._php(
+            "class C{ private $p;"
+            " function set(){ $this->p = $_GET['c']; }"
+            " function go(){ system($this->p); } }"
+        ))
+
+    def test_php_global_and_static(self):
+        self.assertTrue(self._php("$g=$_GET['c']; function f(){ global $g; system($g); } f();"))
+        self.assertTrue(self._php("class C{ public static $s; } C::$s=$_GET['c']; system(C::$s);"))
+
+    def test_php_callables_and_closures(self):
+        self.assertTrue(self._php("$f=function($v){ system($v); }; $f($_GET['c']);"))
+        self.assertTrue(self._php("array_map('system', $_GET['a']);"))
+        self.assertTrue(self._php("call_user_func('system', $_GET['c']);"))
+        self.assertTrue(self._php("$fn='system'; $fn($_GET['c']);"))
+
+    def test_php_method_chain_on_constructed_object(self):
+        self.assertTrue(self._php(
+            "class C{ function f($v){ return $v; } } $o=new C(); system($o->f($_GET['c']));"
+        ))
+
+    def test_java_local_alias(self):
+        """Regression: `String s = q;` used to silently drop taint."""
+        self.assertTrue(self._java(
+            '@GetMapping("/a") public void a(@RequestParam String q) throws Exception {'
+            ' String s = q; Runtime.getRuntime().exec(s); }'
+        ))
+
+    def test_java_collections_and_arrays(self):
+        self.assertTrue(self._java(
+            '@GetMapping("/a") public void a(@RequestParam String q) throws Exception {'
+            ' List<String> l=new ArrayList<>(); l.add(q); Runtime.getRuntime().exec(l.get(0)); }'
+        ))
+        self.assertTrue(self._java(
+            '@GetMapping("/a") public void a(@RequestParam String q) throws Exception {'
+            ' String[] x=new String[1]; x[0]=q; Runtime.getRuntime().exec(x[0]); }'
+        ))
+
+    def test_java_request_body_dto_getter(self):
+        self.assertTrue(self._java(
+            'static class D { public String v; public String getV(){ return v; } }\n'
+            '@PostMapping("/a") public void a(@RequestBody D d) throws Exception {'
+            ' Runtime.getRuntime().exec(d.getV()); }'
+        ))
+
+    def test_java_interface_dispatch(self):
+        self.assertTrue(self._java(
+            'interface I { String g(String s); }\n'
+            'static class Impl implements I { public String g(String s){ return s; } }\n'
+            '@GetMapping("/a") public void a(@RequestParam String q) throws Exception {'
+            ' I i = new Impl(); Runtime.getRuntime().exec(i.g(q)); }'
+        ))
+
+    def test_sink_still_reported_when_call_is_also_a_source(self):
+        """file_get_contents is both an SSRF sink and a file-read source."""
+        rules = {f.rule_id for f in self._php("$u=$_GET['u']; file_get_contents($u);")}
+        self.assertIn("php-ssrf-file_get_contents", rules)
+
+
+class TestSecondOrderSources(unittest.TestCase):
+    def test_db_read_is_low_confidence_source(self):
+        f = _scan({"a.php": "<?php $r=mysqli_query($c,'SELECT x FROM t');"
+                            " $row=mysqli_fetch_assoc($r); system($row['x']);"}).findings
+        self.assertTrue(f)
+        self.assertEqual(f[0].confidence, "low")
+
+    def test_direct_input_outranks_second_order(self):
+        direct = _scan({"a.php": "<?php system($_GET['c']);"}).findings
+        self.assertEqual(direct[0].confidence, "high")
+
+
+class TestSanitizerSoundness(unittest.TestCase):
+    """Bypassable escaping must not silence a finding outright."""
+
+    def _f(self, code):
+        return _scan({"a.php": "<?php " + code}).findings
+
+    def test_weak_sanitizers_downgrade_rather_than_clear(self):
+        for code in ("mysqli_query($c, 'SELECT '.addslashes($_GET['n']));",
+                     "system('ls '.escapeshellcmd($_GET['d']));",
+                     "echo strip_tags($_GET['t']);"):
+            f = self._f(code)
+            self.assertTrue(f, code)
+            self.assertEqual(f[0].confidence, "medium", code)
+
+    def test_filter_var_without_filter_does_not_sanitize(self):
+        self.assertTrue(self._f("system(filter_var($_GET['c']));"))
+
+    def test_sound_sanitizers_still_clear_taint(self):
+        for code in ("echo htmlspecialchars($_GET['u']);",
+                     "mysqli_query($c, 'SELECT '.mysqli_real_escape_string($c,$_GET['n']));",
+                     "system('ls '.escapeshellarg($_GET['d']));",
+                     "system(filter_var($_GET['c'], FILTER_SANITIZE_STRING));",
+                     "mysqli_query($c, 'SELECT '.intval($_GET['i']));"):
+            self.assertEqual(self._f(code), [], code)
+
+
+class TestPhpPatternRules(unittest.TestCase):
+    def _rules(self, code):
+        return {f.rule_id for f in _scan({"a.php": "<?php " + code}).findings}
+
+    def test_new_pattern_rules_fire(self):
+        cases = {
+            "$h = sha1($p);": "php-crypto-sha1",
+            "$t = mt_rand();": "php-weak-random-mt_rand",
+            '$apiKey = "sk_live_AbCdEf123456";': "php-hardcoded-secret",
+            "curl_setopt($c, CURLOPT_SSL_VERIFYPEER, false);": "php-tls-verify-disabled",
+            'openssl_encrypt($d, "aes-128-ecb", $k);': "php-crypto-ecb",
+            "libxml_disable_entity_loader(false);": "php-xxe-entity-loader",
+            "simplexml_load_string($x, null, LIBXML_NOENT);": "php-xxe-noent",
+        }
+        for code, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules(code), code)
+
+    def test_secure_equivalents_are_clean(self):
+        for code in ("$t = random_int(1, 10);",
+                     "curl_setopt($c, CURLOPT_SSL_VERIFYPEER, true);",
+                     '$d = openssl_encrypt($p, "aes-256-gcm", $k);',
+                     '$total = "somelongvalue";'):
+            self.assertEqual(self._rules(code), set(), code)
+
+
+class TestTemplateScanning(unittest.TestCase):
+    def _scan_files(self, files):
+        tmp = tempfile.mkdtemp()
+        for rel, content in files.items():
+            path = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(content)
+        return ScanEngine(ScanOptions()).scan(tmp)
+
+    def test_twig_unescaped_output(self):
+        r = self._scan_files({"a.php": "<?php echo 1;",
+                              "t/p.twig": "<div>{{ bio|raw }}</div>\n<p>{{ safe }}</p>"})
+        rules = {f.rule_id for f in r.findings}
+        self.assertIn("twig-xss-raw-filter", rules)
+
+    def test_jsp_unescaped_output(self):
+        r = self._scan_files({
+            "a.php": "<?php echo 1;",
+            "w/i.jsp": '<%= request.getParameter("q") %>\n'
+                       '<c:out value="${v}" escapeXml="false"/>\n'
+                       '<c:out value="${ok}"/>',
+        })
+        rules = {f.rule_id for f in r.findings}
+        self.assertIn("jsp-xss-scriptlet-expression", rules)
+        self.assertIn("jsp-xss-cout-escaping-off", rules)
+
+    def test_thymeleaf_utext_but_not_text(self):
+        r = self._scan_files({
+            "a.php": "<?php echo 1;",
+            "t/v.html": '<html xmlns:th="http://www.thymeleaf.org">'
+                        '<div th:utext="${c}">x</div><div th:text="${s}">y</div></html>',
+        })
+        ids = [f.rule_id for f in r.findings]
+        self.assertIn("thymeleaf-xss-utext", ids)
+        self.assertEqual(len([i for i in ids if i.startswith("thymeleaf")]), 1)
+
+
+class TestConfigScanning(unittest.TestCase):
+    def _scan_files(self, files):
+        tmp = tempfile.mkdtemp()
+        for rel, content in files.items():
+            path = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(content)
+        return ScanEngine(ScanOptions()).scan(tmp)
+
+    def test_env_and_properties_findings(self):
+        r = self._scan_files({
+            "a.php": "<?php echo 1;",
+            ".env": "APP_DEBUG=true\nDB_PASSWORD=sup3rs3cr3tvalue\n",
+            "application.properties": "management.endpoints.web.exposure.include=*\n"
+                                      "spring.datasource.password=hunter2abc\n"
+                                      "server.ssl.enabled=false\n",
+        })
+        rules = {f.rule_id for f in r.findings}
+        for expected in ("config-debug-enabled", "config-hardcoded-secret",
+                         "config-spring-actuator-exposed",
+                         "config-spring-datasource-password", "config-tls-disabled"):
+            self.assertIn(expected, rules)
+
+    def test_empty_and_placeholder_values_are_not_secrets(self):
+        r = self._scan_files({"a.php": "<?php echo 1;",
+                              ".env": "MAIL_PASSWORD=\nAPI_KEY=${INJECTED}\n"})
+        self.assertEqual([f for f in r.findings if f.rule_id == "config-hardcoded-secret"], [])
+
+    def test_secret_value_is_redacted_in_report(self):
+        r = self._scan_files({"a.php": "<?php echo 1;",
+                              ".env": "DB_PASSWORD=sup3rs3cr3tvalue\n"})
+        secret = [f for f in r.findings if f.rule_id == "config-hardcoded-secret"]
+        self.assertTrue(secret)
+        self.assertNotIn("sup3rs3cr3tvalue", secret[0].location.code)
+        self.assertNotIn("sup3rs3cr3tvalue", render_json(r))
+
+
+class TestTransitiveDependencies(unittest.TestCase):
+    POM = ("<project><dependencies><dependency>"
+           "<groupId>org.springframework.boot</groupId>"
+           "<artifactId>spring-boot-starter-web</artifactId>"
+           "<version>2.7.0</version></dependency></dependencies></project>")
+
+    def test_pom_alone_misses_transitive(self):
+        r = _scan({"pom.xml": self.POM, "A.java": "class A {}"})
+        self.assertEqual(r.dependency_issues, [])
+
+    def test_maven_dependency_tree_finds_transitive(self):
+        tree = ("[INFO] +- org.springframework.boot:spring-boot-starter-web:jar:2.7.0:compile\n"
+                "[INFO] |  \\- org.apache.logging.log4j:log4j-core:jar:2.14.0:compile\n")
+        r = _scan({"pom.xml": self.POM, "A.java": "class A {}",
+                   "dependency-tree.txt": tree})
+        pkgs = {d.package for d in r.dependency_issues}
+        self.assertIn("org.apache.logging.log4j:log4j-core", pkgs)
+
+    def test_gradle_lockfile_finds_transitive(self):
+        lock = "org.apache.logging.log4j:log4j-core:2.14.0=compileClasspath\n"
+        r = _scan({"build.gradle": "dependencies { implementation 'x:y:1.0' }",
+                   "A.java": "class A {}", "gradle.lockfile": lock})
+        pkgs = {d.package for d in r.dependency_issues}
+        self.assertIn("org.apache.logging.log4j:log4j-core", pkgs)
+
+
 if __name__ == "__main__":
     unittest.main()
