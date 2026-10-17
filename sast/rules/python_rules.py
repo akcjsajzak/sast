@@ -12,7 +12,7 @@ A08 = "A08:2021 — Software and Data Integrity Failures"
 A10 = "A10:2021 — Server-Side Request Forgery (SSRF)"
 
 _ALL = ["sql", "cmd", "xss", "ssrf", "lfi", "path", "deser", "code", "ssti",
-        "redirect", "log", "xxe", "ldap", "nosql", "xpath"]
+        "redirect", "log", "xxe", "ldap", "nosql", "xpath", "header"]
 _SQL = ["sql"]
 _CMD = ["cmd"]
 _PATH = ["path", "lfi"]
@@ -37,10 +37,35 @@ def _sources() -> list[TaintSource]:
             kind="call", match=m, tags=_ALL, obj_hint="request",
             description=f"Untrusted data from the HTTP request (request.{m}())",
         ))
+    # A stdlib http.server handler receives the request through attributes on
+    # itself, so `self.path` is the raw request line and `self.headers` the
+    # request headers. Those names are far too common to taint outright, so
+    # each is gated on the file naming one of the handler base classes.
+    _HANDLER_FILE = r"(?:BaseHTTPRequestHandler|SimpleHTTPRequestHandler" \
+                    r"|CGIHTTPRequestHandler|BaseHTTPServer|http\.server)"
+    for prop, what in (("path", "the request path and query string"),
+                       ("headers", "the request headers"),
+                       ("rfile", "the request body stream"),
+                       ("requestline", "the raw request line"),
+                       ("client_address", "the client address")):
+        s.append(TaintSource(
+            kind="member", match=prop, tags=_ALL, obj_hint="self",
+            file_requires=_HANDLER_FILE,
+            description=f"Untrusted data from {what} (self.{prop} of an "
+                        "http.server request handler)",
+        ))
+
     # Raw CGI / WSGI / CLI.
     s.append(TaintSource(
         kind="member", match="argv", tags=_ALL, obj_hint="sys",
         description="Untrusted data from command-line arguments (sys.argv)",
+    ))
+    # WSGI hands the request to the application in `environ`; QUERY_STRING and
+    # the body stream inside it are attacker-controlled.
+    s.append(TaintSource(
+        kind="identifier", match="environ", tags=_ALL, confidence="medium",
+        file_requires=r"def\s+application\s*\(|wsgi",
+        description="Untrusted data from the WSGI environ",
     ))
     for m in ("input", "raw_input"):
         s.append(TaintSource(
@@ -72,12 +97,13 @@ def _sinks() -> list[SinkRule]:
 
     def sink(rid, match, title, severity, cwe, owasp, category, desc, fix, tags,
              arg_index=-1, obj_hint=None, frameworks=("*",), confidence="high",
-             kind="call"):
+             kind="call", receiver_tainted=False):
         k.append(SinkRule(rule_id=rid, kind=kind, match=match, title=title,
                           severity=severity, cwe=cwe, owasp=owasp,
                           category=category, description=desc, remediation=fix,
                           tags=tags, arg_index=arg_index, obj_hint=obj_hint,
-                          frameworks=frameworks, confidence=confidence))
+                          frameworks=frameworks, confidence=confidence,
+                          receiver_tainted=receiver_tainted))
 
     # Code execution
     for fn in ("eval", "exec", "compile"):
@@ -193,6 +219,40 @@ def _sinks() -> list[SinkRule]:
          "exposes local files and internal services.",
          "Use defusedxml, or disable entity resolution.",
          ["xxe"], arg_index=0, obj_hint="etree", confidence="medium")
+    sink("py-xpathi-xpath", "xpath", "XPath injection", "high", "CWE-643", A03,
+         "xpath-injection",
+         "The XPath expression is built from attacker-controlled input, so the "
+         "query can be rewritten to select data it should not reach.",
+         "Pass the value as an XPath variable: xpath('//u[@n=$n]', n=value).",
+         ["xpath", "sql"], arg_index=0)
+
+    # Writing a response by hand, which is what a stdlib http.server handler
+    # and any raw WSGI application do. Nothing escapes for them, so untrusted
+    # data in the body is XSS and untrusted data in a header is response
+    # splitting — the two classes a framework would normally have covered.
+    for fn in ("write", "writelines"):
+        sink(f"py-xss-raw-{fn}", fn, "Reflected XSS in a raw HTTP response",
+             "high", "CWE-79", A03, "xss",
+             "Untrusted data is written straight into the response body with "
+             "no escaping, so markup in it is served to the browser.",
+             "HTML-escape the value (html.escape) before writing it.",
+             ["xss"], arg_index=0, obj_hint="wfile", confidence="medium")
+    sink("py-header-injection", "send_header",
+         "HTTP response header injection", "high", "CWE-113", A03,
+         "header-injection",
+         "An attacker-controlled header value can contain CR/LF and inject "
+         "further headers or a whole response body. A Location built this way "
+         "is also an open redirect.",
+         "Strip CR and LF from the value, and allow-list redirect targets.",
+         ["header", "redirect", "xss"], arg_index=1, confidence="medium")
+    sink("py-ssti-format", "format",
+         "Server-side template injection via str.format()", "medium",
+         "CWE-1336", A03, "ssti",
+         "A format string under attacker control can walk object attributes "
+         "(`{0.__class__}`) and reach module globals.",
+         "Never let untrusted input be the format string; use it as an "
+         "argument instead.",
+         ["ssti", "code"], confidence="medium", receiver_tainted=True)
     return k
 
 

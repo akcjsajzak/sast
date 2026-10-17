@@ -68,7 +68,20 @@ _SKIP_TOP = {
 
 
 def _short(name: str) -> str:
-    return name.split("\\")[-1] if name else ""
+    """Last component of a qualified name.
+
+    Qualifiers differ by language — PHP uses ``\\``, Java/C#/Python use ``.``
+    and Go uses ``/`` — and a rule is written against the bare name. Splitting
+    on only one of them meant a fully-qualified reference such as
+    ``java.io.FileInputStream`` matched no rule at all, which is how every
+    fully-qualified sink in OWASP Benchmark went undetected.
+    """
+    if not name:
+        return ""
+    for sep in ("\\", "/", "."):
+        if sep in name:
+            name = name.rsplit(sep, 1)[-1]
+    return name
 
 
 def match_callee(actual, wanted) -> bool:
@@ -817,14 +830,14 @@ class TaintEngine:
             return ut
 
         if kind == "function" and callee in PROPAGATORS:
-            merged = None
-            for a in args:
-                tt = self.taint_of(a, sf, env, ctx)
-                if tt is not None:
-                    merged = tt if merged is None else merged.merge(tt)
-            return merged
+            return self._merge_args(args, sf, env, ctx)
 
-        return None
+        # A call this analysis could not resolve — a vendor helper, a framework
+        # method, anything outside the scanned source — still returns something
+        # derived from its arguments. Dropping the taint here made every flow
+        # through such a helper invisible. Sanitizers are matched earlier, so
+        # an escaping helper is unaffected.
+        return self._merge_args(args, sf, env, ctx)
 
     def _receiver_class(self, node: Node, env: dict):
         """Class name of a method call's receiver, if it came from `new C()`."""
@@ -1182,12 +1195,28 @@ class TaintEngine:
     # ------------------------------------------------------------------
     # Pattern rules
     # ------------------------------------------------------------------
+    def _absent_ok(self, rule, sf: SourceFile) -> bool:
+        """True unless the rule's `absent` regex appears in the file."""
+        if not getattr(rule, "absent", None):
+            return True
+        import re as _re
+        cache = getattr(self, "_absent_cache", None)
+        if cache is None:
+            cache = self._absent_cache = {}
+        key = (id(sf), rule.absent)
+        if key not in cache:
+            text = sf.content.decode("utf-8", "replace")
+            cache[key] = _re.search(rule.absent, text) is None
+        return cache[key]
+
     def run_patterns(self, sf: SourceFile) -> None:
         if not self.rules.patterns:
             return
         for node in sf.walk():
             for rule in self.rules.patterns:
                 if rule.node_type != "*" and node.type != rule.node_type:
+                    continue
+                if not self._absent_ok(rule, sf):
                     continue
                 value = self._pattern_value(node, rule.match_field)
                 if value is None:

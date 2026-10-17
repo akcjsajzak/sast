@@ -445,6 +445,15 @@ class JsTaintEngine:
 
         if recv_taint is not None and callee not in NON_PROPAGATING:
             return recv_taint
+
+        # Unresolved call: carry the arguments' taint rather than dropping it.
+        # Sanitizers are matched earlier, so this does not defeat escaping.
+        if callee not in NON_PROPAGATING:
+            merged = None
+            for a in args:
+                merged = _merge_taint(merged, self.taint_of(a, sf, env, ctx))
+            if merged is not None:
+                return merged
         return cb_taint
 
     def handle_callbacks(self, args, recv_taint, node, sf, env, ctx):
@@ -644,6 +653,20 @@ class JsTaintEngine:
         ))
 
     # ------------------------------------------------------------------
+    def _absent_ok(self, rule, sf: SourceFile) -> bool:
+        """True unless the rule's `absent` regex appears in the file."""
+        if not getattr(rule, "absent", None):
+            return True
+        import re as _re
+        cache = getattr(self, "_absent_cache", None)
+        if cache is None:
+            cache = self._absent_cache = {}
+        key = (id(sf), rule.absent)
+        if key not in cache:
+            text = sf.content.decode("utf-8", "replace")
+            cache[key] = _re.search(rule.absent, text) is None
+        return cache[key]
+
     def run_patterns(self, sf: SourceFile) -> None:
         if not self.rules.patterns:
             return
@@ -655,6 +678,8 @@ class JsTaintEngine:
         for node in sf.walk():
             for rule in self.rules.patterns:
                 if rule.node_type != "*" and node.type != rule.node_type:
+                    continue
+                if not self._absent_ok(rule, sf):
                     continue
                 value = self._pattern_value(node, rule.match_field)
                 if value is None:

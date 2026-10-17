@@ -32,6 +32,34 @@ class TaintSource:
     # finding so second-order sources ($_SESSION, $_ENV) report below direct
     # request input. One of 'high' | 'medium' | 'low'.
     confidence: str = "high"
+    # Argument positions this call *writes into*, for the C-style convention of
+    # filling a caller-supplied buffer and returning only a count or status:
+    # `fread(&img, ...)`, `recv(fd, buf, ...)`, `scanf("%d", &n)`. Modelling
+    # those as return-value sources taints the wrong expression, so the data
+    # read from the network or a file looked clean to every later sink.
+    # Indices past the end of the argument list are ignored, which is how a
+    # varargs family like scanf covers its whole tail.
+    out_args: Optional[tuple] = None
+    # True when the return value is *not* itself attacker data — fread returns
+    # an item count, read a byte count. Without this they would taint an
+    # integer, and a size check on it would look like a tainted allocation.
+    out_only: bool = False
+    # Regex that must appear somewhere in the file for this source to apply.
+    # Some attacker-controlled values are reached through an attribute name
+    # too common to claim unconditionally: `self.path` is the request line in
+    # an http.server handler and a filename in everything else. Gating on the
+    # base class the file actually names keeps the source without the noise.
+    file_requires: Optional[str] = None
+
+    def file_allows(self, text: str) -> bool:
+        if not self.file_requires:
+            return True
+        cached = getattr(self, "_file_re", None)
+        if cached is None:
+            import re
+            cached = re.compile(self.file_requires)
+            object.__setattr__(self, "_file_re", cached)
+        return bool(cached.search(text))
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)
@@ -75,6 +103,12 @@ class SinkRule:
     cls: Optional[str] = None
     obj_hint: Optional[str] = None  # substring the receiver must contain (Java)
     confidence: str = "high"
+    # Fire on taint in the *receiver* rather than an argument. A handful of
+    # sinks are dangerous because of what they are called on, not what they
+    # are passed: `untrusted.format(x)` can walk attributes out of x, whereas
+    # `"literal {}".format(untrusted)` is ordinary formatting. Checking the
+    # arguments for these would invert the rule.
+    receiver_tainted: bool = False
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)
@@ -145,6 +179,10 @@ class PatternRule:
     # Match case-insensitively. Needed wherever identifiers are matched by
     # name, since `$apiKey` and `api_key` are the same thing to a reader.
     ignore_case: bool = False
+    # Only fire when this regex does NOT appear anywhere in the file. Lets a
+    # rule express "this was created but never hardened" — a cookie built
+    # without setSecure, for instance — which a per-node match cannot say.
+    absent: Optional[str] = None
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)

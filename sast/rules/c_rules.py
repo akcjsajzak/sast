@@ -19,13 +19,38 @@ _ALL = ["buffer", "cmd", "fmt", "path", "lfi", "sql", "code", "int"]
 _BUF = ["buffer"]
 
 
+# Which argument each input function fills in, and whether its return value
+# is data or just a count. C hands a function somewhere to write rather than
+# returning the bytes, so a source rule that only tainted the return value
+# described the wrong expression entirely. `_VARARG_TAIL` covers the scanf
+# family, whose conversion targets run to the end of the call; indices past
+# the end of a given call are ignored.
+_VARARG_TAIL = tuple(range(1, 12))
+_INPUT_FUNCTIONS = {
+    # name:        (out_args,                      return is data)
+    "getenv":      ((),                            True),
+    "gets":        ((0,),                          True),
+    "fgets":       ((0,),                          True),
+    "readline":    ((),                            True),
+    "getline":     ((0,),                          False),
+    "read":        ((1,),                           False),
+    "recv":        ((1,),                           False),
+    "recvfrom":    ((1,),                           False),
+    "fread":       ((0,),                           False),
+    "scanf":       (_VARARG_TAIL,                  False),
+    "fscanf":      (tuple(range(2, 12)),           False),
+    "sscanf":      (tuple(range(2, 12)),           False),
+}
+
+
 def _sources() -> list[TaintSource]:
     s: list[TaintSource] = []
-    for fn in ("getenv", "gets", "fgets", "scanf", "fscanf", "sscanf", "read",
-               "recv", "recvfrom", "fread", "readline", "getline"):
+    for fn, (out_args, returns_data) in _INPUT_FUNCTIONS.items():
         s.append(TaintSource(
             kind="call", match=fn, tags=_ALL,
             description=f"Untrusted input read via {fn}()",
+            out_args=out_args or None,
+            out_only=bool(out_args) and not returns_data,
         ))
     s.append(TaintSource(
         kind="identifier", match="argv", tags=_ALL,

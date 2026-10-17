@@ -18,6 +18,19 @@ MAX_STEPS = 15
 _ALL_TAGS = ["sql", "xss", "cmd", "ssrf", "lfi", "path", "deser", "xxe", "ldap",
              "redirect", "code", "log", "ssti", "jndi", "el", "xpath", "redos"]
 
+# Nodes whose children must not contribute taint: declarations and types
+# describe shape, not values.
+_OPAQUE = frozenset({
+    "class_declaration", "interface_declaration", "enum_declaration",
+    "method_declaration", "constructor_declaration", "field_declaration",
+    "annotation_type_declaration", "import_declaration", "package_declaration",
+    "type_identifier", "scoped_type_identifier", "generic_type",
+    "formal_parameters", "type_arguments", "dimensions", "modifiers",
+    "marker_annotation", "annotation", "block", "class_body",
+})
+
+_COMMENTS = {"comment", "line_comment", "block_comment"}
+
 _SKIP_TOP = {"package_declaration", "import_declaration", "class_declaration",
              "interface_declaration", "enum_declaration", "annotation_type_declaration",
              "comment", "block_comment", "line_comment", "record_declaration"}
@@ -37,6 +50,12 @@ ARG_PROPAGATORS = frozenset({
     "decode", "encode", "encodeToString", "join", "valueOf", "copyValueOf",
     "parseString", "readValue", "fromJson", "deserialize", "unescapeHtml",
     "unescapeHtml4", "toString",
+    # Commons Codec, reached as a static on the Base64 class rather than on a
+    # tainted receiver. Round-tripping a value through Base64 does not launder
+    # it, but losing it here made the round trip look like a sanitizer.
+    "encodeBase64", "decodeBase64", "encodeBase64String", "encodeBase64URLSafe",
+    "encodeBase64URLSafeString", "encodeHexString", "decodeHex",
+    "newStringUtf8", "getBytesUtf8",
     # Collection factories — the collection inherits its elements' taint.
     "asList", "of", "singletonList", "singleton", "copyOf",
     "unmodifiableList", "unmodifiableCollection", "nCopies",
@@ -230,7 +249,13 @@ class JavaTaintEngine:
         for c in node.named_children:
             if c.type == "parenthesized_expression":
                 self.taint_of(c, sf, env, tenv, ctx)
-            elif c.type in ("block", "statement"):
+            elif c.type not in _COMMENTS:
+                # A braceless branch body is the statement itself — an
+                # `expression_statement`, a declaration, a nested if — and
+                # never a node called "statement", so matching on that name
+                # skipped `if (v != null) x = v[0];` outright. The Benchmark's
+                # whole getParameterMap shape ends in exactly that line, which
+                # is why so many of its flows stopped at the null guard.
                 be, bte = dict(env), dict(tenv)
                 r = self.process_any(c, sf, be, bte, ctx)
                 ret = _merge_taint(ret, r)
@@ -245,15 +270,39 @@ class JavaTaintEngine:
         be, bte = dict(env), dict(tenv)
         if node.type == "enhanced_for_statement":
             self.bind_enhanced_for(node, sf, be, bte, ctx)
+        bound = self._loop_header_nodes(node)
         for c in node.named_children:
-            if c.type in ("block", "statement"):
+            if c in bound:
+                continue
+            if c.type == "parenthesized_expression":
+                self.taint_of(c, sf, be, bte, ctx)
+            elif c.type not in _COMMENTS:
+                # As in handle_if: a braceless loop body is the bare statement.
                 r = self.process_any(c, sf, be, bte, ctx)
                 ret = _merge_taint(ret, r)
-            elif c.type == "parenthesized_expression":
-                self.taint_of(c, sf, be, bte, ctx)
         _merge_env(env, be)
         _merge_tenv(tenv, bte)
         return ret
+
+    @staticmethod
+    def _loop_header_nodes(node: Node) -> set:
+        """Children of a for/foreach that belong to its header, not its body.
+
+        `for (int i = 0; i < n; i++) body;` keeps the init, condition and
+        update as siblings of the body, and a foreach keeps its element type,
+        name and iterable the same way. Processing those as statements would
+        both double-count them and, for a foreach, overwrite the element
+        binding that `bind_enhanced_for` just made.
+        """
+        header = set()
+        fields = (("type", "name", "value")
+                  if node.type == "enhanced_for_statement"
+                  else ("init", "condition", "update"))
+        for field in fields:
+            child = node.child_by_field_name(field)
+            if child is not None:
+                header.add(child)
+        return header
 
     def bind_enhanced_for(self, node: Node, sf: SourceFile, env: dict, tenv: dict, ctx: Ctx):
         named = node.named_children
@@ -301,7 +350,19 @@ class JavaTaintEngine:
             return self.method_invocation_taint(node, sf, env, tenv, ctx)
         if t == "object_creation_expression":
             self.check_constructor_sink(node, sf, env, tenv, ctx)
-            return None
+            # A constructor wraps its arguments rather than cleansing them:
+            # `new String(bytes)`, `new StringBuilder(s)`, `new File(path)`,
+            # `new URL(u)` all carry the value straight through. Returning
+            # nothing here ended the trace at any such wrapper, so a value that
+            # merely round-tripped through Base64 and back into a String looked
+            # as though it had been sanitized.
+            lists = [c for c in node.named_children if c.type == "argument_list"]
+            merged = None
+            for a in (lists[0].named_children if lists else []):
+                tt = self.taint_of(a, sf, env, tenv, ctx)
+                if tt is not None:
+                    merged = tt if merged is None else merged.merge(tt)
+            return merged
         if t == "field_access":
             return env.get(ja.text(node))
         if t == "array_access":
@@ -322,9 +383,27 @@ class JavaTaintEngine:
         if t == "assignment_expression":
             nc = node.named_children
             return self.taint_of(nc[-1], sf, env, tenv, ctx) if nc else None
-        if t == "array_creation_expression":
+        if t in ("array_creation_expression", "array_initializer"):
+            # `new String[]{x}` and the bare `{x}` of `String[] a = {x};` are
+            # different nodes; missing the second dropped taint on a very
+            # common shape.
             merged = None
             for c in node.named_children:
+                tt = self.taint_of(c, sf, env, tenv, ctx)
+                if tt is not None:
+                    merged = tt if merged is None else merged.merge(tt)
+            return merged
+
+        # Anything else composite: carry the taint of whatever it contains.
+        # Returning None here instead meant every unmodelled expression
+        # silently terminated a trace, which is the dominant cause of false
+        # negatives — a missed sink is far more costly than an over-tainted
+        # intermediate value, which still has to reach a sink to be reported.
+        if node.named_children and t not in _OPAQUE:
+            merged = None
+            for c in node.named_children:
+                if c.type in ("comment", "line_comment", "block_comment"):
+                    continue
                 tt = self.taint_of(c, sf, env, tenv, ctx)
                 if tt is not None:
                     merged = tt if merged is None else merged.merge(tt)
@@ -448,6 +527,21 @@ class JavaTaintEngine:
             recv = self.taint_of(obj, sf, env, tenv, ctx)
             if recv is not None:
                 return recv
+
+        # A call this analysis could not resolve — a helper in a class that was
+        # not scanned, or a method reached through an interface whose concrete
+        # type is unknown — still returns something derived from its arguments.
+        # Dropping the taint here made every flow through such a helper
+        # invisible, which is the single largest source of false negatives.
+        # Sanitizers are matched earlier, so an escaping helper is unaffected.
+        if mname not in NON_PROPAGATING:
+            merged = None
+            for a in args:
+                tt = self.taint_of(a, sf, env, tenv, ctx)
+                if tt is not None:
+                    merged = tt if merged is None else merged.merge(tt)
+            if merged is not None:
+                return merged
 
         return None
 
@@ -659,12 +753,28 @@ class JavaTaintEngine:
         ))
 
     # ------------------------------------------------------------------
+    def _absent_ok(self, rule, sf: SourceFile) -> bool:
+        """True unless the rule's `absent` regex appears in the file."""
+        if not getattr(rule, "absent", None):
+            return True
+        import re as _re
+        cache = getattr(self, "_absent_cache", None)
+        if cache is None:
+            cache = self._absent_cache = {}
+        key = (id(sf), rule.absent)
+        if key not in cache:
+            text = sf.content.decode("utf-8", "replace")
+            cache[key] = _re.search(rule.absent, text) is None
+        return cache[key]
+
     def run_patterns(self, sf: SourceFile) -> None:
         if not self.rules.patterns:
             return
         for node in sf.walk():
             for rule in self.rules.patterns:
                 if rule.node_type != "*" and node.type != rule.node_type:
+                    continue
+                if not self._absent_ok(rule, sf):
                     continue
                 value = ja.text(node) if rule.match_field == "text" else None
                 if value is None:

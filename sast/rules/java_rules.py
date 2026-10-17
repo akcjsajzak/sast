@@ -4,6 +4,7 @@ from __future__ import annotations
 from .base import RuleSet, TaintSource, SinkRule, SanitizerRule, PatternRule
 
 _ALL = ["sql", "xss", "cmd", "ssrf", "lfi", "path", "deser", "xxe", "ldap",
+        "trustbound",
         "redirect", "code", "log", "ssti", "jndi", "el", "xpath", "redos"]
 A03 = "A03:2021 — Injection"
 A10 = "A10:2021 — Server-Side Request Forgery (SSRF)"
@@ -15,7 +16,15 @@ def _sources() -> list[TaintSource]:
     # Servlet / raw Java request accessors.
     for m in ("getParameter", "getParameterValues", "getHeader", "getHeaders",
               "getQueryString", "getInputStream", "getReader", "getCookies",
-              "getAttribute", "getParameterMap"):
+              "getAttribute", "getParameterMap",
+              # The *names* are attacker-controlled too: a request decides
+              # which parameters and headers it sends, and code that echoes a
+              # name or stores it under that key is reflecting request data.
+              "getParameterNames", "getHeaderNames", "getAttributeNames",
+              "getPathInfo", "getRequestURI", "getRequestURL", "getServletPath",
+              "getPathTranslated", "getRemoteUser", "getRemoteHost",
+              "getRemoteAddr", "getAuthType", "getContentType",
+              "getCharacterEncoding", "getPart", "getParts"):
         s.append(TaintSource(
             kind="method", match=m, tags=_ALL,
             description=f"Untrusted data from Servlet request ->{m}()",
@@ -67,7 +76,14 @@ def _sinks() -> list[SinkRule]:
     # --- SQL injection ---
     for m in ("executeQuery", "execute", "executeUpdate", "executeLargeUpdate",
               "prepareStatement", "prepareCall", "createQuery", "createNativeQuery",
-              "queryForObject", "queryForList", "query", "update"):
+              "queryForObject", "queryForList", "query", "update",
+              # The rest of Spring's JdbcTemplate surface, plus JDBC batching.
+              # Each takes the statement as a string exactly as the methods
+              # above do, so leaving them out made a flow invisible purely
+              # because of which overload the caller happened to pick.
+              "queryForRowSet", "queryForMap", "queryForLong", "queryForInt",
+              "queryForStream", "batchUpdate", "addBatch", "executeBatch",
+              "executeLargeBatch", "nativeQuery", "createSQLQuery"):
         k.append(SinkRule(
             rule_id=f"java-sqli-{m}", kind="method", match=m,
             title=f"SQL injection via {m}()",
@@ -86,6 +102,20 @@ def _sinks() -> list[SinkRule]:
         remediation="Avoid shell execution with untrusted input; use ProcessBuilder with an argument array and no shell.",
         tags=["cmd"], obj_hint="Runtime",
     ))
+    # A ProcessBuilder is often built empty and filled later, so the command
+    # never passes through the constructor the object_create rule below sees.
+    for m in ("command", "directory"):
+        k.append(SinkRule(
+            rule_id=f"java-cmdi-pb-{m}", kind="method", match=m,
+            title=f"Command injection via ProcessBuilder.{m}()",
+            severity="critical", cwe="CWE-78", owasp=A03,
+            category="command-injection",
+            description=f"Untrusted data sets the command ProcessBuilder will run "
+                        f"via {m}().",
+            remediation="Choose the program from a fixed allow-list and pass "
+                        "arguments separately, never through a shell.",
+            tags=["cmd"], obj_hint="processbuilder",
+        ))
     k.append(SinkRule(
         rule_id="java-cmdi-processbuilder", kind="object_create", match="ProcessBuilder",
         title="Command injection via ProcessBuilder",
@@ -124,6 +154,21 @@ def _sinks() -> list[SinkRule]:
     ))
 
     # --- XSS (response writer) ---
+    # printf/format take the format string first, and the Locale overload
+    # pushes it to the second position, so neither can be pinned to a fixed
+    # argument index: any tainted argument is reflected into the response.
+    for m in ("printf", "format"):
+        k.append(SinkRule(
+            rule_id=f"java-xss-{m}", kind="method", match=m,
+            title=f"Cross-site scripting via response writer ->{m}()",
+            severity="medium", cwe="CWE-79", owasp=A03, category="xss",
+            description=f"Untrusted data is formatted into the HTTP response via "
+                        f"{m}() without encoding. A tainted format string is "
+                        "worse still, since the conversions themselves become "
+                        "attacker-controlled.",
+            remediation="HTML-encode the values and keep the format string a literal.",
+            tags=["xss"], obj_hint="response",
+        ))
     for m in ("write", "print", "println", "append"):
         k.append(SinkRule(
             rule_id=f"java-xss-{m}", kind="method", match=m,
@@ -436,6 +481,29 @@ def _sinks() -> list[SinkRule]:
     return k
 
 
+def _trustbound_sinks() -> list[SinkRule]:
+    """A tainted name crossing into session storage (CWE-501)."""
+    A05 = "A05:2021 — Security Misconfiguration"
+    out = []
+    for m in ("setAttribute", "putValue"):
+        out.append(SinkRule(
+            rule_id=f"java-trustbound-{m}", kind="method", match=m,
+            title=f"Trust boundary violation via {m}()",
+            severity="medium", cwe="CWE-501", owasp=A05,
+            category="trust-boundary",
+            description="Attacker-controlled data is written into the session "
+                        "under an attacker-controlled name, mixing untrusted "
+                        "input with trusted server-side state.",
+            remediation="Validate the key against an allow-list before storing, "
+                        "and never let a request choose a session attribute name.",
+            # Either position matters: an attacker-chosen name is the trust
+            # boundary violation CWE-501 describes, and attacker-chosen content
+            # under a trusted name is what later code then relies on. Pinning
+            # this to argument 0 missed every `putValue("userid", param)`.
+            tags=["trustbound", "log"], arg_index=-1, confidence="medium"))
+    return out
+
+
 def _sanitizers() -> list[SanitizerRule]:
     s = []
     for m in ("htmlEscape", "escapeHtml", "escapeHtml4", "forHtml", "encodeForHTML",
@@ -446,6 +514,7 @@ def _sanitizers() -> list[SanitizerRule]:
 
 
 def _patterns() -> list[PatternRule]:
+    A02 = "A02:2021 — Cryptographic Failures"
     p = []
     for factory in ("DocumentBuilderFactory", "SAXParserFactory", "XMLInputFactory",
                     "SAXReader", "SAXBuilder"):
@@ -458,6 +527,49 @@ def _patterns() -> list[PatternRule]:
             description=f"{factory} is instantiated. Ensure external entity resolution and DTDs are explicitly disabled.",
             remediation="Disable DOCTYPE/external entities (e.g. setFeature on DocumentBuilderFactory).",
         ))
+    p.append(PatternRule(
+        rule_id="java-insecure-cookie",
+        node_type="*",
+        match=r"\.addCookie\s*\(",
+        absent=r"setSecure\s*\(\s*true\s*\)",
+        match_field="text", regex=True,
+        title="Cookie sent without the Secure flag",
+        severity="medium", cwe="CWE-614", owasp=A02,
+        category="security-misconfiguration",
+        description="A cookie is added to the response without setSecure(true) "
+                    "anywhere in this file, so it is transmitted over plaintext "
+                    "HTTP and can be captured in transit.",
+        remediation="Call setSecure(true) and setHttpOnly(true) before adding "
+                    "the cookie, and set SameSite.",
+        confidence="medium",
+    ))
+    p.append(PatternRule(
+        rule_id="java-crypto-weak-cipher",
+        node_type="*",
+        match=r"""(?:Cipher|SecretKeyFactory|KeyGenerator)\.getInstance\s*\(\s*"""
+              r"""[^")]*"(?:DES|DESede|TripleDES|RC2|RC4|ARCFOUR|Blowfish|IDEA|"""
+              r"""AES/ECB|DES/ECB|[A-Za-z0-9]+/ECB)""",
+        match_field="text", regex=True, ignore_case=True,
+        title="Weak or broken cipher algorithm",
+        severity="medium", cwe="CWE-327", owasp=A02, category="weak-crypto",
+        description="DES, 3DES, RC2, RC4, Blowfish and IDEA are broken or too "
+                    "weak for current use, and ECB mode leaks plaintext "
+                    "structure by mapping equal blocks to equal ciphertext.",
+        remediation="Use AES-GCM (or AES-CBC with a random IV and a MAC) and a "
+                    "256-bit key.",
+    ))
+    p.append(PatternRule(
+        rule_id="java-crypto-weak-hash-algorithm",
+        node_type="*",
+        match=r"""MessageDigest\.getInstance\s*\(\s*[^")]*"(?:MD2|MD4|MD5|SHA-?1)"""
+              r"""|["'](?:MD5|SHA1|SHA-1)["']\s*,\s*["'][A-Za-z]+["']\s*\)""",
+        match_field="text", regex=True, ignore_case=True,
+        title="Weak cryptographic hash (MD5/SHA-1)",
+        severity="low", cwe="CWE-328", owasp=A02, category="weak-crypto",
+        description="MD2, MD4, MD5 and SHA-1 are collision-prone and unfit for "
+                    "signatures, integrity checks or password storage.",
+        remediation="Use SHA-256 or better; use bcrypt/scrypt/argon2 for passwords.",
+    ))
     p.append(PatternRule(
         rule_id="java-crypto-md5", node_type="string_literal", match="MD5",
         match_field="text", title="Weak cryptographic hash (MD5)",
@@ -544,7 +656,7 @@ def _patterns() -> list[PatternRule]:
 def build_java_rules() -> RuleSet:
     return RuleSet(
         sources=_sources(),
-        sinks=_sinks(),
+        sinks=_sinks() + _trustbound_sinks(),
         sanitizers=_sanitizers(),
         patterns=_patterns(),
     )

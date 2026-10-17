@@ -45,6 +45,7 @@ class GenericTaintEngine:
         self.findings: list[Finding] = []
         self._seen: set = set()
         self._call_memo: dict = {}
+        self._file_text_cache: dict = {}
 
     # ------------------------------------------------------------------
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
@@ -181,7 +182,18 @@ class GenericTaintEngine:
             if len(kids) < 2:
                 return None
             left, right = kids[0], kids[-1]
-        vt = self.taint_of(right, sf, env, ctx)
+        # `x = y = value` nests one assignment inside another, so the outer
+        # right-hand side is itself an assignment rather than the value. Bind
+        # the inner targets first, then give the outer target the same taint;
+        # evaluating the nested node as an expression instead left every name
+        # but the innermost one clean.
+        inner = self.strip(right)
+        if inner is not None and inner.type in p.assignment:
+            self.handle_assignment(inner, sf, env, ctx)
+            inner_right = inner.child_by_field_name(p.f_right)
+            vt = self.taint_of(inner_right, sf, env, ctx) if inner_right else None
+        else:
+            vt = self.taint_of(right, sf, env, ctx)
         self.check_property_sink(left, vt, stmt, sf)
         self.assign_to(left, vt, sf, env)
         return None
@@ -223,7 +235,16 @@ class GenericTaintEngine:
             kids = [c for c in node.named_children if c.type not in self.p.comment]
             if not kids:
                 return node
-            node = kids[-1] if node.type in self.p.expression_stmt else kids[0]
+            # A cast names the type first and the expression second, so taking
+            # the first child turned `(char *)malloc(n)` into the type `char *`
+            # and lost the call — in C, where casting a malloc is the norm,
+            # that silently dropped the sink. The grammar's value field says
+            # which child is the expression; trust it when it exists.
+            valued = node.child_by_field_name(self.p.f_value)
+            if valued is not None:
+                node = valued
+            else:
+                node = kids[-1] if node.type in self.p.expression_stmt else kids[0]
             seen += 1
         return node
 
@@ -309,16 +330,26 @@ class GenericTaintEngine:
 
         if t in p.binary:
             op = node.child_by_field_name(p.f_operator)
-            if op is not None and _text(op) not in p.concat_ops:
-                return None
             merged = None
             for c in node.named_children:
                 merged = _merge_taint(merged, self.taint_of(c, sf, env, ctx))
+            if op is not None and _text(op) not in p.concat_ops:
+                # A comparison or arithmetic result is not the operand's data,
+                # so it carries no taint — but the operands still had to be
+                # evaluated. Returning early here skipped them outright, which
+                # hid every sink written inside a condition
+                # (`while (fread(&buf, ...) > 0)`, `if (system(cmd) == 0)`)
+                # along with any buffer such a call fills in.
+                return None
             return merged
 
         if t in p.ternary:
             merged = None
-            for c in node.named_children[1:]:
+            kids = node.named_children
+            if kids:
+                # Evaluated for its sinks; a condition's truth value is not data.
+                self.taint_of(kids[0], sf, env, ctx)
+            for c in kids[1:]:
                 merged = _merge_taint(merged, self.taint_of(c, sf, env, ctx))
             return merged
 
@@ -399,9 +430,14 @@ class GenericTaintEngine:
         if san is None:
             self.check_call_sink(name, recv_root, path, args, node, sf, env, ctx)
 
-        st = self.source_taint("call", name, node, sf, recv_root, path, args)
-        if st is not None:
-            return st
+        src = self.match_source("call", name, recv_root, path, sf)
+        if src is not None:
+            st = self.taint_from_source(src, node, sf)
+            if src.out_args:
+                self.apply_out_args(src, args, node, sf, env)
+            if not src.out_only:
+                return st
+            return None
 
         if san is not None:
             return self.sanitized_taint(san, args, sf, env, ctx)
@@ -475,9 +511,23 @@ class GenericTaintEngine:
     # ------------------------------------------------------------------
     # Rules
     # ------------------------------------------------------------------
-    def source_taint(self, kind, name, node, sf, root="", path="", args=None):
+    def _file_text(self, sf: SourceFile) -> str:
+        """The file's decoded text, cached — only needed by gated sources."""
+        cache = self._file_text_cache
+        key = sf.path
+        text = cache.get(key)
+        if text is None:
+            text = sf.content.decode("utf-8", "replace")
+            cache[key] = text
+        return text
+
+    def match_source(self, kind, name, root="", path="", sf=None):
+        """The first source rule this expression satisfies, or None."""
         for src in self.rules.sources:
             if src.kind != kind:
+                continue
+            if src.file_requires and not (
+                    sf is not None and src.file_allows(self._file_text(sf))):
                 continue
             if not match_callee(name, src.match):
                 continue
@@ -485,15 +535,44 @@ class GenericTaintEngine:
                 continue
             if src.keys is not None and not src.key_matches(name):
                 continue
-            return Taint(
-                tags=set(src.tags),
-                origins=[make_loc(sf, node)],
-                steps=[TaintStep(location=make_loc(sf, node),
-                                 description=src.description,
-                                 code=sf.node_line(node))],
-                confidence=src.confidence,
-            )
+            return src
         return None
+
+    def taint_from_source(self, src, node: Node, sf: SourceFile) -> Taint:
+        return Taint(
+            tags=set(src.tags),
+            origins=[make_loc(sf, node)],
+            steps=[TaintStep(location=make_loc(sf, node),
+                             description=src.description,
+                             code=sf.node_line(node))],
+            confidence=src.confidence,
+        )
+
+    def apply_out_args(self, src, args, node: Node, sf: SourceFile, env: dict):
+        """Taint the variables a call fills in through its arguments.
+
+        C reads input by handing a function somewhere to put it, so the
+        interesting value is never the return: after `fread(&img, ...)` it is
+        `img` that holds attacker bytes. Binding the taint to the argument's
+        root name is what lets a later `malloc(img.width + img.height)` be
+        seen as an attacker-controlled allocation.
+        """
+        for idx in src.out_args:
+            if idx >= len(args):
+                continue  # a varargs tail that this call did not use
+            name = self.root_of(args[idx])
+            if not name:
+                continue
+            env[name] = self.taint_from_source(src, args[idx], sf).with_step(
+                TaintStep(location=make_loc(sf, node),
+                          description=f"{name} is filled in by {_text(node)[:60]}",
+                          code=sf.node_line(node)))
+
+    def source_taint(self, kind, name, node, sf, root="", path="", args=None):
+        src = self.match_source(kind, name, root, path, sf)
+        if src is None:
+            return None
+        return self.taint_from_source(src, node, sf)
 
     def match_sanitizer(self, name, root, arg_texts):
         for san in self.rules.sanitizers:
@@ -546,6 +625,13 @@ class GenericTaintEngine:
             if not sink.tags:
                 self.report(sink, None, node, sf)
                 return
+            if sink.receiver_tainted:
+                recv = self._receiver_node(node)
+                rt = self.taint_of(recv, sf, env, ctx) if recv is not None else None
+                if rt is not None and set(sink.tags) & rt.tags:
+                    self.report(sink, rt, node, sf)
+                    return
+                continue
             indices = range(len(args)) if sink.arg_index < 0 else [sink.arg_index]
             for i in indices:
                 if i >= len(args):
@@ -608,6 +694,20 @@ class GenericTaintEngine:
             tags=list(taint.tags & set(sink.tags)) if taint else list(sink.tags),
         ))
 
+    def _absent_ok(self, rule, sf: SourceFile) -> bool:
+        """True unless the rule's `absent` regex appears in the file."""
+        if not getattr(rule, "absent", None):
+            return True
+        import re as _re
+        cache = getattr(self, "_absent_cache", None)
+        if cache is None:
+            cache = self._absent_cache = {}
+        key = (id(sf), rule.absent)
+        if key not in cache:
+            text = sf.content.decode("utf-8", "replace")
+            cache[key] = _re.search(rule.absent, text) is None
+        return cache[key]
+
     def run_patterns(self, sf: SourceFile) -> None:
         if not self.rules.patterns:
             return
@@ -615,6 +715,8 @@ class GenericTaintEngine:
         for node in sf.walk():
             for rule in self.rules.patterns:
                 if rule.node_type != "*" and node.type != rule.node_type:
+                    continue
+                if not self._absent_ok(rule, sf):
                     continue
                 value = self._pattern_value(node, rule.match_field)
                 if value is None:
@@ -678,23 +780,68 @@ def build_symbols(files: list[SourceFile], profile: LangProfile) -> dict:
     """Index function and method definitions by name across all files."""
     symbols: dict = {}
 
-    def params_of(node: Node) -> list:
-        names = []
+    def find_params(node: Node):
+        """Locate the formal parameter list belonging to `node`.
+
+        Most grammars hang it straight off the function node, but C and C++
+        bury it inside the declarator — `function_definition` holds a
+        `function_declarator`, which holds the `parameter_list`, and a
+        pointer return type adds another wrapper on top. Looking only at the
+        direct children therefore found nothing for C/C++, every function was
+        recorded with no parameters, and no taint could cross a call: an
+        argument had no name to bind to in the callee.
+
+        The search skips the body so a nested closure's parameters are never
+        mistaken for the enclosing function's.
+        """
         for c in node.named_children:
-            if c.type not in profile.params:
+            if c.type in profile.params:
+                return c
+            if c.type in profile.block or c.type in profile.comment:
                 continue
-            for param in c.named_children:
-                if param.type in profile.comment:
-                    continue
-                ident = param
-                if param.type not in profile.identifier:
-                    found = param.child_by_field_name(profile.f_name)
-                    if found is None:
-                        found = next((k for k in param.named_children
-                                      if k.type in profile.identifier), None)
-                    ident = found
-                if ident is not None:
-                    names.append(_text(ident))
+            found = find_params(c)
+            if found is not None:
+                return found
+        return None
+
+    def param_name(param: Node):
+        """The bound name of one formal parameter.
+
+        `char *filename` and `char buf[10]` wrap the identifier in a
+        `pointer_declarator` or `array_declarator`, so the name is not a
+        direct child; descend until an identifier turns up.
+        """
+        if param.type in profile.identifier:
+            return param
+        named = param.child_by_field_name(profile.f_name)
+        if named is not None and named.type in profile.identifier:
+            return named
+        stack = list(param.named_children)
+        while stack:
+            cur = stack.pop(0)
+            if cur.type in profile.identifier:
+                return cur
+            # A type name is not a parameter name; nothing useful is nested
+            # inside one, so do not descend through it.
+            if cur.type in ("primitive_type", "type_identifier",
+                            "sized_type_specifier", "struct_specifier",
+                            "type_descriptor", "qualified_identifier",
+                            "template_type"):
+                continue
+            stack.extend(cur.named_children)
+        return None
+
+    def params_of(node: Node) -> list:
+        container = find_params(node)
+        if container is None:
+            return []
+        names = []
+        for param in container.named_children:
+            if param.type in profile.comment:
+                continue
+            ident = param_name(param)
+            if ident is not None:
+                names.append(_text(ident))
         return names
 
     def walk(node: Node, sf: SourceFile):
