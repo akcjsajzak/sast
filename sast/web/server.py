@@ -16,9 +16,11 @@ import html
 import json
 import os
 import socket
+import sys
 import threading
 import time
 import traceback
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from ..engine import ScanEngine, ScanOptions
@@ -60,7 +62,17 @@ class ScanService:
         )
         self._threads.append(thread)
         thread.start()
+        self._log(record.id, f"started: {label}")
         return record.id
+
+    def _log(self, scan_id: str, message: str) -> None:
+        # Progress goes to stderr so it is visible whether stdout is a terminal
+        # or redirected to a log file, and flushed so it appears promptly.
+        print(f"[scan {scan_id[:8]}] {message}", file=sys.stderr, flush=True)
+
+    def _on_progress(self, scan_id: str, message: str) -> None:
+        self.store.progress(scan_id, message)
+        self._log(scan_id, message)
 
     def _run(self, scan_id, source_type, value, upload, filename, branch) -> None:
         cleanup = None
@@ -68,13 +80,23 @@ class ScanService:
         try:
             directory, label, cleanup = resolve(
                 source_type, value, upload, filename, branch)
-            result = ScanEngine(self.options).scan(directory)
+            options = replace(
+                self.options,
+                progress=lambda msg: self._on_progress(scan_id, msg),
+            )
+            result = ScanEngine(options).scan(directory)
             self.store.write_report(
                 scan_id, render_html(result), render_json(result))
             self.store.finish(scan_id, result, time.time() - started)
+            self._log(scan_id, "done: "
+                      f"{len(result.findings)} finding(s), "
+                      f"{len(result.dependency_issues)} dependency "
+                      f"issue(s) in {result.duration_seconds}s")
         except SourceError as exc:
+            self._log(scan_id, f"failed: {exc}")
             self.store.fail(scan_id, str(exc))
         except Exception as exc:  # noqa: BLE001 — a scan must never kill the server
+            self._log(scan_id, f"failed: {type(exc).__name__}: {exc}")
             self.store.fail(scan_id, f"{type(exc).__name__}: {exc}\n\n"
                                      f"{traceback.format_exc(limit=5)}")
         finally:

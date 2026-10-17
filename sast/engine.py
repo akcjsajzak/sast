@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 from .advisory.analyzer import analyze_dependencies
 from .advisory.db import AdvisoryDB
@@ -67,12 +68,19 @@ class ScanOptions:
     # Establish whether first-party code actually imports and calls each
     # vulnerable dependency, and rank findings by that.
     reachability: bool = True
+    # Called with a human-readable phase message as the scan progresses, so a
+    # CLI can print it and a server can store or stream it. None silences it.
+    progress: Optional[Callable[[str], None]] = None
 
 
 class ScanEngine:
     def __init__(self, options: ScanOptions = None) -> None:
         self.options = options or ScanOptions()
         self.registry = Registry()
+
+    def _progress(self, message: str) -> None:
+        if self.options.progress is not None:
+            self.options.progress(message)
 
     _properties: dict = {}
 
@@ -115,9 +123,14 @@ class ScanEngine:
             module_dirs[language] = profile.module_dirs
 
             rules = self.registry.rules_for(language, profile.framework)
+            self._progress(
+                f"Scanning {language}: {len(source_files)} file(s), "
+                f"framework {profile.framework}",
+            )
             lang_findings, parsed_count, unreadable = self._analyze(
                 language, profile.framework, rules, source_files,
             )
+            self._progress(f"{language}: {len(lang_findings)} finding(s)")
             findings.extend(lang_findings)
             files_scanned += parsed_count
             if unreadable:
@@ -129,6 +142,7 @@ class ScanEngine:
         # application source.
         primary = languages[0] if languages else ""
         if self.options.scan_templates:
+            self._progress("Scanning templates")
             tpl_files = collect_template_files(root)
             if not self.options.include_tests:
                 tpl_files = [(p, k) for (p, k) in tpl_files
@@ -136,6 +150,7 @@ class ScanEngine:
             findings.extend(scan_templates(tpl_files))
             files_scanned += len(tpl_files)
         if self.options.scan_configs:
+            self._progress("Scanning configuration")
             cfg_files = collect_config_files(root)
             findings.extend(scan_configs(
                 cfg_files, language=primary, framework=frameworks.get(primary, "raw"),
@@ -145,12 +160,14 @@ class ScanEngine:
         # Infrastructure as code: where a bucket becomes public or a container
         # becomes privileged. Not reachable from any application taint path.
         if self.options.scan_iac:
+            self._progress("Scanning infrastructure-as-code")
             iac_files = collect_iac_files(root)
             findings.extend(scan_iac(iac_files))
             files_scanned += len(iac_files)
 
         dockerfiles: list = []
         if self.options.scan_containers:
+            self._progress("Scanning containers")
             dockerfiles = collect_dockerfiles(root)
             findings.extend(scan_dockerfiles(dockerfiles))
             files_scanned += len(dockerfiles)
@@ -158,6 +175,7 @@ class ScanEngine:
         # Secrets are searched across every text file, not only source: a
         # credential is as dangerous in a README or a CI config.
         if self.options.scan_secrets:
+            self._progress("Scanning secrets")
             secret_files = collect_scannable_files(root)
             findings.extend(scan_secrets(secret_files, root))
 
@@ -171,6 +189,7 @@ class ScanEngine:
 
         dep_issues: list = []
         if self.options.scan_dependencies:
+            self._progress("Checking dependencies")
             for language in languages:
                 found = analyze_dependencies(
                     root, language, db, module_dirs.get(language) or [root],
@@ -185,6 +204,7 @@ class ScanEngine:
         # Reachability: a vulnerable package that first-party code never
         # imports is rarely the same risk as one it calls into.
         if dep_issues and self.options.reachability:
+            self._progress("Resolving dependency reachability")
             if not all_source_files:
                 for language in languages:
                     all_source_files.extend(collect_source_files_detailed(

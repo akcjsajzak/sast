@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS scans (
     findings      INTEGER DEFAULT 0,
     dependencies  INTEGER DEFAULT 0,
     files_scanned INTEGER DEFAULT 0,
+    progress      TEXT DEFAULT '',
     error         TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS scans_created ON scans (created_at DESC);
@@ -62,6 +63,7 @@ class ScanRecord:
     findings: int = 0
     dependencies: int = 0
     files_scanned: int = 0
+    progress: str = ""
     error: str = ""
 
     def to_dict(self) -> dict:
@@ -80,6 +82,7 @@ class ScanRecord:
             "findings": self.findings,
             "dependencies": self.dependencies,
             "files_scanned": self.files_scanned,
+            "progress": self.progress,
             "error": self.error,
         }
 
@@ -99,8 +102,15 @@ class ScanStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._ensure_column("progress", "TEXT DEFAULT ''")
             self._conn.commit()
         self._recover()
+
+    def _ensure_column(self, name: str, decl: str) -> None:
+        """Add a column to a store created before the column existed."""
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(scans)")}
+        if name not in cols:
+            self._conn.execute(f"ALTER TABLE scans ADD COLUMN {name} {decl}")
 
     def _recover(self) -> None:
         """Mark scans that a restart cut short.
@@ -148,6 +158,12 @@ class ScanStore:
                  json.dumps(counts), len(result.findings),
                  len(result.dependency_issues), result.files_scanned, scan_id),
             )
+            self._conn.commit()
+
+    def progress(self, scan_id: str, message: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE scans SET progress=? WHERE id=?", (message, scan_id))
             self._conn.commit()
 
     def fail(self, scan_id: str, error: str) -> None:
@@ -244,5 +260,6 @@ def _row_to_record(row) -> ScanRecord:
         findings=row["findings"] or 0,
         dependencies=row["dependencies"] or 0,
         files_scanned=row["files_scanned"] or 0,
+        progress=row["progress"] or "",
         error=row["error"] or "",
     )

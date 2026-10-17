@@ -18,6 +18,10 @@ def _severity_choices() -> str:
     return ", ".join(s.value for s in Severity)
 
 
+def _stderr_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
 def cmd_scan(args) -> int:
     # --advisory-db is repeatable; --advisory-dbs is a deprecated alias.
     advisory_dbs = list(args.advisory_db or []) + list(args.advisory_dbs or [])
@@ -43,6 +47,7 @@ def cmd_scan(args) -> int:
         scan_configs=enabled("config"),
         scan_dependencies=enabled("deps"),
         reachability=not args.no_reachability,
+        progress=None if args.quiet else _stderr_progress,
     )
     engine = ScanEngine(options)
     result = engine.scan(args.path)
@@ -190,6 +195,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Scan at most N files per language (0 = unlimited)")
     p_scan.add_argument("--no-reachability", action="store_true",
                         help="Skip reachability analysis for dependencies")
+    p_scan.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress progress output")
     p_scan.add_argument("--ignore-unreachable", action="store_true",
                         help="Omit vulnerable dependencies that no first-party "
                              "code imports")

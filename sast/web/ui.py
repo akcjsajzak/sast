@@ -284,7 +284,7 @@ __BANNER__
     if (!scans.length) { hist.innerHTML = '<div class="empty">No scans yet.</div>'; return; }
     hist.innerHTML = scans.map(function(s){
       var label = s.source_label || s.root || "(unknown)";
-      var meta = s.status === "running" ? "scanning…"
+      var meta = s.status === "running" ? (s.progress || "scanning…")
         : s.status === "failed" ? "failed"
         : s.status === "interrupted" ? "interrupted"
         : (s.findings + " findings · " + s.dependencies + " deps · " + s.duration + "s");
@@ -319,7 +319,8 @@ __BANNER__
     title.textContent = rec.source_label || rec.root;
     $("v-del").style.display = "";
     if (rec.status === "running") {
-      body.innerHTML = '<div class="empty"><span class="spin"></span> Scanning…</div>';
+      body.innerHTML = '<div class="empty"><span class="spin"></span> '
+        + esc(rec.progress || "Scanning…") + '</div>';
     } else if (rec.status === "done") {
       $("v-open").style.display = ""; $("v-open").href = "report/" + rec.id;
       $("v-json").style.display = ""; $("v-json").href = "report/" + rec.id + ".json";
@@ -346,7 +347,7 @@ __BANNER__
       var scans = data.scans || [];
       records = {}; scans.forEach(function(s){ records[s.id] = s; });
       var signature = JSON.stringify(scans.map(function(s){
-        return [s.id, s.status, s.findings];
+        return [s.id, s.status, s.findings, s.progress];
       }));
       if (force || signature !== lastSignature) {
         lastSignature = signature;
