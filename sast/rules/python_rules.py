@@ -245,14 +245,21 @@ def _sinks() -> list[SinkRule]:
          "is also an open redirect.",
          "Strip CR and LF from the value, and allow-list redirect targets.",
          ["header", "redirect", "xss"], arg_index=1, confidence="medium")
+    # `format` is too common a method name to claim confidently: a logging
+    # Formatter, a date formatter and plenty of domain classes all define one,
+    # and the receiver being tainted says nothing about whether it is a
+    # string. The attribute-walk through a tainted format string is a real bug
+    # class, so the rule stays, but at a severity that keeps it out of the way
+    # of findings the engine can actually stand behind.
     sink("py-ssti-format", "format",
-         "Server-side template injection via str.format()", "medium",
+         "Possible template injection via str.format()", "low",
          "CWE-1336", A03, "ssti",
-         "A format string under attacker control can walk object attributes "
-         "(`{0.__class__}`) and reach module globals.",
+         "If this receiver is a string, an attacker-controlled format string "
+         "can walk object attributes (`{0.__class__}`) and reach module "
+         "globals. Check whether the value really is a format string.",
          "Never let untrusted input be the format string; use it as an "
          "argument instead.",
-         ["ssti", "code"], confidence="medium", receiver_tainted=True)
+         ["ssti", "code"], confidence="low", receiver_tainted=True)
     return k
 
 

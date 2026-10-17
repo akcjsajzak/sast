@@ -1116,8 +1116,12 @@ class JavaTaintEngine:
     def emit_finding(self, sink, taint, node, sf):
         loc = make_loc(sf, node)
         source = taint.origins[0] if taint.origins else None
-        key = (sink.rule_id, sf.path, loc.line, loc.column,
-               source.file if source else "", source.line if source else 0)
+        # One finding per rule and location. The source used to be part of
+        # this key, so a sink reached from several sources was reported once
+        # per source — the same line appearing eight times in OpenDoor's
+        # report. A reviewer fixes the sink once, and the trace still shows a
+        # representative path, so the extra copies were pure noise.
+        key = (sink.rule_id, sf.path, loc.line, loc.column)
         if key in self._seen:
             return
         self._seen.add(key)

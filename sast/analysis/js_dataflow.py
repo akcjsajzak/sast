@@ -625,8 +625,12 @@ class JsTaintEngine:
 
     def report(self, sink, taint: Taint, node: Node, sf: SourceFile) -> None:
         loc = _loc(sf, node)
-        key = (sink.rule_id, loc.file, loc.line, loc.column,
-               tuple(sorted((o.file, o.line, o.column) for o in taint.origins)))
+        # One finding per rule and location. The source used to be part of
+        # this key, so a sink reached from several sources was reported once
+        # per source — the same line appearing eight times in OpenDoor's
+        # report. A reviewer fixes the sink once, and the trace still shows a
+        # representative path, so the extra copies were pure noise.
+        key = (sink.rule_id, loc.file, loc.line, loc.column)
         if key in self._seen:
             return
         self._seen.add(key)
