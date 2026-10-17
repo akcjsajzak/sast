@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sast"
+version = "0.1.0"
+description = "Offline framework-aware static application security testing for PHP and Java"
+requires-python = ">=3.10"
+dependencies = [
+    "tree_sitter>=0.23,<0.26",
+    "tree_sitter_php>=0.23",
+    "tree_sitter_java>=0.23",
+]
+
+[project.scripts]
+sast = "sast.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sast*"]
+
+[tool.setuptools.package-data]
+"sast" = ["data/advisories/*.json"]

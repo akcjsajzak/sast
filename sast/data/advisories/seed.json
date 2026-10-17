@@ -1,0 +1,112 @@
+[
+  {
+    "package": "phpmailer/phpmailer",
+    "ranges": ["<5.2.18"],
+    "cve": "CVE-2016-10033",
+    "severity": "critical",
+    "title": "PHPMailer mailSend() remote code execution (CVE-2016-10033)",
+    "description": "The mailSend function in PHPMailer before 5.2.18 allows remote code execution via a crafted From address that is passed to a shell command (sendmail -f).",
+    "fixed_in": "5.2.18",
+    "cwe": "CWE-94",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2016-10033"]
+  },
+  {
+    "package": "phpmailer/phpmailer",
+    "ranges": ["<5.2.20"],
+    "cve": "CVE-2016-10045",
+    "severity": "critical",
+    "title": "PHPMailer sender injection / code execution (CVE-2016-10045)",
+    "description": "PHPMailer before 5.2.20 does not properly validate sender addresses, allowing code execution via crafted input in sendmail parameters.",
+    "fixed_in": "5.2.20",
+    "cwe": "CWE-94",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2016-10045"]
+  },
+  {
+    "package": "phpunit/phpunit",
+    "ranges": [">=4.0.0,<4.8.28"],
+    "cve": "CVE-2017-9841",
+    "severity": "critical",
+    "title": "PHPUnit eval() remote code execution (CVE-2017-9841)",
+    "description": "PHPUnit before 4.8.28 ships Util/PHP/eval-stdin.php which evaluates php://input as PHP code, allowing remote code execution if the file is web-accessible.",
+    "fixed_in": "4.8.28",
+    "cwe": "CWE-94",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2017-9841"]
+  },
+  {
+    "package": "phpunit/phpunit",
+    "ranges": [">=5.0.0,<5.6.3"],
+    "cve": "CVE-2017-9841",
+    "severity": "critical",
+    "title": "PHPUnit eval() remote code execution (CVE-2017-9841)",
+    "description": "PHPUnit 5.x before 5.6.3 ships Util/PHP/eval-stdin.php which evaluates php://input as PHP code.",
+    "fixed_in": "5.6.3",
+    "cwe": "CWE-94",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2017-9841"]
+  },
+  {
+    "package": "dompdf/dompdf",
+    "ranges": ["<2.0.1"],
+    "cve": "CVE-2022-41343",
+    "severity": "critical",
+    "title": "Dompdf arbitrary file write / RCE via font cache (CVE-2022-41343)",
+    "description": "dompdf before 2.0.1 allows remote code execution via a crafted font cache path and PHP file extension (.php) in the font cache.",
+    "fixed_in": "2.0.1",
+    "cwe": "CWE-94",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2022-41343"]
+  },
+  {
+    "package": "guzzlehttp/guzzle",
+    "ranges": [">=7.0.0,<7.4.5"],
+    "cve": "CVE-2022-31090",
+    "severity": "high",
+    "title": "Guzzle information disclosure via CURLOPT_HTTPHEADER (CVE-2022-31090)",
+    "description": "Guzzle 7.x before 7.4.5 mishandles the Cookie and Authorization headers via CURLOPT_HTTPHEADER, potentially leaking credentials across redirects.",
+    "fixed_in": "7.4.5",
+    "cwe": "CWE-200",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2022-31090"]
+  },
+  {
+    "package": "guzzlehttp/psr7",
+    "ranges": [">=2.0.0,<2.4.5"],
+    "cve": "CVE-2023-29197",
+    "severity": "high",
+    "title": "guzzlehttp/psr7 improper header validation (CVE-2023-29197)",
+    "description": "guzzlehttp/psr7 before 2.4.5 does not strip CR/LF from header names, allowing HTTP response splitting / header injection.",
+    "fixed_in": "2.4.5",
+    "cwe": "CWE-436",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2023-29197"]
+  },
+  {
+    "package": "laravel/framework",
+    "ranges": [">=5.5.0,<5.6.30"],
+    "cve": "CVE-2018-15133",
+    "severity": "critical",
+    "title": "Laravel remote code execution via unserialize() (CVE-2018-15133)",
+    "description": "Laravel before 5.6.30 deserializes the X-XSRF-TOKEN cookie via unserialize(), enabling remote code execution through POP chains.",
+    "fixed_in": "5.6.30",
+    "cwe": "CWE-94",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2018-15133"]
+  },
+  {
+    "package": "facade/ignition",
+    "ranges": [">=2.0.0,<2.5.2"],
+    "cve": "CVE-2021-3129",
+    "severity": "critical",
+    "title": "Ignition (Laravel) remote code execution (CVE-2021-3129)",
+    "description": "Ignition before 2.5.2 allows unauthenticated remote code execution via a crafted request to the debug error page.",
+    "fixed_in": "2.5.2",
+    "cwe": "CWE-94",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2021-3129"]
+  },
+  {
+    "package": "symfony/symfony",
+    "ranges": [">=3.4.0,<3.4.20"],
+    "cve": "CVE-2018-19790",
+    "severity": "critical",
+    "title": "Symfony remote code execution via unserialize() (CVE-2018-19790)",
+    "description": "Symfony before 3.4.20 is vulnerable to PHP object injection / RCE through crafted serialized data in the routing/cache subsystem.",
+    "fixed_in": "3.4.20",
+    "cwe": "CWE-502",
+    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2018-19790"]
+  }
+]

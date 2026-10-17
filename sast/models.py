@@ -1,0 +1,158 @@
+"""Core data model for the SAST engine."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class Severity(str, Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
+
+
+SEVERITY_ORDER = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+    Severity.INFO: 4,
+}
+
+# OWASP Top 10 (2021)
+OWASP_2021 = {
+    "A01": "A01:2021 — Broken Access Control",
+    "A02": "A02:2021 — Cryptographic Failures",
+    "A03": "A03:2021 — Injection",
+    "A04": "A04:2021 — Insecure Design",
+    "A05": "A05:2021 — Security Misconfiguration",
+    "A06": "A06:2021 — Vulnerable and Outdated Components",
+    "A07": "A07:2021 — Identification and Authentication Failures",
+    "A08": "A08:2021 — Software and Data Integrity Failures",
+    "A09": "A09:2021 — Security Logging and Monitoring Failures",
+    "A10": "A10:2021 — Server-Side Request Forgery (SSRF)",
+}
+
+
+@dataclass
+class Location:
+    """A position in a source file."""
+    file: str
+    line: int
+    column: int
+    end_line: int = 0
+    end_column: int = 0
+    code: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "file": self.file,
+            "line": self.line,
+            "column": self.column,
+            "end_line": self.end_line,
+            "end_column": self.end_column,
+            "code": self.code,
+        }
+
+
+@dataclass
+class TaintStep:
+    """One hop in a validated source-to-sink taint trace."""
+    location: Location
+    description: str
+    code: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "location": self.location.to_dict(),
+            "description": self.description,
+            "code": self.code,
+        }
+
+
+@dataclass
+class Finding:
+    """A single validated security finding."""
+    rule_id: str
+    title: str
+    severity: Severity
+    cwe: str
+    owasp: str
+    category: str
+    description: str
+    remediation: str
+    confidence: str
+    framework: str
+    language: str
+    location: Location                 # the sink location
+    source: Optional[Location] = None  # the taint source location
+    trace: list = field(default_factory=list)
+    tags: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "rule_id": self.rule_id,
+            "title": self.title,
+            "severity": self.severity.value,
+            "cwe": self.cwe,
+            "owasp": self.owasp,
+            "category": self.category,
+            "description": self.description,
+            "remediation": self.remediation,
+            "confidence": self.confidence,
+            "framework": self.framework,
+            "language": self.language,
+            "location": self.location.to_dict(),
+            "source": self.source.to_dict() if self.source else None,
+            "trace": [s.to_dict() for s in self.trace],
+            "tags": self.tags,
+        }
+
+
+@dataclass
+class DependencyIssue:
+    """A vulnerable dependency, matched against the offline advisory DB."""
+    package: str
+    version: str
+    cve: str
+    severity: Severity
+    title: str
+    description: str
+    fixed_in: str
+    cwe: str = ""
+    references: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "package": self.package,
+            "version": self.version,
+            "cve": self.cve,
+            "severity": self.severity.value,
+            "title": self.title,
+            "description": self.description,
+            "fixed_in": self.fixed_in,
+            "cwe": self.cwe,
+            "references": self.references,
+        }
+
+
+@dataclass
+class ScanResult:
+    """Aggregate result of a scan."""
+    root: str
+    language: str
+    framework: str
+    files_scanned: int = 0
+    findings: list = field(default_factory=list)
+    dependency_issues: list = field(default_factory=list)
+    duration_seconds: float = 0.0
+
+    def stats(self) -> dict:
+        counts = {s.value: 0 for s in Severity}
+        for f in self.findings:
+            if f.severity.value in counts:
+                counts[f.severity.value] += 1
+        return counts

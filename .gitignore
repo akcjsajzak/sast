@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging (PyInstaller, setuptools)
+build/
+dist/
+*.spec
+
+# Generated scan reports
+sast-report.html
+
+# Downloaded vulnerability feeds (regenerated via `make feeds`)
+sast/data/advisories/downloaded.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
