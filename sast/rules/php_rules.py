@@ -696,20 +696,6 @@ def _patterns() -> list[PatternRule]:
             confidence="medium",
         ))
     p.append(PatternRule(
-        rule_id="php-hardcoded-secret", node_type="assignment_expression",
-        match=r"\$(?:[a-z_]*(?:password|passwd|pwd|secret|api[_-]?key|apikey|token|"
-              r"private[_-]?key|access[_-]?key))[a-z_]*\s*=\s*['\"][^'\"]{6,}['\"]",
-        match_field="text", regex=True, ignore_case=True,
-        title="Hardcoded credential",
-        severity="medium", cwe="CWE-798",
-        owasp="A07:2021 — Identification and Authentication Failures",
-        category="hardcoded-secret",
-        description="A credential or secret literal is assigned inline in source, "
-                    "so it lands in version control and in every deployed copy.",
-        remediation="Load secrets from the environment or a secrets manager.",
-        confidence="medium",
-    ))
-    p.append(PatternRule(
         rule_id="php-tls-verify-disabled", node_type="function_call_expression",
         match=r"CURLOPT_SSL_VERIFY(?:PEER|HOST)\s*,\s*(?:false|0|FALSE)",
         match_field="text", regex=True,

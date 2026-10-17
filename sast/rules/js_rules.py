@@ -411,15 +411,6 @@ def _patterns() -> list[PatternRule]:
         "connection trivially interceptable.",
         "Leave verification enabled and fix the trust store instead.",
         severity="high", cwe="CWE-295", owasp=A02, category="insecure-transport")
-    pat("js-hardcoded-secret",
-        r"\b(?:password|passwd|secret|api[_-]?key|apikey|token|private[_-]?key|"
-        r"access[_-]?key|client[_-]?secret)\s*[:=]\s*['\"][^'\"]{8,}['\"]",
-        "Hardcoded credential",
-        "A credential literal is embedded in source, so it reaches version control "
-        "and every deployed copy.",
-        "Load it from the environment or a secrets manager, and rotate the value.",
-        severity="medium", cwe="CWE-798", owasp=A07, category="hardcoded-secret",
-        confidence="medium", ignore_case=True)
     pat("js-cors-wildcard",
         r"origin\s*:\s*(?:['\"]\*['\"]|true)|Access-Control-Allow-Origin['\"]\s*,\s*['\"]\*",
         "Permissive CORS policy",

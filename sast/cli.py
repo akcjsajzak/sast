@@ -25,12 +25,23 @@ def cmd_scan(args) -> int:
         print("warning: --advisory-dbs is deprecated; use repeated --advisory-db",
               file=sys.stderr)
 
+    only = set(args.only or [])
+    def enabled(kind: str, disabled: bool = False) -> bool:
+        return (kind in only) if only else not disabled
+
     options = ScanOptions(
         advisory_dbs=advisory_dbs,
         min_severity=args.min_severity,
         include_tests=args.include_tests,
         max_file_bytes=int(args.max_file_size * 1024 * 1024),
         max_files=args.max_files,
+        scan_code=enabled("code"),
+        scan_secrets=enabled("secrets", args.no_secrets),
+        scan_iac=enabled("iac", args.no_iac),
+        scan_containers=enabled("containers", args.no_containers),
+        scan_templates=enabled("templates"),
+        scan_configs=enabled("config"),
+        scan_dependencies=enabled("deps"),
     )
     engine = ScanEngine(options)
     result = engine.scan(args.path)
@@ -163,6 +174,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip source files larger than this many MB (default: 2)")
     p_scan.add_argument("--max-files", type=int, default=0, metavar="N",
                         help="Scan at most N files per language (0 = unlimited)")
+    p_scan.add_argument("--no-secrets", action="store_true",
+                        help="Skip secrets detection")
+    p_scan.add_argument("--no-iac", action="store_true",
+                        help="Skip infrastructure-as-code scanning")
+    p_scan.add_argument("--no-containers", action="store_true",
+                        help="Skip Dockerfile and base-image scanning")
+    p_scan.add_argument("--only", metavar="KIND", action="append", default=[],
+                        choices=["code", "secrets", "iac", "containers",
+                                 "templates", "config", "deps"],
+                        help="Run only these scanners (repeatable)")
     p_scan.set_defaults(func=cmd_scan)
 
     p_import = sub.add_parser("import-feed", help="Import an OSV/NVD/generic feed")

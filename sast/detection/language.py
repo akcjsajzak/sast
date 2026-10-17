@@ -11,6 +11,13 @@ LANGUAGE_EXTENSIONS = {
     # TypeScript is included under "javascript": Angular is .ts and React is
     # frequently .tsx, so excluding it would miss both frameworks entirely.
     "javascript": {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"},
+    "python": {".py", ".pyi"},
+    "go": {".go"},
+    "csharp": {".cs"},
+    "c": {".c"},
+    # .h is claimed by C++ so a header using C++ constructs still parses; a
+    # C-only project's headers parse fine under the C++ grammar too.
+    "cpp": {".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h"},
 }
 
 # Build output and vendored bundles: minified, not first-party, and a rich
@@ -137,30 +144,54 @@ def collect_source_files_detailed(
     return results, skipped
 
 
+# A manifest is strong evidence the language is present even when few source
+# files are. Mapped to the weight it contributes.
+_MANIFEST_WEIGHTS = {
+    "composer.json": ("php", 100),
+    "pom.xml": ("java", 100),
+    "build.gradle": ("java", 80),
+    "build.gradle.kts": ("java", 80),
+    "package.json": ("javascript", 100),
+    "requirements.txt": ("python", 100),
+    "pyproject.toml": ("python", 100),
+    "Pipfile": ("python", 80),
+    "setup.py": ("python", 80),
+    "go.mod": ("go", 100),
+    "CMakeLists.txt": ("cpp", 60),
+    "conanfile.txt": ("cpp", 60),
+    "vcpkg.json": ("cpp", 60),
+}
+
+# Extension -> language, built once from LANGUAGE_EXTENSIONS. Later entries
+# win on conflict, which is why .h resolves to cpp.
+_EXT_LANGUAGE: dict = {}
+for _lang, _exts in LANGUAGE_EXTENSIONS.items():
+    for _ext in _exts:
+        _EXT_LANGUAGE[_ext] = _lang
+
+
 def _language_counts(root: str) -> dict:
     """Weighted file counts per language (manifests count heavily)."""
-    counts = {"php": 0, "java": 0, "javascript": 0}
+    counts = {lang: 0 for lang in LANGUAGE_EXTENSIONS}
 
-    if os.path.isfile(os.path.join(root, "composer.json")):
-        counts["php"] += 100
-    if os.path.isfile(os.path.join(root, "pom.xml")):
-        counts["java"] += 100
-    if os.path.isfile(os.path.join(root, "build.gradle")):
-        counts["java"] += 80
-    if os.path.isfile(os.path.join(root, "package.json")):
-        counts["javascript"] += 100
+    for manifest, (lang, weight) in _MANIFEST_WEIGHTS.items():
+        if os.path.isfile(os.path.join(root, manifest)):
+            counts[lang] += weight
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         for fname in filenames:
-            ext = os.path.splitext(fname)[1].lower()
-            if ext in LANGUAGE_EXTENSIONS["php"]:
-                counts["php"] += 1
-            elif ext in LANGUAGE_EXTENSIONS["java"]:
-                counts["java"] += 1
-            elif (ext in LANGUAGE_EXTENSIONS["javascript"]
-                  and not fname.lower().endswith(_JS_SKIP_SUFFIXES)):
-                counts["javascript"] += 1
+            low = fname.lower()
+            ext = os.path.splitext(low)[1]
+            lang = _EXT_LANGUAGE.get(ext)
+            if lang is None:
+                continue
+            if lang == "javascript" and low.endswith(_JS_SKIP_SUFFIXES):
+                continue
+            # A .csproj next to .cs files is the C# signal.
+            counts[lang] += 1
+            if low.endswith(".csproj") or low.endswith(".sln"):
+                counts["csharp"] += 50
     return counts
 
 

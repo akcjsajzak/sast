@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sast"
 version = "0.1.0"
-description = "Offline framework-aware static application security testing for PHP and Java"
+description = "Offline framework-aware static application security testing, SCA, IaC, container and secrets scanning"
 requires-python = ">=3.10"
 dependencies = [
     "tree_sitter>=0.23,<0.26",
@@ -13,6 +13,11 @@ dependencies = [
     "tree_sitter_java>=0.23",
     "tree_sitter_javascript>=0.23",
     "tree_sitter_typescript>=0.23",
+    "tree_sitter_python>=0.23",
+    "tree_sitter_go>=0.23",
+    "tree_sitter_c_sharp>=0.23",
+    "tree_sitter_c>=0.23",
+    "tree_sitter_cpp>=0.23",
 ]
 
 [project.scripts]

@@ -9,12 +9,19 @@ from .advisory.analyzer import analyze_dependencies
 from .advisory.db import AdvisoryDB
 from .analysis.blade import scan_blade
 from .analysis.config_scan import collect_config_files, scan_configs
+from .analysis.containers import (
+    collect_dockerfiles, scan_base_images, scan_dockerfiles,
+)
 from .analysis.dataflow import TaintEngine
 from .analysis.templates import collect_template_files, scan_templates
 from .analysis.java_dataflow import JavaTaintEngine
 from .analysis.java_symbols import build_java_symbols
+from .analysis.generic_dataflow import GenericTaintEngine, build_symbols
+from .analysis.iac import collect_iac_files, scan_iac
 from .analysis.js_dataflow import JsTaintEngine
 from .analysis.js_symbols import build_js_symbols
+from .analysis.lang_profile import PROFILES
+from .analysis.secrets import collect_scannable_files, scan_secrets
 from .analysis.symbols import build_symbol_table
 from .detection import (
     collect_source_files_detailed,
@@ -24,6 +31,7 @@ from .detection import (
 )
 from .detection.language import DEFAULT_MAX_FILE_BYTES
 from .models import ScanResult, SEVERITY_ORDER
+from .parsing.generic import GenericParser
 from .parsing.java import JavaParser
 from .parsing.javascript import JsParser
 from .parsing.php import PhpParser
@@ -43,8 +51,15 @@ class ScanOptions:
     max_files: int = 0  # 0 = unlimited
     # Templates and configuration files are scanned alongside source; these
     # exist so a noisy repo can turn either off.
+    # Each scanner can be turned off independently, so a repo can be scanned
+    # for one concern at a time.
+    scan_code: bool = True
     scan_templates: bool = True
     scan_configs: bool = True
+    scan_iac: bool = True
+    scan_containers: bool = True
+    scan_secrets: bool = True
+    scan_dependencies: bool = True
 
 
 class ScanEngine:
@@ -56,17 +71,17 @@ class ScanEngine:
         start = time.time()
         root = os.path.abspath(root)
 
+        # A repository with no application source at all is still worth
+        # scanning: it may be nothing but Terraform, Kubernetes manifests or a
+        # Dockerfile, which is exactly where cloud exposure lives.
         languages = detect_languages(root)
-        if not languages:
-            return ScanResult(root=root, language="unknown", framework="raw")
-
         findings: list = []
         frameworks: dict = {}
         module_dirs: dict = {}
         files_scanned = 0
         skipped: dict = {}
 
-        for language in languages:
+        for language in (languages if self.options.scan_code else []):
             source_files, lang_skipped = collect_source_files_detailed(
                 root, language,
                 include_tests=self.options.include_tests,
@@ -90,10 +105,11 @@ class ScanEngine:
             if unreadable:
                 skipped["unreadable"] = skipped.get("unreadable", 0) + unreadable
 
-        # Templates and configuration are scanned independently of the
-        # detected source languages: they are where rendering and deployment
-        # posture actually live, and neither is PHP or Java source.
-        primary = languages[0]
+        # Templates, configuration, IaC, containers and secrets are scanned
+        # independently of the detected source languages: they are where
+        # rendering and deployment posture live, and none of them is
+        # application source.
+        primary = languages[0] if languages else ""
         if self.options.scan_templates:
             tpl_files = collect_template_files(root)
             if not self.options.include_tests:
@@ -108,6 +124,25 @@ class ScanEngine:
             ))
             files_scanned += len(cfg_files)
 
+        # Infrastructure as code: where a bucket becomes public or a container
+        # becomes privileged. Not reachable from any application taint path.
+        if self.options.scan_iac:
+            iac_files = collect_iac_files(root)
+            findings.extend(scan_iac(iac_files))
+            files_scanned += len(iac_files)
+
+        dockerfiles: list = []
+        if self.options.scan_containers:
+            dockerfiles = collect_dockerfiles(root)
+            findings.extend(scan_dockerfiles(dockerfiles))
+            files_scanned += len(dockerfiles)
+
+        # Secrets are searched across every text file, not only source: a
+        # credential is as dangerous in a README or a CI config.
+        if self.options.scan_secrets:
+            secret_files = collect_scannable_files(root)
+            findings.extend(scan_secrets(secret_files, root))
+
         # Dependency analysis, per language and per module.
         db = AdvisoryDB()
         for seed in self._seed_paths():
@@ -117,10 +152,14 @@ class ScanEngine:
                 db.load_file(extra)
 
         dep_issues: list = []
-        for language in languages:
-            dep_issues.extend(analyze_dependencies(
-                root, language, db, module_dirs.get(language),
-            ))
+        if self.options.scan_dependencies:
+            for language in languages:
+                dep_issues.extend(analyze_dependencies(
+                    root, language, db, module_dirs.get(language) or [root],
+                ))
+            # A base image is a dependency like any other.
+            if dockerfiles:
+                dep_issues.extend(scan_base_images(dockerfiles, db))
 
         # Filter + sort.
         min_order = SEVERITY_ORDER.get(_sev_enum(self.options.min_severity or "info"), 99)
@@ -131,8 +170,8 @@ class ScanEngine:
 
         return ScanResult(
             root=root,
-            language=languages[0],
-            framework=frameworks.get(languages[0], "raw"),
+            language=primary or "none",
+            framework=frameworks.get(primary, "raw"),
             languages=languages,
             frameworks=frameworks,
             files_scanned=files_scanned,
@@ -168,6 +207,18 @@ class ScanEngine:
             parsed, unreadable = self._parse_all(JsParser(), source_files)
             symbols = build_js_symbols(parsed)
             engine = JsTaintEngine(symbols, rules, framework, language)
+            return engine.analyze(parsed), len(parsed), unreadable
+
+        # Python, Go, C#, C and C++ share one engine, configured by profile.
+        profile = PROFILES.get(language)
+        if profile is not None:
+            parser = GenericParser(language)
+            if not parser.available:
+                return [], 0, 0
+            parsed, unreadable = self._parse_all(parser, source_files)
+            symbols = build_symbols(parsed, profile)
+            engine = GenericTaintEngine(profile, rules, framework, language,
+                                        symbols)
             return engine.analyze(parsed), len(parsed), unreadable
 
         return [], 0, 0

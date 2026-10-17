@@ -5,6 +5,12 @@ from ..models import DependencyIssue, Severity
 from .composer import parse_composer_json, parse_composer_lock
 from .db import AdvisoryDB
 from .maven import parse_java_dependencies
+from .misc_ecosystems import (
+    parse_dotnet_dependencies,
+    parse_go_dependencies,
+    parse_native_dependencies,
+    parse_python_dependencies,
+)
 from .npm import parse_npm_dependencies
 
 
@@ -19,6 +25,14 @@ def _packages_for(module: str, language: str) -> list[tuple[str, str]]:
         return parse_java_dependencies(module)
     if language == "javascript":
         return parse_npm_dependencies(module)
+    if language == "python":
+        return parse_python_dependencies(module)
+    if language == "go":
+        return parse_go_dependencies(module)
+    if language == "csharp":
+        return parse_dotnet_dependencies(module)
+    if language in ("c", "cpp"):
+        return parse_native_dependencies(module)
     return []
 
 

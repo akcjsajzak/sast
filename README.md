@@ -1,14 +1,29 @@
-# SAST — offline framework-aware static analysis for PHP, Java & JavaScript
+# SAST — offline application security scanning
 
-A fully offline, dependency-free-at-runtime static application security testing
-(SAST) engine targeting **PHP** (Laravel, Symfony, raw), **Java** (Spring,
-Spring Boot, raw) and **JavaScript/TypeScript** (Node, Express, React, Angular,
-raw). It auto-detects the framework, performs interprocedural
-**source-to-sink taint analysis**, and reports validated findings as HTML,
-JSON, or **SARIF**.
+A fully offline, dependency-free-at-runtime security scanner covering **code,
+dependencies, infrastructure, containers and secrets** in a single pass.
 
-Every engine runs in the same pass, so a PHP or Java backend with a React or
-Angular frontend is scanned end to end in one command.
+**Eight languages** with interprocedural source-to-sink taint analysis:
+
+| Language | Frameworks |
+|---|---|
+| PHP | Laravel, Symfony, raw |
+| Java | Spring, Spring Boot, Jakarta EE, raw |
+| JavaScript / TypeScript | Node, Express, React, Angular, Next.js, NestJS, Vue |
+| Python | Django, Flask, FastAPI, raw |
+| Go | net/http, Gin, Echo, Fiber, Gorilla |
+| C# | ASP.NET Core, ASP.NET, raw |
+| C / C++ | memory safety, raw |
+
+Plus four scanners that need no source language at all: **IaC**
+(Terraform, Kubernetes, CloudFormation, Helm, docker-compose), **containers**
+(Dockerfile + base-image CVEs), **secrets** (provider patterns + entropy), and
+**dependencies** across Composer, Maven/Gradle, npm, PyPI, Go modules, NuGet
+and Conan/vcpkg.
+
+Every engine runs in the same pass, so a Java backend with a React frontend,
+Terraform infrastructure and a Dockerfile is scanned end to end in one
+command. Reports are HTML, JSON or **SARIF**.
 
 Think of it as an offline, framework-aware Snyk / SonarQube.
 
@@ -163,12 +178,14 @@ used to translate NVD CPEs into ecosystem package names.
 
 ```
 sast/
-  analysis/    AST utils, symbol tables, taint engines (PHP + Java)
+  analysis/    taint engines (PHP, Java, JS hand-written; one generic
+               engine driven by language profiles for the rest), plus the
+               secrets, IaC and container scanners
   advisory/    offline DB, semver, composer/maven parsing, feed importers
   detection/   language + framework auto-detection
-  parsing/     tree-sitter PHP/Java/JavaScript parsers
+  parsing/     tree-sitter parsers for all eight languages
   reporting/   HTML, JSON, SARIF renderers
-  rules/       declarative rule model + PHP/Java/JavaScript rule sets
+  rules/       declarative rule model + per-language rule sets
   data/        bundled advisory seed databases
   engine.py    orchestration
   cli.py       command-line interface
@@ -195,6 +212,41 @@ is what keeps Node APIs matching regardless of which framework was detected.
 
 ```bash
 python -m unittest tests.test_sast -v
+```
+
+## Beyond application code
+
+### Secrets
+Scanned across every text file, not just source — a credential is as dangerous
+in a README or a CI config. Two strategies: ~22 **provider patterns** (AWS,
+GitHub, GitLab, Slack, Stripe, Google, OpenAI, Anthropic, npm, PyPI, SendGrid,
+Twilio, Azure, private keys, JWTs, DB connection URIs) matched by their
+issuer-defined shape, and **Shannon entropy** over credential-shaped
+assignments for keys with no distinctive format. Placeholders (`changeme`,
+`your-api-key`, `${VAR}`) and low-variety values are suppressed, and findings
+in example/fixture paths are downgraded rather than dropped.
+
+**Secret values are redacted everywhere** — they never reach a report in any
+format.
+
+### Infrastructure as code
+Terraform/HCL, Kubernetes, CloudFormation, Helm values and docker-compose:
+world-open security groups, public S3 buckets and ACLs, publicly accessible
+databases, unencrypted storage, wildcard IAM actions and principals, IMDSv1,
+privileged containers, host namespaces, root containers, mounted Docker
+sockets, and disabled audit logging.
+
+### Containers
+Dockerfile analysis (root user, unpinned base image, secrets baked into
+layers, `curl | sh`, `ADD` from a URL, disabled package verification, exposed
+SSH) plus **base-image CVE matching** — the `FROM` line is treated as a
+dependency and matched against distro advisories. A CycloneDX or SPDX SBOM is
+ingested when the build produced one; images are never pulled or unpacked,
+since that would need a daemon and a network.
+
+```bash
+sast scan . --only iac --only secrets   # run selected scanners
+sast scan . --no-containers             # or disable one
 ```
 
 ## Templates and configuration
@@ -236,6 +288,14 @@ What the engine does **not** find, and why:
   output as `dependency-tree.txt` and those are scanned too. `composer.lock`
   already lists the full tree, so PHP is unaffected.
 - **Variable variables** (`$$name`) in PHP.
+- **Container images are not unpacked** — only the Dockerfile and, where
+  present, an SBOM are read. Scanning the contents of a built image needs a
+  daemon and a network, which would break the offline guarantee.
+- **C/C++ analysis is function-local for memory safety** — unsafe APIs and
+  tainted-length copies are found, but there is no pointer or alias analysis,
+  so heap-shape bugs (use-after-free, double-free) are out of reach.
+- **IaC rules are textual**, not a full HCL/YAML evaluation: a value computed
+  by a module or a variable indirection is not resolved.
 - **JavaScript module resolution** — identifiers are indexed globally by name
   rather than per module, so two different helpers sharing a name are conflated
   and a renamed import (`import { x as y }`) is not followed.

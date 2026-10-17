@@ -20,6 +20,25 @@ from sast.reporting.json_report import render_json
 from sast.reporting.sarif_report import render_sarif
 
 
+def _synth(*parts: str) -> str:
+    """Assemble a credential-shaped fixture at runtime.
+
+    These are fabricated, but they match the issuer formats closely enough to
+    trip secret scanners — GitHub push protection rejected this file when the
+    Slack fixture was written out literally. Joining fragments keeps the
+    repository free of anything that looks like a live credential while the
+    tests still exercise the real patterns.
+    """
+    return "".join(parts)
+
+
+FAKE_AWS_KEY = _synth("AKIA", "IOSFODNN7", "EXAMPLE")
+FAKE_GITHUB_TOKEN = _synth("ghp", "_", "aBcDeF1234567890aBcDeF1234567890abcd")
+FAKE_SLACK_TOKEN = _synth("xoxb", "-", "123456789012", "-", "abcdefghijklmnop")
+FAKE_STRIPE_KEY = _synth("sk", "_", "live", "_", "AbCdEf123456")
+FAKE_PEM_HEADER = _synth("-----BEGIN ", "RSA PRIVATE KEY", "-----")
+
+
 def _scan(files: dict, extra_files: dict = None) -> "ScanEngine":
     tmp = tempfile.mkdtemp()
     for rel, content in files.items():
@@ -682,7 +701,7 @@ class TestPhpPatternRules(unittest.TestCase):
         cases = {
             "$h = sha1($p);": "php-crypto-sha1",
             "$t = mt_rand();": "php-weak-random-mt_rand",
-            '$apiKey = "sk_live_AbCdEf123456";': "php-hardcoded-secret",
+            f'$apiKey = "{FAKE_STRIPE_KEY}";': "secret-stripe-key",
             "curl_setopt($c, CURLOPT_SSL_VERIFYPEER, false);": "php-tls-verify-disabled",
             'openssl_encrypt($d, "aes-128-ecb", $k);': "php-crypto-ecb",
             "libxml_disable_entity_loader(false);": "php-xxe-entity-loader",
@@ -939,7 +958,7 @@ class TestJsPatternRules(unittest.TestCase):
         cases = {
             "const t = Math.random();": "js-weak-random",
             "crypto.createHash('md5');": "js-crypto-weak-hash",
-            "const apiKey = 'sk_live_AbCdEf123456';": "js-hardcoded-secret",
+            f"const apiKey = '{FAKE_STRIPE_KEY}';": "secret-stripe-key",
             "const o = { rejectUnauthorized: false };": "js-tls-verify-disabled",
             "jwt.verify(t, k, { algorithms: ['none'] });": "js-jwt-none-algorithm",
         }
@@ -1066,6 +1085,344 @@ class TestPolyglotWithJavaScript(unittest.TestCase):
         self.assertEqual(sorted(r.languages), ["java", "javascript", "php"])
         self.assertEqual({f.language for f in r.findings},
                          {"java", "javascript", "php"})
+
+
+class TestPythonEngine(unittest.TestCase):
+    def _rules(self, code, name="a.py"):
+        return {f.rule_id for f in _scan({name: code}).findings}
+
+    def test_request_to_dangerous_sinks(self):
+        cases = {
+            "from flask import request\ndef v():\n    eval(request.args['q'])\n":
+                "py-code-eval",
+            "import os\nfrom flask import request\n"
+            "def v():\n    os.system('ls ' + request.args['d'])\n":
+                "py-cmdi-os-system",
+            "from flask import request\n"
+            "def v(cur):\n    cur.execute('SELECT ' + request.args['id'])\n":
+                "py-sqli-execute",
+            "import pickle\nfrom flask import request\n"
+            "def v():\n    pickle.loads(request.data)\n":
+                "py-deser-pickle-loads",
+            "from flask import request\ndef v():\n    open(request.args['f'])\n":
+                "py-path-open",
+        }
+        for code, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules(code), code)
+
+    def test_int_coercion_sanitizes(self):
+        self.assertEqual(self._rules(
+            "from flask import request\n"
+            "def v(cur):\n    cur.execute('SELECT ' + str(int(request.args['id'])))\n"
+        ), set())
+
+    def test_python_pattern_rules(self):
+        self.assertIn("py-weak-random", self._rules("import random\nt = random.randint(0,9)\n"))
+        self.assertIn("py-assert-auth", self._rules("def v(u):\n    assert u.is_admin\n"))
+        self.assertIn("py-django-debug", self._rules("DEBUG = True\n", "settings.py"))
+
+    def test_framework_detection(self):
+        r = _scan({"app.py": "from flask import request, Flask\napp = Flask(__name__)\n"})
+        self.assertEqual(r.framework, "Flask")
+
+
+class TestGoEngine(unittest.TestCase):
+    def _rules(self, body):
+        return {f.rule_id for f in _scan({"go.mod": "module x\n", "a.go": body}).findings}
+
+    def test_request_to_sinks(self):
+        base = ('package main\nimport ("net/http"; "os/exec"; "os")\n'
+                'func h(w http.ResponseWriter, r *http.Request) {\n  %s\n}\n')
+        cases = {
+            'exec.Command("sh", "-c", r.FormValue("c"))': "go-cmdi-command",
+            'db.Query("SELECT * FROM t WHERE id=" + r.FormValue("id"))': "go-sqli-query",
+            'os.Open(r.FormValue("f"))': "go-path-open",
+        }
+        for stmt, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules(base % stmt), stmt)
+
+    def test_local_variable_alias(self):
+        """Go's short_var_declaration must bind taint."""
+        self.assertIn("go-cmdi-command", self._rules(
+            'package main\nimport ("net/http"; "os/exec")\n'
+            'func h(w http.ResponseWriter, r *http.Request) {\n'
+            '  d := r.FormValue("d")\n  exec.Command("sh", "-c", d)\n}\n'))
+
+    def test_atoi_sanitizes(self):
+        self.assertEqual(self._rules(
+            'package main\nimport ("net/http"; "strconv")\n'
+            'func h(w http.ResponseWriter, r *http.Request) {\n'
+            '  id, _ := strconv.Atoi(r.FormValue("id"))\n'
+            '  db.Query("SELECT " + id)\n}\n'), set())
+
+    def test_go_patterns_and_framework(self):
+        self.assertIn("go-tls-skip-verify", self._rules(
+            'package main\nvar c = tls.Config{InsecureSkipVerify: true}\n'))
+        r = _scan({"go.mod": "module x\nrequire github.com/gin-gonic/gin v1.7.0\n",
+                   "a.go": "package main\n"})
+        self.assertEqual(r.framework, "Gin")
+
+
+class TestCSharpEngine(unittest.TestCase):
+    def _rules(self, body):
+        return {f.rule_id for f in _scan({"a.cs": body}).findings}
+
+    def test_request_to_sinks(self):
+        base = 'class C { void M() { %s } }'
+        cases = {
+            'var id = Request.Query["id"]; cmd.ExecuteReader("SELECT " + id);':
+                "cs-sqli-executereader",
+            'var d = Request.Query["d"]; Process.Start("cmd.exe", d);':
+                "cs-cmdi-process-start",
+            'var f = Request.Query["f"]; File.ReadAllText(f);':
+                "cs-path-readalltext",
+        }
+        for stmt, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules(base % stmt), stmt)
+
+    def test_csharp_patterns(self):
+        self.assertIn("cs-binaryformatter",
+                      self._rules('class C { void M() { var f = new BinaryFormatter(); } }'))
+        self.assertIn("cs-weak-random",
+                      self._rules('class C { void M() { var r = new Random(); } }'))
+
+
+class TestCEngine(unittest.TestCase):
+    def _rules(self, code, name="a.c"):
+        return {f.rule_id for f in _scan({name: code}).findings}
+
+    def test_inherently_unsafe_functions(self):
+        """gets()/strcpy() are unsafe regardless of whether input is tainted."""
+        self.assertIn("c-unsafe-gets", self._rules(
+            '#include <stdio.h>\nint main(){ char b[64]; gets(b); return 0; }\n'))
+        self.assertIn("c-unsafe-strcpy", self._rules(
+            '#include <string.h>\nint main(){ char d[8]; strcpy(d,"x"); return 0; }\n'))
+
+    def test_argv_is_a_taint_source(self):
+        rules = self._rules(
+            '#include <stdlib.h>\nint main(int argc, char**argv){'
+            ' system(argv[1]); return 0; }\n')
+        self.assertIn("c-cmdi-system", rules)
+
+    def test_format_string(self):
+        self.assertIn("c-fmt-printf", self._rules(
+            '#include <stdio.h>\nint main(int c, char**argv){ printf(argv[1]); return 0; }\n'))
+
+    def test_allocation_off_by_one(self):
+        self.assertIn("c-strlen-alloc", self._rules(
+            '#include <stdlib.h>\n#include <string.h>\n'
+            'char* f(char* s){ return malloc(strlen(s)); }\n'))
+
+    def test_cpp_uses_the_same_rules(self):
+        self.assertIn("c-unsafe-strcpy", self._rules(
+            '#include <cstring>\nint main(){ char d[8]; strcpy(d,"x"); return 0; }\n',
+            name="a.cpp"))
+
+
+class TestIacScanning(unittest.TestCase):
+    def _rules(self, files):
+        return {f.rule_id for f in _scan(files).findings}
+
+    def test_terraform(self):
+        cases = {
+            'resource "aws_security_group" "x" { ingress { cidr_blocks = ["0.0.0.0/0"] } }':
+                "iac-tf-sg-world-ingress",
+            'resource "aws_s3_bucket" "b" { acl = "public-read" }':
+                "iac-tf-s3-public-acl",
+            'resource "aws_db_instance" "d" { publicly_accessible = true }':
+                "iac-tf-db-public",
+            'resource "aws_instance" "i" { metadata_options { http_tokens = "optional" } }':
+                "iac-tf-imdsv1",
+        }
+        for body, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules({"m.tf": body}), body)
+
+    def test_kubernetes(self):
+        pod = ("apiVersion: v1\nkind: Pod\nspec:\n  hostNetwork: true\n"
+               "  containers:\n  - name: x\n    securityContext:\n"
+               "      privileged: true\n")
+        rules = self._rules({"p.yaml": pod})
+        self.assertIn("iac-k8s-privileged", rules)
+        self.assertIn("iac-k8s-host-namespace", rules)
+
+    def test_docker_compose(self):
+        self.assertIn("iac-compose-docker-socket", self._rules({
+            "docker-compose.yml":
+                "services:\n  x:\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n"}))
+
+    def test_secure_config_is_silent(self):
+        self.assertEqual(self._rules({"m.tf": 'resource "aws_s3_bucket" "b" { acl = "private" }'}),
+                         set())
+
+    def test_plain_yaml_is_not_treated_as_kubernetes(self):
+        self.assertEqual(self._rules({"data.yaml": "colours:\n  - red\n  - blue\n"}), set())
+
+
+class TestContainerScanning(unittest.TestCase):
+    def _rules(self, dockerfile):
+        return {f.rule_id for f in _scan({"Dockerfile": dockerfile}).findings}
+
+    def test_dockerfile_rules(self):
+        self.assertIn("container-runs-as-root",
+                      self._rules("FROM alpine:3.14\nRUN echo hi\n"))
+        self.assertIn("container-curl-pipe-shell",
+                      self._rules("FROM alpine:3.14\nRUN curl -sL https://x.sh | sh\nUSER app\n"))
+        self.assertIn("container-latest-tag",
+                      self._rules("FROM node:latest\nUSER app\n"))
+
+    def test_non_root_user_is_not_flagged(self):
+        self.assertNotIn("container-runs-as-root",
+                         self._rules("FROM alpine:3.14\nUSER app\n"))
+
+    def test_secret_in_env_is_redacted(self):
+        r = _scan({"Dockerfile": "FROM alpine:3.14\n"
+                                 "ENV API_KEY=A1b2C3d4E5f6G7h8\nUSER app\n"})
+        hits = [f for f in r.findings if f.rule_id == "container-secret-in-env"]
+        self.assertTrue(hits)
+        self.assertNotIn("A1b2C3d4E5f6G7h8", hits[0].location.code)
+
+    def test_base_image_matched_against_advisories(self):
+        """A base image is treated as a dependency."""
+        from sast.analysis.containers import base_images
+        import tempfile as _t
+        d = _t.mkdtemp()
+        path = os.path.join(d, "Dockerfile")
+        with open(path, "w") as fh:
+            fh.write("FROM alpine:3.14\nUSER app\n")
+        found = base_images([path])
+        self.assertEqual(found[0][1], "alpine")
+        self.assertEqual(found[0][2], "3.14")
+
+
+class TestSecretsScanning(unittest.TestCase):
+    def _rules(self, files):
+        return {f.rule_id for f in _scan(files).findings}
+
+    def test_provider_patterns(self):
+        cases = {
+            f"aws_key = {FAKE_AWS_KEY}": "secret-aws-access-key-id",
+            f"token: {FAKE_GITHUB_TOKEN}": "secret-github-token",
+            FAKE_PEM_HEADER: "secret-private-key",
+            f'TOKEN = "{FAKE_SLACK_TOKEN}"': "secret-slack-token",
+            'DB = "postgres://admin:s3cr3tP4ss@db.internal:5432/app"':
+                "secret-db-connection-uri",
+        }
+        for content, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules({"cfg.txt": content}), content)
+
+    def test_high_entropy_assignment(self):
+        self.assertIn("secret-high-entropy-assignment",
+                      self._rules({"a.py": 'api_key = "8Fq2Zx9vLm4KpR7tWn3Yb6Hd1Jc5Gs0A"'}))
+
+    def test_placeholders_and_low_entropy_ignored(self):
+        for content in ('password = "changeme"',
+                        'api_key = "your-api-key-here"',
+                        'password = "aaaaaaaaaaaa"',
+                        'token = "${env.TOKEN}"',
+                        'secret = "xxxxxxxxxxxx"'):
+            self.assertEqual(self._rules({"a.py": content}), set(), content)
+
+    def test_secret_value_never_reaches_the_report(self):
+        secret = FAKE_AWS_KEY
+        r = _scan({"cfg.txt": f"aws_key = {secret}"})
+        self.assertTrue(r.findings)
+        self.assertNotIn(secret, r.findings[0].location.code)
+        self.assertNotIn(secret, render_json(r))
+
+    def test_example_files_downgraded(self):
+        real = _scan({"cfg.txt": f"aws_key = {FAKE_AWS_KEY}"}).findings
+        example = _scan({"example.txt": f"aws_key = {FAKE_AWS_KEY}"}).findings
+        self.assertTrue(real and example)
+        self.assertEqual(real[0].severity, Severity.CRITICAL)
+        self.assertEqual(example[0].severity, Severity.MEDIUM)
+
+    def test_entropy_helper(self):
+        from sast.analysis.secrets import redact, shannon_entropy
+        self.assertGreater(shannon_entropy("8Fq2Zx9vLm4KpR7tWn3Yb6"), 3.6)
+        self.assertLess(shannon_entropy("aaaaaaaaaaaaaaaa"), 1.0)
+        self.assertNotIn("SECRET", redact("MYSUPERSECRETVALUE"))
+
+
+class TestCrossCuttingScanners(unittest.TestCase):
+    def test_repo_with_no_source_language_is_still_scanned(self):
+        """A Terraform- or Dockerfile-only repo must not be skipped."""
+        r = _scan({"main.tf": 'resource "aws_s3_bucket" "b" { acl = "public-read" }'})
+        self.assertEqual(r.languages, [])
+        self.assertIn("iac-tf-s3-public-acl", {f.rule_id for f in r.findings})
+
+    def test_scanners_can_be_disabled(self):
+        files = {"a.py": "x = 1\n",
+                 "main.tf": 'resource "aws_s3_bucket" "b" { acl = "public-read" }',
+                 "cfg.txt": f"aws_key = {FAKE_AWS_KEY}"}
+        tmp = tempfile.mkdtemp()
+        for rel, content in files.items():
+            with open(os.path.join(tmp, rel), "w") as fh:
+                fh.write(content)
+        full = ScanEngine(ScanOptions()).scan(tmp)
+        self.assertTrue({f.language for f in full.findings} >= {"iac", "secrets"})
+
+        no_iac = ScanEngine(ScanOptions(scan_iac=False)).scan(tmp)
+        self.assertNotIn("iac", {f.language for f in no_iac.findings})
+
+        only_secrets = ScanEngine(ScanOptions(
+            scan_code=False, scan_iac=False, scan_containers=False,
+            scan_templates=False, scan_configs=False)).scan(tmp)
+        self.assertEqual({f.language for f in only_secrets.findings}, {"secrets"})
+
+    def test_eight_languages_in_one_scan(self):
+        r = _scan({
+            "legacy/index.php": '<?php system($_GET["c"]);',
+            "api/src/main/java/A.java":
+                "import org.springframework.web.bind.annotation.*;\n"
+                "@RestController public class A {\n"
+                " @GetMapping(\"/r\") public void r(@RequestParam String q) throws Exception {\n"
+                "  Runtime.getRuntime().exec(q); } }",
+            "web/app.js": "el.innerHTML = location.hash;",
+            "svc/app.py": "import os\nfrom flask import request\n"
+                          "def h():\n    os.system(request.args['d'])\n",
+            "api-go/main.go": 'package main\nimport ("net/http";"os/exec")\n'
+                              'func h(w http.ResponseWriter, r *http.Request) {'
+                              ' exec.Command("sh","-c",r.FormValue("c")) }\n',
+            "dotnet/App.cs": 'class C { void M() { var f = Request.Query["f"];'
+                             ' File.ReadAllText(f); } }',
+            "native/main.c": '#include <stdio.h>\nint main(){ char b[8]; gets(b); return 0; }\n',
+        })
+        langs = {f.language for f in r.findings}
+        for expected in ("php", "java", "javascript", "python", "go", "csharp", "c"):
+            self.assertIn(expected, langs, f"{expected} engine produced no finding")
+
+
+class TestNewEcosystemDependencies(unittest.TestCase):
+    def test_python_requirements(self):
+        r = _scan({"a.py": "x = 1\n", "requirements.txt": "flask==2.0.1\njinja2==2.10\n"})
+        self.assertIsInstance(r.dependency_issues, list)
+
+    def test_go_sum_parsed(self):
+        from sast.advisory.misc_ecosystems import parse_go_dependencies
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "go.sum"), "w") as fh:
+            fh.write("github.com/gin-gonic/gin v1.7.0 h1:abc=\n"
+                     "golang.org/x/text v0.3.3/go.mod h1:def=\n")
+        deps = dict(parse_go_dependencies(tmp))
+        self.assertEqual(deps.get("github.com/gin-gonic/gin"), "1.7.0")
+
+    def test_csproj_parsed(self):
+        from sast.advisory.misc_ecosystems import parse_dotnet_dependencies
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "App.csproj"), "w") as fh:
+            fh.write('<Project><ItemGroup>'
+                     '<PackageReference Include="Newtonsoft.Json" Version="12.0.1" />'
+                     '</ItemGroup></Project>')
+        self.assertEqual(dict(parse_dotnet_dependencies(tmp)).get("Newtonsoft.Json"),
+                         "12.0.1")
+
+    def test_conan_parsed(self):
+        from sast.advisory.misc_ecosystems import parse_native_dependencies
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "conanfile.txt"), "w") as fh:
+            fh.write("[requires]\nopenssl/1.1.1k\nzlib/1.2.11\n")
+        deps = dict(parse_native_dependencies(tmp))
+        self.assertEqual(deps.get("openssl"), "1.1.1k")
 
 
 if __name__ == "__main__":

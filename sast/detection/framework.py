@@ -259,6 +259,60 @@ def _detect_js_framework(root: str, source_files: list[str]) -> tuple:
     return found or "raw", None, manifests, notes, module_dirs
 
 
+# Source markers for languages whose manifests are less declarative.
+_PY_FRAMEWORKS = [
+    (re.compile(r"\bfrom\s+django\b|\bimport\s+django\b|DJANGO_SETTINGS_MODULE"), "Django"),
+    (re.compile(r"\bfrom\s+fastapi\b|\bimport\s+fastapi\b|FastAPI\s*\("), "FastAPI"),
+    (re.compile(r"\bfrom\s+flask\b|\bimport\s+flask\b|Flask\s*\(__name__"), "Flask"),
+    (re.compile(r"\bimport\s+tornado\b"), "Tornado"),
+    (re.compile(r"\bfrom\s+pyramid\b"), "Pyramid"),
+]
+_GO_FRAMEWORKS = [
+    (re.compile(r"github\.com/gin-gonic/gin"), "Gin"),
+    (re.compile(r"github\.com/labstack/echo"), "Echo"),
+    (re.compile(r"github\.com/gofiber/fiber"), "Fiber"),
+    (re.compile(r"github\.com/gorilla/mux"), "Gorilla"),
+    (re.compile(r"\bnet/http\b"), "net/http"),
+]
+_CS_FRAMEWORKS = [
+    (re.compile(r"Microsoft\.AspNetCore|using\s+Microsoft\.AspNetCore"), "ASP.NET Core"),
+    (re.compile(r"System\.Web\.Mvc|using\s+System\.Web"), "ASP.NET"),
+]
+
+
+def _detect_by_markers(root: str, source_files: list[str], markers: list,
+                       manifests: tuple, default: str = "raw") -> tuple:
+    """Detect a framework from manifest text first, then source markers."""
+    manifest_files: list[str] = []
+    module_dirs = find_manifest_dirs(root, manifests) if manifests else [root]
+    blob = ""
+    for mod in module_dirs:
+        for name in manifests:
+            path = os.path.join(mod, name)
+            if not os.path.isfile(path):
+                continue
+            manifest_files.append(path)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    blob += fh.read()
+            except OSError:
+                continue
+    for regex, framework in markers:
+        if regex.search(blob):
+            return framework, None, manifest_files, [], module_dirs
+
+    for sf in source_files[:200]:
+        try:
+            with open(sf, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(20000)
+        except OSError:
+            continue
+        for regex, framework in markers:
+            if regex.search(text):
+                return framework, None, manifest_files, [], module_dirs
+    return default, None, manifest_files, [], module_dirs or [root]
+
+
 def detect_framework(root: str, language: str, source_files: list[str]) -> ProjectProfile:
     """Auto-detect the framework (if any) for a project."""
     if language == "php":
@@ -267,6 +321,20 @@ def detect_framework(root: str, language: str, source_files: list[str]) -> Proje
         framework, version, manifests, notes, modules = _detect_java_framework(root, source_files)
     elif language == "javascript":
         framework, version, manifests, notes, modules = _detect_js_framework(root, source_files)
+    elif language == "python":
+        framework, version, manifests, notes, modules = _detect_by_markers(
+            root, source_files, _PY_FRAMEWORKS,
+            ("requirements.txt", "pyproject.toml", "Pipfile", "setup.py"))
+    elif language == "go":
+        framework, version, manifests, notes, modules = _detect_by_markers(
+            root, source_files, _GO_FRAMEWORKS, ("go.mod",))
+    elif language == "csharp":
+        framework, version, manifests, notes, modules = _detect_by_markers(
+            root, source_files, _CS_FRAMEWORKS, ("packages.config",))
+    elif language in ("c", "cpp"):
+        framework, version, manifests, notes, modules = _detect_by_markers(
+            root, source_files, [],
+            ("CMakeLists.txt", "conanfile.txt", "vcpkg.json", "Makefile"))
     else:
         framework, version, manifests, notes, modules = "raw", None, [], [], []
 
