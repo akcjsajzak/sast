@@ -50,6 +50,9 @@ class GenericTaintEngine:
         self._seen: set = set()
         self._call_memo: dict = {}
         self._file_text_cache: dict = {}
+        # Declared element counts for fixed-size arrays, so an index finding
+        # can name the bound it may exceed.
+        self._array_sizes: dict = {}
 
     # ------------------------------------------------------------------
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
@@ -57,13 +60,30 @@ class GenericTaintEngine:
             self.walk_block(sf.root, sf, {}, Ctx())
         # Function bodies again with a clean environment, so a sink inside a
         # handler is found even when the top-level walk never called it.
-        for sym in self.symbols.values():
-            body = self._body(sym["node"])
-            if body is not None:
-                self.walk_block(body, sym["source"], {}, Ctx())
+        #
+        # Every definition in every file, not the symbol table's entries: that
+        # table holds one preferred implementation per bare name, so iterating
+        # it analysed only one of any two same-named functions and skipped the
+        # other outright. `static` helpers called `init` or `main` in several
+        # C files, or `run` in several Python modules, are the normal case.
+        for sf in files:
+            for fn in self._definitions(sf.root):
+                body = self._body(fn)
+                if body is not None:
+                    self.walk_block(body, sf, {}, Ctx())
         for sf in files:
             self.run_patterns(sf)
         return self.findings
+
+    def _definitions(self, root: Node):
+        """Every function and method definition in one file."""
+        p = self.p
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type in p.function or node.type in p.method:
+                yield node
+            stack.extend(node.named_children)
 
     # ------------------------------------------------------------------
     # Statements
@@ -147,6 +167,10 @@ class GenericTaintEngine:
 
     def handle_declaration(self, stmt: Node, sf: SourceFile, env: dict, ctx: Ctx):
         p = self.p
+        # Record any fixed-size array first. `char buf[10];` has no
+        # initialiser, so it would otherwise be skipped before its bound was
+        # seen — and the bound is the whole point of an index finding.
+        self._note_array_sizes(stmt)
         # Declarators can sit a level or two below the statement — C# wraps
         # them in a variable_declaration — so search rather than assume.
         declarators = self._find_declarators(stmt)
@@ -199,6 +223,13 @@ class GenericTaintEngine:
         else:
             vt = self.taint_of(right, sf, env, ctx)
         self.check_property_sink(left, vt, stmt, sf)
+        # `buf[i] = x` indexes buf as much as `y = buf[i]` does, and a write
+        # past the end is the worse of the two. Only the right-hand side was
+        # ever evaluated as an expression, so the index on the left was never
+        # checked.
+        stripped = self.strip(left)
+        if stripped is not None and stripped.type in p.index:
+            self.check_index_sink(stripped, sf, env, ctx)
         self.assign_to(left, vt, sf, env)
         return None
 
@@ -334,6 +365,8 @@ class GenericTaintEngine:
             return merged
 
         if t in p.member or t in p.index:
+            if t in p.index:
+                self.check_index_sink(node, sf, env, ctx)
             return self.member_taint(node, sf, env, ctx)
 
         if t in p.call:
@@ -345,13 +378,20 @@ class GenericTaintEngine:
             for c in node.named_children:
                 merged = _merge_taint(merged, self.taint_of(c, sf, env, ctx))
             if op is not None and _text(op) not in p.concat_ops:
-                # A comparison or arithmetic result is not the operand's data,
-                # so it carries no taint — but the operands still had to be
-                # evaluated. Returning early here skipped them outright, which
-                # hid every sink written inside a condition
-                # (`while (fread(&buf, ...) > 0)`, `if (system(cmd) == 0)`)
-                # along with any buffer such a call fills in.
-                return None
+                # The operands still had to be evaluated: returning early here
+                # skipped them outright, which hid every sink written inside a
+                # condition (`while (fread(&buf, ...) > 0)`,
+                # `if (system(cmd) == 0)`) along with any buffer such a call
+                # fills in.
+                #
+                # The result is not the operands' *string*, so sql/cmd/xss
+                # must not pass through. It can still be an attacker-influenced
+                # *number*, which is the whole of CWE-190 and CWE-129, so a
+                # language that says which of its tags describe numbers keeps
+                # those. Without this `malloc(w * h)` was invisible while
+                # `malloc(w + h)` was found, purely because `+` doubles as
+                # string concatenation.
+                return _restrict_tags(merged, p.numeric_tags)
             return merged
 
         if t in p.ternary:
@@ -689,6 +729,61 @@ class GenericTaintEngine:
                     self.report(sink, t, node, sf)
                     return
 
+    def check_index_sink(self, node: Node, sf: SourceFile, env: dict,
+                         ctx: Ctx) -> None:
+        """Report an attacker-controlled index into a buffer (CWE-129).
+
+        `buf[n]` with an attacker-influenced `n` reads or writes outside the
+        buffer, and in C that is the bug — there is no bounds check to fail.
+        The array's declared size is reported when it is known, because
+        `char buf[10]` indexed by a value from the network is a far more
+        concrete claim than the same thing on a heap pointer.
+        """
+        rules = [r for r in self.rules.sinks if r.kind == "index"]
+        if not rules:
+            return
+        kids = [c for c in node.named_children if c.type not in self.p.comment]
+        if len(kids) < 2:
+            return
+        index_taint = self.taint_of(kids[1], sf, env, ctx)
+        if index_taint is None:
+            return
+        name = self.root_of(kids[0]) or _text(kids[0])
+        size = self._array_sizes.get(name)
+        if not size:
+            # Only fixed-size arrays. On a heap pointer the buffer was almost
+            # always allocated from the same value being indexed with, and
+            # telling `malloc(n + 3)` with `buf[n + 1]` (correct) apart from
+            # `malloc(n)` with `buf[n]` (off by one) needs to compare the two
+            # expressions numerically — a relational analysis this does not
+            # have. Reporting both produced as many false findings on cJSON
+            # and sds as real ones on the vulnerable program, so the rule
+            # speaks only where the bound is a literal the index is never
+            # checked against.
+            return
+        for rule in rules:
+            if not (set(rule.tags) & index_taint.tags):
+                continue
+            self.report(rule, index_taint, node, sf,
+                        extra=f" '{name}' is declared with {size} elements, "
+                              "and nothing here confines the index to them.")
+            return
+
+    def _note_array_sizes(self, stmt: Node, depth: int = 0) -> None:
+        """Record `char buf[10]` so an index into it can cite the bound."""
+        if depth > 4:
+            return
+        for child in stmt.named_children:
+            if child.type == "array_declarator":
+                kids = [c for c in child.named_children
+                        if c.type not in self.p.comment]
+                if len(kids) >= 2:
+                    name = self.root_of(kids[0]) or _text(kids[0])
+                    text = _text(kids[1]).strip()
+                    if name and text.isdigit():
+                        self._array_sizes[name] = int(text)
+            self._note_array_sizes(child, depth + 1)
+
     def check_property_sink(self, left, vt, node, sf):
         if vt is None:
             return
@@ -710,7 +805,8 @@ class GenericTaintEngine:
                 return
 
     # ------------------------------------------------------------------
-    def report(self, sink, taint, node: Node, sf: SourceFile) -> None:
+    def report(self, sink, taint, node: Node, sf: SourceFile,
+               extra: str = "") -> None:
         loc = make_loc(sf, node)
         # One finding per rule and location. The source used to be part of
         # this key, so a sink reached from several sources was reported once
@@ -731,7 +827,7 @@ class GenericTaintEngine:
             cwe=sink.cwe,
             owasp=sink.owasp,
             category=sink.category,
-            description=sink.description,
+            description=sink.description + extra,
             remediation=sink.remediation,
             confidence=weakest_confidence(
                 sink.confidence, taint.confidence if taint else "high"),
@@ -816,6 +912,17 @@ class GenericTaintEngine:
                              code=sf.node_line(node))],
             tags=[rule.category],
         ))
+
+
+def _restrict_tags(taint, keep: tuple):
+    """The same taint narrowed to `keep`, or None if nothing is left."""
+    if taint is None or not keep:
+        return None
+    tags = taint.tags & set(keep)
+    if not tags:
+        return None
+    return Taint(tags=tags, origins=list(taint.origins),
+                 steps=list(taint.steps), confidence=taint.confidence)
 
 
 def _hint(hint: str, root: str, path: str) -> bool:

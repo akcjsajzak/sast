@@ -141,6 +141,21 @@ def _sinks() -> list[SinkRule]:
              "directory.",
              "Canonicalise with realpath() and verify the allowed prefix.",
              ["path", "lfi"], arg_index=0, owasp=A01)
+    # An attacker-influenced index. C performs no bounds check, so the read
+    # or write simply lands outside the buffer; `match` is unused because the
+    # engine matches the subscript itself rather than a callee name.
+    k.append(SinkRule(
+        rule_id="c-oob-index", kind="index", match="*",
+        title="Attacker-controlled index into a buffer",
+        severity="high", cwe="CWE-129", owasp=A01,
+        category="out-of-bounds-access",
+        description="The index is derived from attacker-controlled input and "
+                    "is not bounds-checked here, so the access can fall "
+                    "outside the buffer. A write past the end is memory "
+                    "corruption; a read past it discloses adjacent memory.",
+        remediation="Reject the index unless it is within the buffer's length, "
+                    "and remember that a signed index can also be negative.",
+        tags=["int", "buffer"], confidence="medium"))
     sink("c-sqli-exec", "sqlite3_exec", "SQL injection via sqlite3_exec()",
          "high", "CWE-89", "sql-injection",
          "The statement is built from attacker-controlled data.",

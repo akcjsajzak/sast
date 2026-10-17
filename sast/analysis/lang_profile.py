@@ -25,6 +25,13 @@ class LangProfile:
     literal: tuple = ()          # nodes that are never tainted
     binary: tuple = ()           # concatenation-capable binary expressions
     concat_ops: tuple = ("+",)   # operators that join strings
+    # Tags that survive arithmetic. `a / b` is not a string an attacker
+    # controls, so sql/cmd/xss must not pass through it — but it *is* a number
+    # an attacker influences, which is the whole of CWE-190 and CWE-129.
+    # Dropping everything meant `malloc(w * h)` and `buf[w / h]` were
+    # invisible while `malloc(w + h)` was found, purely because `+` happens to
+    # double as string concatenation.
+    numeric_tags: tuple = ()
     transparent: tuple = ()      # wrappers that pass taint straight through
     ternary: tuple = ()
     interpolation: tuple = ()    # f-strings / template literals
@@ -203,6 +210,7 @@ C = LangProfile(
              "true", "false"),
     binary=("binary_expression",),
     concat_ops=("+",),
+    numeric_tags=("int", "buffer"),
     transparent=("parenthesized_expression", "cast_expression",
                  "pointer_expression", "unary_expression"),
     ternary=("conditional_expression",),
@@ -236,6 +244,7 @@ CPP = LangProfile(
              "true", "false", "raw_string_literal"),
     binary=("binary_expression",),
     concat_ops=("+", "<<"),
+    numeric_tags=("int", "buffer"),
     transparent=("parenthesized_expression", "cast_expression",
                  "pointer_expression", "unary_expression",
                  "static_cast_expression", "reinterpret_cast_expression"),

@@ -2296,6 +2296,69 @@ class TestMemorySafety(unittest.TestCase):
         self.assertEqual({r for r in rules if "free" in r}, set())
 
 
+class TestNumericTaintAndIndexing(unittest.TestCase):
+    """An attacker-influenced number is not an attacker-controlled string."""
+
+    def _rules(self, body):
+        return {f.rule_id for f in
+                _scan({"n.c": "#include <stdlib.h>\n#include <stdio.h>\n"
+                              + body}).findings}
+
+    HEAD = ("void f(FILE *fp) {\n"
+            "  int w, h;\n"
+            "  fread(&w, sizeof(w), 1, fp);\n"
+            "  fread(&h, sizeof(h), 1, fp);\n")
+
+    def test_arithmetic_keeps_the_numeric_tags(self):
+        """`malloc(w * h)` is CWE-190; only `+` used to survive, because it
+        doubles as string concatenation."""
+        for op in ("+", "-", "*", "/"):
+            body = self.HEAD + f"  malloc(w {op} h);\n}}\n"
+            self.assertIn("c-int-malloc", self._rules(body), op)
+
+    def test_arithmetic_drops_the_string_tags(self):
+        """A quotient is not a command, however it was derived."""
+        body = self.HEAD + '  char b[8]; sprintf(b, "%d", w / h);'
+        self.assertNotIn("c-cmdi-system", self._rules(body + "\n}\n"))
+
+    def test_tainted_index_into_a_fixed_size_array(self):
+        body = self.HEAD + ("  int i = w / h;\n  char buf[10];\n"
+                            "  buf[i] = 'c';\n  char r = buf[i];\n"
+                            "  (void)r;\n}\n")
+        self.assertIn("c-oob-index", self._rules(body))
+
+    def test_constant_index_is_silent(self):
+        body = self.HEAD + ("  char buf[10];\n  int k = 4;\n"
+                            "  char r = buf[k] + buf[3];\n  (void)r;\n}\n")
+        self.assertNotIn("c-oob-index", self._rules(body))
+
+    def test_heap_pointer_index_is_not_claimed(self):
+        """The buffer is nearly always sized from the value being indexed
+        with, and separating `malloc(n+3)` with `buf[n+1]` from `malloc(n)`
+        with `buf[n]` needs a relational analysis this does not have."""
+        body = self.HEAD + ("  int i = w / h;\n  char *p = malloc(64);\n"
+                            "  p[i] = 'c';\n}\n")
+        self.assertNotIn("c-oob-index", self._rules(body))
+
+
+class TestSameNamedFunctions(unittest.TestCase):
+    def test_every_definition_is_analysed(self):
+        """The symbol table keeps one implementation per bare name, so
+        iterating it analysed only one of two same-named functions. `static`
+        helpers called `init` or `main` in several C files are the norm."""
+        both = _scan({
+            "a.c": ("#include <stdlib.h>\n#include <stdio.h>\n"
+                    "void f(FILE *fp) { int n; fread(&n, 4, 1, fp);"
+                    " malloc(n); }\n"),
+            "b.c": ("#include <stdlib.h>\n#include <stdio.h>\n"
+                    "void f(FILE *fp) { int n; fread(&n, 4, 1, fp);"
+                    " malloc(n); }\n"),
+        })
+        files = {os.path.basename(x.location.file) for x in both.findings
+                 if x.rule_id == "c-int-malloc"}
+        self.assertEqual(files, {"a.c", "b.c"})
+
+
 class TestFindingDeduplication(unittest.TestCase):
     def test_one_finding_per_rule_and_location(self):
         """A sink reached from several sources is still one line to fix."""
