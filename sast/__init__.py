@@ -1,8 +1,9 @@
-"""SAST — a fully offline static application security testing engine.
+"""SAST — a fully offline application security scanner.
 
-Targets PHP (Laravel, Symfony, raw) and Java (Spring, Spring Boot, raw).
-Framework-aware, source-to-sink taint analysis, offline dependency advisories,
-and an HTML report.
+Framework-aware, interprocedural source-to-sink taint analysis across eight
+languages, plus dependency, infrastructure-as-code, container and secrets
+scanning, all in a single self-contained binary with an embedded advisory
+database.
 """
 
 __version__ = "0.1.0"
