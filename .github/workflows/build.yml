@@ -32,7 +32,7 @@ jobs:
         run: python -m unittest tests.test_sast
 
       - name: Download vulnerability feeds
-        run: python -m sast.fetch_feeds --ecosystems Packagist Maven npm -o sast/data/advisories/downloaded.json
+        run: python -m sast.fetch_feeds --ecosystems Packagist Maven npm PyPI Go NuGet -o sast/data/advisories/downloaded.json
 
       - name: Build executable
         shell: bash

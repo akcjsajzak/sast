@@ -47,6 +47,9 @@ Think of it as an offline, framework-aware Snyk / SonarQube.
   - Command injection, SSRF, path traversal/LFI, insecure deserialization,
     XXE, LDAP injection, open redirect, SpEL injection, mass assignment,
     CSRF/authorization misconfig, weak crypto.
+- **Dependency reachability** — every dependency finding is classified as
+  `called`, `imported` or `unused` based on whether first-party code reaches
+  it, and ranked accordingly, so the list leads with what matters.
 - **Dependency vulnerability scanning** — matches `composer.lock`,
   `pom.xml`/`build.gradle`, and `package-lock.json`/`yarn.lock`/`pnpm-lock.yaml`
   against a bundled offline advisory DB with semantic version ranges; import
@@ -147,6 +150,24 @@ Laravel, Symfony, Spring and Spring Boot per module:
     java     framework: Spring Boot
 ```
 
+### Vulnerability feed coverage
+
+`make feeds` downloads OSV data for **every language ecosystem** the scanner
+analyses — Packagist, Maven, npm, PyPI, Go and NuGet. A dependency parser
+without a matching feed silently reports zero vulnerabilities, so these are
+not optional.
+
+The OS distribution feeds that back base-image scanning are opt-in, because
+Ubuntu's export alone is ~740 MB:
+
+```bash
+make feeds FEEDS="Packagist Maven npm PyPI Go NuGet Alpine Debian"
+```
+
+**C and C++ have no OSV ecosystem** (ConanCenter returns 404). The Conan and
+vcpkg manifests are parsed, but matching them needs an NVD feed imported
+separately.
+
 ### Importing vulnerability feeds (offline)
 
 ```bash
@@ -236,6 +257,35 @@ databases, unencrypted storage, wildcard IAM actions and principals, IMDSv1,
 privileged containers, host namespaces, root containers, mounted Docker
 sockets, and disabled audit logging.
 
+### Dependency reachability
+
+A vulnerable package in a lockfile is not the same thing as a vulnerable
+application. Most dependency alerts are for packages that are installed but
+never used. Every dependency finding is classified by whether first-party code
+actually reaches it, and the list is ranked by that — a *called* medium
+outranks an *unimported* critical:
+
+| State | Meaning |
+|---|---|
+| `called` | The package is imported **and** a symbol the advisory names is invoked |
+| `imported` | The package is imported, so the vulnerable version is loaded |
+| `unused` | No first-party import found — usually deprioritisable |
+
+```bash
+sast scan . --ignore-unreachable   # drop what nothing imports
+sast scan . --no-reachability      # skip the analysis
+```
+
+Each verdict carries its evidence (`imported as 'lodash' and the advisory's
+defaultsDeep() is called in first-party code`) so it can be checked rather
+than taken on trust. Package names are mapped to import names per ecosystem —
+`pyyaml` imports as `yaml`, `org.group:artifact` as `org.group.artifact`.
+
+This is **import and call-site evidence, not an exploitability claim**: it
+establishes what can be known without resolving the dependency's own source.
+`unused` does not prove a package is unloadable — another dependency may pull
+it in — and `called` does not prove the vulnerable path is taken.
+
 ### Containers
 Dockerfile analysis (root user, unpinned base image, secrets baked into
 layers, `curl | sh`, `ADD` from a URL, disabled package verification, exposed
@@ -296,6 +346,13 @@ What the engine does **not** find, and why:
   so heap-shape bugs (use-after-free, double-free) are out of reach.
 - **IaC rules are textual**, not a full HCL/YAML evaluation: a value computed
   by a module or a variable indirection is not resolved.
+- **Reachability does not analyse dependency source.** It reads first-party
+  imports and call sites only, so a package reached solely through another
+  dependency reads as `unused`, and a dynamic import (`importlib`,
+  `require(variable)`) is not followed.
+- **No OSV feed exists for C/C++.** The Conan/vcpkg parsers extract packages,
+  but OSV publishes no ConanCenter ecosystem, so native-library CVEs need an
+  NVD feed imported with `sast import-feed`.
 - **JavaScript module resolution** — identifiers are indexed globally by name
   rather than per module, so two different helpers sharing a name are conflated
   and a renamed import (`import { x as y }`) is not followed.

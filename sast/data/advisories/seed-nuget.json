@@ -1,0 +1,20 @@
+{
+  "generated_at": "2026-10-17",
+  "advisories": [
+    {"package": "Newtonsoft.Json", "ranges": [">=0.0.0,<13.0.1"], "cve": "CVE-2024-21907",
+     "severity": "high", "title": "Newtonsoft.Json denial of service via deeply nested input",
+     "description": "Newtonsoft.Json before 13.0.1 can be forced into unbounded recursion by crafted JSON.",
+     "fixed_in": "13.0.1", "cwe": "CWE-755",
+     "references": ["https://nvd.nist.gov/vuln/detail/CVE-2024-21907"]},
+    {"package": "System.Text.Encodings.Web", "ranges": [">=0.0.0,<4.5.1"], "cve": "CVE-2021-26701",
+     "severity": "critical", "title": ".NET remote code execution in text encoding",
+     "description": "A flaw in System.Text.Encodings.Web allows remote code execution.",
+     "fixed_in": "4.5.1", "cwe": "CWE-94",
+     "references": ["https://nvd.nist.gov/vuln/detail/CVE-2021-26701"]},
+    {"package": "Microsoft.AspNetCore.Http", "ranges": [">=0.0.0,<2.1.22"], "cve": "CVE-2020-1045",
+     "severity": "medium", "title": "ASP.NET Core cookie parsing security feature bypass",
+     "description": "ASP.NET Core mishandles cookie parsing, enabling a security feature bypass.",
+     "fixed_in": "2.1.22", "cwe": "CWE-565",
+     "references": ["https://nvd.nist.gov/vuln/detail/CVE-2020-1045"]}
+  ]
+}

@@ -18,11 +18,33 @@ from .advisory.importers import osv_entry_to_advisories
 OSV_BASE = "https://osv-vulnerabilities.storage.googleapis.com"
 
 # OSV ecosystem export name -> language (informational only).
+# OSV ecosystems backing each language this tool analyses. Every one of these
+# is fetched by default: a dependency parser without a matching feed silently
+# reports zero vulnerabilities, which is worse than not supporting it.
+#
+# C and C++ have no entry because OSV publishes no ecosystem for them
+# (ConanCenter returns 404). Native-library CVEs live in NVD instead — see
+# `sast import-feed` and the README.
 ECOSYSTEMS = {
     "Packagist": "php",       # PHP / Composer
     "Maven": "java",          # Java / Maven
     "npm": "javascript",      # JavaScript / npm
+    "PyPI": "python",         # Python / pip
+    "Go": "go",               # Go modules
+    "NuGet": "csharp",        # .NET / NuGet
 }
+
+# Fetchable but not downloaded by default. The OS distribution feeds back
+# base-image scanning, and Ubuntu's export alone is ~740 MB, which would
+# dominate the size of an otherwise self-contained binary.
+OPTIONAL_ECOSYSTEMS = {
+    "Alpine": "container",
+    "Debian": "container",
+    "Ubuntu": "container",
+    "crates.io": "rust",
+}
+
+ALL_ECOSYSTEMS = {**ECOSYSTEMS, **OPTIONAL_ECOSYSTEMS}
 
 _USER_AGENT = "sast-feed-fetch/1.0"
 
@@ -69,7 +91,10 @@ def fetch(ecosystems, out_path: str) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Download OSV feeds into the internal advisory format")
     parser.add_argument("--ecosystems", nargs="*", default=list(ECOSYSTEMS),
-                        choices=list(ECOSYSTEMS), help="OSV ecosystems to fetch")
+                        choices=list(ALL_ECOSYSTEMS),
+                        help="OSV ecosystems to fetch (default: every language "
+                             "ecosystem; the OS distribution feeds are "
+                             "available but opt-in because of their size)")
     parser.add_argument("-o", "--output", default="sast/data/advisories/downloaded.json")
     args = parser.parse_args(argv)
     fetch(args.ecosystems, args.output)

@@ -42,9 +42,15 @@ def cmd_scan(args) -> int:
         scan_templates=enabled("templates"),
         scan_configs=enabled("config"),
         scan_dependencies=enabled("deps"),
+        reachability=not args.no_reachability,
     )
     engine = ScanEngine(options)
     result = engine.scan(args.path)
+
+    if args.ignore_unreachable:
+        result.dependency_issues = [
+            d for d in result.dependency_issues if d.reachability != "unused"
+        ]
 
     if args.format in ("json", "sarif"):
         print_summary(result, stream=sys.stderr)
@@ -108,6 +114,14 @@ def print_summary(result, stream=None) -> None:
         if stats.get(sev):
             p(f"    {sev:<10} {stats[sev]}")
     p(f"  Dependencies with known vulns: {len(result.dependency_issues)}")
+    reach: dict = {}
+    for d in result.dependency_issues:
+        if d.reachability:
+            reach[d.reachability] = reach.get(d.reachability, 0) + 1
+    if reach:
+        parts = [f"{reach[k]} {k}" for k in ("called", "imported", "unused")
+                 if reach.get(k)]
+        p(f"    reachability: {', '.join(parts)}")
     if result.advisory_count:
         stamp = result.advisory_db_date or "unknown date"
         p(f"  Advisory DB: {result.advisory_count} advisories, as of {stamp}")
@@ -174,6 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip source files larger than this many MB (default: 2)")
     p_scan.add_argument("--max-files", type=int, default=0, metavar="N",
                         help="Scan at most N files per language (0 = unlimited)")
+    p_scan.add_argument("--no-reachability", action="store_true",
+                        help="Skip reachability analysis for dependencies")
+    p_scan.add_argument("--ignore-unreachable", action="store_true",
+                        help="Omit vulnerable dependencies that no first-party "
+                             "code imports")
     p_scan.add_argument("--no-secrets", action="store_true",
                         help="Skip secrets detection")
     p_scan.add_argument("--no-iac", action="store_true",
@@ -195,8 +214,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_fetch = sub.add_parser("fetch-feeds", help="Download OSV feeds into the internal advisory format")
     p_fetch.add_argument("--ecosystems", nargs="*", default=None,
-                         choices=["Packagist", "Maven", "npm"],
-                         help="OSV ecosystems to fetch (default: both)")
+                         choices=["Packagist", "Maven", "npm", "PyPI", "Go", "NuGet",
+                                  "Alpine", "Debian", "Ubuntu", "crates.io"],
+                         help="OSV ecosystems to fetch (default: every language ecosystem; "
+                              "distro feeds are opt-in)")
     p_fetch.add_argument("-o", "--output", default="sast/data/advisories/downloaded.json")
     p_fetch.set_defaults(func=cmd_fetch_feeds)
 
@@ -204,7 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_fetch_feeds(args) -> int:
-    ecosystems = args.ecosystems or ["Packagist", "Maven", "npm"]
+    from .fetch_feeds import ECOSYSTEMS
+    ecosystems = args.ecosystems or list(ECOSYSTEMS)
     fetch(ecosystems, args.output)
     return 0
 

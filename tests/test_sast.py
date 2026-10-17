@@ -1425,5 +1425,115 @@ class TestNewEcosystemDependencies(unittest.TestCase):
         self.assertEqual(deps.get("openssl"), "1.1.1k")
 
 
+class TestReachability(unittest.TestCase):
+    """A vulnerable package nothing imports is not the same risk as one it calls."""
+
+    NPM_PKG = json.dumps({"dependencies": {
+        "lodash": "4.17.11", "minimist": "1.2.0", "express": "4.17.1"}})
+
+    def _by_package(self, result):
+        out = {}
+        for d in result.dependency_issues:
+            out.setdefault(d.package, []).append(d)
+        return out
+
+    def test_called_imported_and_unused(self):
+        r = _scan({
+            "package.json": self.NPM_PKG,
+            "app.js": "const _ = require('lodash');\n"
+                      "const express = require('express');\n"
+                      "function m(a, b) { return _.defaultsDeep(a, b); }\n",
+        })
+        by_pkg = self._by_package(r)
+        states = {d.reachability for d in by_pkg["lodash"]}
+        self.assertIn("called", states)      # defaultsDeep is named and called
+        self.assertEqual(by_pkg["express"][0].reachability, "imported")
+        self.assertEqual(by_pkg["minimist"][0].reachability, "unused")
+
+    def test_reachable_issues_rank_first(self):
+        """A called medium outranks an unimported critical."""
+        r = _scan({
+            "package.json": self.NPM_PKG,
+            "app.js": "const express = require('express');\n",
+        })
+        order = [d.reachability for d in r.dependency_issues]
+        self.assertEqual(order[0], "imported")
+        self.assertEqual(order[-1], "unused")
+        # minimist is critical but unimported, so it must not be first.
+        self.assertNotEqual(r.dependency_issues[0].package, "minimist")
+
+    def test_python_import_alias(self):
+        """PyPI names and import names differ: pyyaml imports as yaml."""
+        r = _scan({"requirements.txt": "pyyaml==5.3\nrequests==2.25.0\n",
+                   "app.py": "import yaml\ndef f(s): return yaml.safe_load(s)\n"})
+        by_pkg = self._by_package(r)
+        self.assertEqual(by_pkg["pyyaml"][0].reachability, "imported")
+        self.assertEqual(by_pkg["requests"][0].reachability, "unused")
+
+    def test_submodule_import_counts(self):
+        r = _scan({"requirements.txt": "jinja2==2.10\n",
+                   "app.py": "from jinja2.sandbox import SandboxedEnvironment\n"})
+        self.assertEqual(r.dependency_issues[0].reachability, "imported")
+
+    def test_evidence_is_recorded(self):
+        r = _scan({"package.json": self.NPM_PKG,
+                   "app.js": "const _ = require('lodash');\n"})
+        for d in r.dependency_issues:
+            self.assertTrue(d.reachability_note, d.package)
+
+    def test_can_be_disabled(self):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "package.json"), "w") as fh:
+            fh.write(self.NPM_PKG)
+        with open(os.path.join(tmp, "app.js"), "w") as fh:
+            fh.write("const _ = require('lodash');\n")
+        off = ScanEngine(ScanOptions(reachability=False)).scan(tmp)
+        self.assertTrue(off.dependency_issues)
+        self.assertEqual({d.reachability for d in off.dependency_issues}, {""})
+
+    def test_base_images_are_exempt(self):
+        """A base image is not imported by source; the question does not apply."""
+        from sast.analysis.reachability import ImportIndex, annotate
+        from sast.models import DependencyIssue, Severity
+        issue = DependencyIssue(package="alpine (base image)", version="3.14",
+                                cve="CVE-X", severity=Severity.HIGH, title="t",
+                                description="d", fixed_in="3.15")
+        annotate([issue], ImportIndex())
+        self.assertEqual(issue.reachability, "")
+
+    def test_reachability_in_json_report(self):
+        r = _scan({"package.json": self.NPM_PKG,
+                   "app.js": "const _ = require('lodash');\n"})
+        data = json.loads(render_json(r))
+        self.assertIn("reachability", data["dependency_issues"][0])
+
+    def test_advisory_prose_does_not_create_false_calls(self):
+        """Ordinary words in an advisory must not count as called symbols."""
+        from sast.analysis.reachability import affected_symbols
+        symbols = affected_symbols(
+            "This allows a remote attacker to cause denial of service "
+            "through the request handling function in the server module.")
+        self.assertEqual(symbols, set())
+
+    def test_symbol_extraction_forms(self):
+        from sast.analysis.reachability import affected_symbols
+        self.assertIn("defaultsDeep", affected_symbols("pollution via defaultsDeep"))
+        self.assertIn("safe_load", affected_symbols("use yaml.safe_load() instead"))
+        self.assertIn("load", affected_symbols("yaml.load is unsafe"))
+
+    def test_go_module_path_matching(self):
+        from sast.analysis.reachability import ImportIndex, assess
+        index = ImportIndex(modules={"github.com/gin-gonic/gin"}, calls=set())
+        state, _note = assess("github.com/gin-gonic/gin", "go", index)
+        self.assertEqual(state, "imported")
+
+    def test_java_group_artifact_matching(self):
+        from sast.analysis.reachability import ImportIndex, assess
+        index = ImportIndex(
+            modules={"org.apache.logging.log4j.LogManager"}, calls=set())
+        state, _note = assess("org.apache.logging.log4j:log4j-core", "java", index)
+        self.assertEqual(state, "imported")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,11 +8,14 @@
 #   make clean      # remove build artifacts
 #
 # The produced binary is fully offline: it contains the tool AND the downloaded
-# advisory database (Packagist + Maven + npm by default).
+# advisory database. The default covers every language ecosystem OSV
+# publishes a feed for; the OS distribution feeds (Alpine/Debian/Ubuntu, used
+# for base-image scanning) are opt-in because of their size:
+#   make feeds FEEDS="Packagist Maven npm PyPI Go NuGet Alpine Debian"
 
 PYTHON      ?= python3
 VENV        := .venv
-FEEDS       ?= Packagist Maven npm
+FEEDS       ?= Packagist Maven npm PyPI Go NuGet
 ADVISORY_DIR := sast/data/advisories
 DOWNLOADED  := $(ADVISORY_DIR)/downloaded.json
 

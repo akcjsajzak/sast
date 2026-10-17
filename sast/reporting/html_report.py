@@ -247,6 +247,13 @@ def _trace_timeline(f, root: str) -> str:
 # ---------------------------------------------------------------------------
 # Dependency card
 # ---------------------------------------------------------------------------
+_REACH_LABEL = {
+    "called": ("Called", "reach-called"),
+    "imported": ("Imported", "reach-imported"),
+    "unused": ("Not imported", "reach-unused"),
+}
+
+
 def _dep_card(i: int, d) -> str:
     chips = "".join(
         c for c in (
@@ -256,6 +263,13 @@ def _dep_card(i: int, d) -> str:
             _chip("Fixed in", d.fixed_in),
         ) if c
     )
+    reach = ""
+    label = _REACH_LABEL.get(getattr(d, "reachability", "") or "")
+    if label:
+        text, cls = label
+        note = getattr(d, "reachability_note", "") or ""
+        reach = (f'<div class="reach {cls}"><span class="reach-tag">{_esc(text)}</span>'
+                 f'<span class="reach-note">{_esc(note)}</span></div>')
     refs = ""
     if d.references:
         items = "".join(
@@ -277,6 +291,7 @@ def _dep_card(i: int, d) -> str:
           <div class="chips">{chips}</div>
         </header>
         <div class="fb">
+          {reach}
           <p class="desc">{_esc(d.description)}</p>
           {refs}
         </div>
@@ -440,6 +455,18 @@ h2.sec .n {{
 .rem .lbl {{ color:var(--rem-fg); }}
 .rem-b {{ color:var(--rem-fg); font-size:13px; margin-top:3px; }}
 
+.reach {{
+  display:flex; align-items:baseline; gap:9px; flex-wrap:wrap;
+  margin:2px 0 11px; font-size:12.5px;
+}}
+.reach-tag {{
+  font-size:10.5px; font-weight:750; letter-spacing:.03em; padding:2px 9px;
+  border-radius:999px; color:#fff; white-space:nowrap;
+}}
+.reach-called .reach-tag   {{ background:#dc2626; }}
+.reach-imported .reach-tag {{ background:#d97706; }}
+.reach-unused .reach-tag   {{ background:#64748b; }}
+.reach-note {{ color:var(--muted); }}
 .tags {{ margin:10px 0; }}
 .tag {{
   display:inline-block; font-size:11px; background:var(--chip-bg); color:var(--chip-v);

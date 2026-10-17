@@ -124,6 +124,11 @@ class DependencyIssue:
     fixed_in: str
     cwe: str = ""
     references: list = field(default_factory=list)
+    # Whether first-party code actually reaches this package: 'called',
+    # 'imported', 'unused', or '' when the question does not apply (a base
+    # image). This is import/call-site evidence, not an exploitability claim.
+    reachability: str = ""
+    reachability_note: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -136,6 +141,8 @@ class DependencyIssue:
             "fixed_in": self.fixed_in,
             "cwe": self.cwe,
             "references": self.references,
+            "reachability": self.reachability,
+            "reachability_note": self.reachability_note,
         }
 
 

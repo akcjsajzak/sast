@@ -21,6 +21,8 @@ from .analysis.iac import collect_iac_files, scan_iac
 from .analysis.js_dataflow import JsTaintEngine
 from .analysis.js_symbols import build_js_symbols
 from .analysis.lang_profile import PROFILES
+from .analysis.reachability import annotate as annotate_reachability
+from .analysis.reachability import build_import_index, rank as reach_rank
 from .analysis.secrets import collect_scannable_files, scan_secrets
 from .analysis.symbols import build_symbol_table
 from .detection import (
@@ -60,6 +62,9 @@ class ScanOptions:
     scan_containers: bool = True
     scan_secrets: bool = True
     scan_dependencies: bool = True
+    # Establish whether first-party code actually imports and calls each
+    # vulnerable dependency, and rank findings by that.
+    reachability: bool = True
 
 
 class ScanEngine:
@@ -80,6 +85,9 @@ class ScanEngine:
         module_dirs: dict = {}
         files_scanned = 0
         skipped: dict = {}
+        # Every first-party source file, kept for reachability analysis.
+        all_source_files: list = []
+        package_language: dict = {}
 
         for language in (languages if self.options.scan_code else []):
             source_files, lang_skipped = collect_source_files_detailed(
@@ -91,6 +99,7 @@ class ScanEngine:
             for reason, n in lang_skipped.items():
                 if n:
                     skipped[reason] = skipped.get(reason, 0) + n
+            all_source_files.extend(source_files)
 
             profile = detect_framework(root, language, source_files)
             frameworks[language] = profile.framework
@@ -154,19 +163,40 @@ class ScanEngine:
         dep_issues: list = []
         if self.options.scan_dependencies:
             for language in languages:
-                dep_issues.extend(analyze_dependencies(
+                found = analyze_dependencies(
                     root, language, db, module_dirs.get(language) or [root],
-                ))
+                )
+                for issue in found:
+                    package_language.setdefault(issue.package, language)
+                dep_issues.extend(found)
             # A base image is a dependency like any other.
             if dockerfiles:
                 dep_issues.extend(scan_base_images(dockerfiles, db))
+
+        # Reachability: a vulnerable package that first-party code never
+        # imports is rarely the same risk as one it calls into.
+        if dep_issues and self.options.reachability:
+            if not all_source_files:
+                for language in languages:
+                    all_source_files.extend(collect_source_files_detailed(
+                        root, language,
+                        include_tests=self.options.include_tests,
+                        max_file_bytes=self.options.max_file_bytes,
+                    )[0])
+            index = build_import_index(all_source_files)
+            annotate_reachability(dep_issues, index, package_language)
 
         # Filter + sort.
         min_order = SEVERITY_ORDER.get(_sev_enum(self.options.min_severity or "info"), 99)
         findings = [f for f in findings if SEVERITY_ORDER.get(f.severity, 99) <= min_order]
         findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 99),
                                      f.location.file, f.location.line))
-        dep_issues.sort(key=lambda d: (SEVERITY_ORDER.get(d.severity, 99), d.package))
+        # Reachable issues first, then by severity: a called vulnerability in a
+        # medium-severity package usually matters more than a critical one in a
+        # package nothing imports.
+        dep_issues.sort(key=lambda d: (-reach_rank(d.reachability),
+                                       SEVERITY_ORDER.get(d.severity, 99),
+                                       d.package))
 
         return ScanResult(
             root=root,
