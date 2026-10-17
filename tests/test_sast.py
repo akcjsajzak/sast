@@ -1868,5 +1868,306 @@ class TestMultipartParser(unittest.TestCase):
         self.assertEqual(multipart.parse(b"junk", "multipart/form-data"), {})
 
 
+# ---------------------------------------------------------------------------
+# Regression tests for the false-negative sweep against known-vulnerable apps.
+#
+# Each case below is a shape that a real vulnerable application used and the
+# engine missed. They are grouped by the language whose probe found them, and
+# the taint-propagation ones assert in both directions where the fix could
+# plausibly have gone too far.
+# ---------------------------------------------------------------------------
+class TestPythonPropagation(unittest.TestCase):
+    """Shapes from DSVW and the Flask probe that used to lose taint."""
+
+    BASE = ('import os\n'
+            'from flask import request\n'
+            'def v():\n'
+            '    q = request.args["p"]\n'
+            '%s\n')
+
+    def _rules(self, body):
+        return {f.rule_id for f in _scan({"a.py": self.BASE % body}).findings}
+
+    def test_propagation_shapes(self):
+        cases = {
+            "tuple unpacking":
+                '    a, b = q.split("?", 1)\n    os.system("echo " + a)',
+            "chained assignment":
+                '    x = y = q\n    os.system("echo " + y)',
+            "generator expression into dict()":
+                '    d = dict((m, m) for m in q.split("&"))\n'
+                '    os.system("echo " + d["z"])',
+            "list comprehension":
+                '    items = [i for i in q.split(",")]\n'
+                '    os.system("echo " + items[0])',
+            "dict comprehension":
+                '    d = {k: k for k in q.split("&")}\n'
+                '    os.system("echo " + d["a"])',
+            "tuple unpack from a literal tuple":
+                '    a, b = (q, "x")\n    os.system("echo " + a)',
+            "for-loop binding":
+                '    for tok in q.split(","):\n        os.system("echo " + tok)',
+            "f-string":
+                '    os.system(f"echo {q}")',
+        }
+        for label, body in cases.items():
+            self.assertIn("py-cmdi-os-system", self._rules(body), label)
+
+    def test_literal_assignment_still_clears(self):
+        self.assertEqual(self._rules('    q = "safe"\n    os.system(q)'), set())
+
+    def test_http_server_handler_attributes_are_sources(self):
+        """DSVW reads the request off `self`, not off a framework object."""
+        rules = {f.rule_id for f in _scan({"h.py":
+            "import http.server, os\n"
+            "class H(http.server.BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        os.system(self.path)\n"}).findings}
+        self.assertIn("py-cmdi-os-system", rules)
+
+    def test_self_path_is_not_a_source_outside_a_handler(self):
+        """`self.path` is a filename in most classes; the rule is gated."""
+        rules = {f.rule_id for f in _scan({"n.py":
+            "import os\n"
+            "class Thing:\n"
+            "    def run(self):\n"
+            "        os.system(self.path)\n"}).findings}
+        self.assertNotIn("py-cmdi-os-system", rules)
+
+
+class TestCPropagation(unittest.TestCase):
+    """Damn_Vulnerable_C_Program reported nothing at all before these."""
+
+    def _rules(self, body):
+        return {f.rule_id for f in _scan({"a.c": body}).findings}
+
+    def test_function_parameters_bind(self):
+        """A parameter name sits inside a pointer_declarator, not beside it."""
+        self.assertIn("c-path-fopen", self._rules(
+            "#include <stdio.h>\n"
+            "int go(char *filename) { return fopen(filename, \"r\") != 0; }\n"
+            "int main(int argc, char **argv) { return go(argv[1]); }\n"))
+
+    def test_cast_does_not_hide_the_call(self):
+        """`(char *)malloc(n)` must not strip to the type `char *`."""
+        self.assertIn("c-int-malloc", self._rules(
+            "#include <stdlib.h>\n#include <stdio.h>\n"
+            "void f(void) { int n; scanf(\"%d\", &n);"
+            " char *p = (char *)malloc(n); (void)p; }\n"))
+
+    def test_out_parameter_is_the_tainted_value(self):
+        """scanf returns a count; the data lands in the argument."""
+        self.assertIn("c-int-malloc", self._rules(
+            "#include <stdlib.h>\n#include <stdio.h>\n"
+            "void f(void) { int n; scanf(\"%d\", &n); malloc(n); }\n"))
+
+    def test_sink_inside_a_condition_is_seen(self):
+        """`while (fread(&x, ...) > 0)` used to be skipped entirely."""
+        self.assertIn("c-buf-memcpy", self._rules(
+            "#include <stdio.h>\n#include <string.h>\n"
+            "struct S { int w; char d[4]; };\n"
+            "void f(FILE *fp, char *dst) { struct S s;\n"
+            "  while (fread(&s, sizeof(s), 1, fp) > 0) {"
+            " memcpy(dst, s.d, s.w); } }\n"))
+
+
+class TestJavaConstantFolding(unittest.TestCase):
+    """A decidable condition has one live arm; the dead one must not merge."""
+
+    BASE = ('import javax.servlet.http.*;\n'
+            'public class C extends HttpServlet {\n'
+            '  public void doPost(HttpServletRequest request,'
+            ' HttpServletResponse response) {\n'
+            '    String param = request.getParameter("x");\n'
+            '    int num = 86;\n'
+            '%s\n  }\n}\n')
+
+    def _rules(self, body):
+        return {f.rule_id for f in _scan({"C.java": self.BASE % body}).findings}
+
+    def test_dead_branch_does_not_taint(self):
+        quiet = {
+            "always-true if":
+                '    String b; if ((7 * 42) - num > 200) b = "safe";'
+                ' else b = param; Runtime.getRuntime().exec(b);',
+            "always-true ternary":
+                '    String b = (500 > 200) ? "safe" : param;'
+                ' Runtime.getRuntime().exec(b);',
+            "if (false) with no else":
+                '    String b = "safe"; if (1 > 2) { b = param; }'
+                ' Runtime.getRuntime().exec(b);',
+            "switch on a constant selector":
+                '    String b; switch (num) { case 86: b = "safe"; break;'
+                ' default: b = param; } Runtime.getRuntime().exec(b);',
+            "switch on a constant charAt":
+                '    String b; String g = "ABC";'
+                ' switch (g.charAt(1)) { case \'A\': b = param; break;'
+                ' case \'B\': b = "safe"; break; default: b = param; }'
+                ' Runtime.getRuntime().exec(b);',
+        }
+        for label, body in quiet.items():
+            self.assertNotIn("java-cmdi-exec", self._rules(body), label)
+
+    def test_live_branch_still_taints(self):
+        loud = {
+            "always-false if":
+                '    String b; if ((7 * 42) - num > 500) b = "safe";'
+                ' else b = param; Runtime.getRuntime().exec(b);',
+            "always-false ternary":
+                '    String b = (200 > 500) ? "safe" : param;'
+                ' Runtime.getRuntime().exec(b);',
+            "undecidable condition":
+                '    String b; if (param != null) b = "safe";'
+                ' else b = param; Runtime.getRuntime().exec(b);',
+            "constant clobbered inside a branch":
+                '    int n2 = 1; if (param != null) { n2 = 900; }'
+                ' String b; if (n2 > 500) b = param; else b = "safe";'
+                ' Runtime.getRuntime().exec(b);',
+            "if (true) taking the tainted arm":
+                '    String b = "safe"; if (2 > 1) { b = param; }'
+                ' Runtime.getRuntime().exec(b);',
+            "switch falling through to the tainted arm":
+                '    String b; switch (num) { case 86: b = param;'
+                ' case 7: break; default: b = "safe"; }'
+                ' Runtime.getRuntime().exec(b);',
+        }
+        for label, body in loud.items():
+            self.assertIn("java-cmdi-exec", self._rules(body), label)
+
+    def test_braceless_branch_body_is_walked(self):
+        """The Benchmark's getParameterMap shape ends in a braceless if."""
+        self.assertIn("java-cmdi-exec", self._rules(
+            '    java.util.Map<String, String[]> map = request.getParameterMap();\n'
+            '    String b = "";\n'
+            '    if (!map.isEmpty()) {\n'
+            '      String[] values = map.get("x");\n'
+            '      if (values != null) b = values[0];\n'
+            '    }\n'
+            '    Runtime.getRuntime().exec(b);'))
+
+    def test_constructor_carries_its_arguments(self):
+        """A Base64 round trip through `new String(...)` is not sanitising."""
+        self.assertIn("java-cmdi-exec", self._rules(
+            '    String b = new String(param.getBytes());\n'
+            '    Runtime.getRuntime().exec(b);'))
+
+
+class TestGoProbeShapes(unittest.TestCase):
+    """Sink shapes govwa used that the Go rules claimed but did not match."""
+
+    BASE = ('package main\n'
+            'import ("net/http"; "io/ioutil"; "fmt"; "os")\n'
+            'func h(w http.ResponseWriter, r *http.Request) {\n'
+            '  q := r.FormValue("q")\n'
+            '%s\n}\n')
+
+    def _rules(self, body):
+        return {f.rule_id for f in
+                _scan({"go.mod": "module x\n", "a.go": self.BASE % body}).findings}
+
+    def test_receiver_hint_mismatches(self):
+        cases = {
+            "  ioutil.WriteFile(q, nil, 0644)": "go-path-ioutil-writefile",
+            '  fmt.Fprintf(w, "<b>%s</b>", q)': "go-xss-fmt-fprintf",
+            '  w.Header().Set("Location", q)': "go-header-set",
+        }
+        for stmt, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules(stmt), stmt)
+
+    def test_type_conversion_keeps_the_value(self):
+        """`[]byte(q)` must not strip to the type `[]byte`."""
+        self.assertIn("go-xss-write", self._rules("  w.Write([]byte(q))"))
+
+    def test_os_path_rule_ids_are_unchanged(self):
+        """Splitting os/ioutil must not rename ids people may suppress."""
+        self.assertIn("go-path-open", self._rules("  os.Open(q)"))
+
+    def test_method_parameters_bind_not_the_receiver(self):
+        """A Go method's receiver is a parameter_list too, and comes first."""
+        rules = {f.rule_id for f in _scan({"go.mod": "module x\n", "a.go":
+            'package main\n'
+            'import ("net/http"; "os/exec")\n'
+            'type P struct{}\n'
+            'func (p *P) run(cmd string) { exec.Command("sh", "-c", cmd) }\n'
+            'func h(w http.ResponseWriter, r *http.Request) {\n'
+            '  p := &P{}\n  p.run(r.FormValue("c"))\n}\n'}).findings}
+        self.assertIn("go-cmdi-command", rules)
+
+
+class TestCSharpProbeShapes(unittest.TestCase):
+    """WebGoat.NET found almost nothing before these."""
+
+    def _rules(self, files):
+        return {f.rule_id for f in _scan(files).findings}
+
+    def _page(self, body):
+        return self._rules({"P.cs":
+            "using System;\n"
+            "public class P : System.Web.UI.Page {\n"
+            "  protected void Page_Load(object sender, EventArgs e) {\n"
+            f"    {body}\n  }}\n}}\n"})
+
+    def test_webforms_indexer_is_a_source(self):
+        """`Request["city"]` has no member name at all."""
+        self.assertIn("cs-sqli-sqlcommand",
+                      self._page('new SqlCommand("SELECT " + Request["c"], null);'))
+
+    def test_provider_specific_command_classes(self):
+        """Only the prefix differs between ADO.NET providers."""
+        self.assertIn("cs-sqli-mysqlcommand",
+                      self._page('new MySqlCommand("SELECT " + Request["c"], null);'))
+
+    def test_execute_on_a_tainted_command(self):
+        """The execute call takes no arguments; the taint is the receiver."""
+        self.assertIn("cs-sqli-cmd-executereader", self._page(
+            'var cmd = new SqlCommand("SELECT " + Request["c"], null);'
+            ' cmd.ExecuteReader();'))
+
+    def test_command_text_property(self):
+        self.assertIn("cs-sqli-commandtext", self._page(
+            'var cmd = new SqlCommand(); cmd.CommandText = "SELECT " + Request["c"];'))
+
+    def test_generic_call_keeps_its_name(self):
+        """`Deserialize<object>(x)` matched as "Deserialize<object>"."""
+        self.assertIn("cs-deser-deserialize", self._page(
+            'var s = new System.Web.Script.Serialization.JavaScriptSerializer();'
+            ' s.Deserialize<object>(Request["c"]);'))
+
+    def test_interface_dispatch_reaches_the_real_implementation(self):
+        """A bodiless interface method used to hide the implementation, and
+        only one implementation per name was ever analysed — so WebGoat.NET's
+        SQL layer resolved to a stub provider."""
+        rules = self._rules({
+            "I.cs": "public interface IDb { string Get(string n); }\n",
+            "Stub.cs": ("public class StubDb : IDb {\n"
+                        "  public string Get(string n) { return \"x\"; }\n}\n"),
+            "Real.cs": ("using MySql.Data.MySqlClient;\n"
+                        "public class RealDb : IDb {\n"
+                        "  public string Get(string n) {\n"
+                        "    new MySqlCommand(\"SELECT \" + n, null);\n"
+                        "    return null;\n  }\n}\n"),
+            "P.cs": ("using System;\n"
+                     "public class P : System.Web.UI.Page {\n"
+                     "  private IDb du = null;\n"
+                     "  protected void Page_Load(object s, EventArgs e) {\n"
+                     "    du.Get(Request[\"n\"]);\n  }\n}\n"),
+        })
+        self.assertIn("cs-sqli-mysqlcommand", rules)
+
+
+class TestFindingDeduplication(unittest.TestCase):
+    def test_one_finding_per_rule_and_location(self):
+        """A sink reached from several sources is still one line to fix."""
+        result = _scan({"a.php":
+            "<?php\n"
+            "$a = $_GET['a'];\n"
+            "$b = $_POST['b'];\n"
+            "function run($x) { system($x); }\n"
+            "run($a);\n"
+            "run($b);\n"})
+        at_sink = [f for f in result.findings if f.rule_id == "php-cmdi-system"]
+        self.assertEqual(len(at_sink), 1, [f.location.line for f in at_sink])
+
+
 if __name__ == "__main__":
     unittest.main()
