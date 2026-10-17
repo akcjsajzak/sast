@@ -96,12 +96,18 @@ Per category (repository root): crypto 100%, hash 100%, weakrand 100%, sqli
   symbol table, and one implementation was indexed per bare name, so
   WebGoat.NET's SQL layer resolved to a stub provider.
 * `x = y = value` left every target but the innermost one clean.
-* **Only one function per bare name was ever analysed.** The generic engine
-  re-walked bodies by iterating the symbol table, which keeps one preferred
-  implementation per name, so two same-named functions meant one was skipped
-  outright — and `static` helpers called `init` or `main` in several C files,
-  or `run` in several Python modules, are the normal case. Fixing it gained
-  findings in every generic-engine language at once.
+* **Only one declaration per bare name was ever analysed, in all four
+  engines.** Each builds a symbol table keyed by name for *resolution* and
+  then uses the same table to drive analysis, so a second declaration sharing
+  a name was skipped outright: a `static` helper called `init` in several C
+  files, two JavaScript modules exporting `handle` (module scoping is
+  deliberately ignored, so this is the normal case), an unnamespaced PHP
+  `handle()`, a second Java class called `Test`, and every Java method
+  overload past the first. Each table now keeps an `all_*` list beside the
+  keyed dicts. This changed nothing on any of the sixteen apps or on
+  Benchmark — every one of them declares its sinks in uniquely named classes,
+  which is exactly why it went unnoticed — but it gained findings in C#,
+  Python and C, and the four new tests pin it per engine.
 * **Arithmetic dropped all taint**, so `malloc(w * h)` was invisible while
   `malloc(w + h)` was found, purely because `+` doubles as string
   concatenation. Arithmetic now keeps the tags a language declares numeric and
@@ -230,7 +236,7 @@ out-of-bounds indexing.
 
 ## State of the tree
 
-`python3 -m unittest tests.test_sast` — 230 tests, all passing. 39 of them are
+`python3 -m unittest tests.test_sast` — 234 tests, all passing. 43 of them are
 new and cover every shape this work fixed: the Python propagation shapes, the
 C parameter and out-parameter handling, the Java constant folding in both
 directions, the Go and C# probe shapes, configured crypto, finding
