@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from .advisory.analyzer import analyze_dependencies
 from .advisory.db import AdvisoryDB
 from .analysis.blade import scan_blade
-from .analysis.config_scan import collect_config_files, scan_configs
+from .analysis.config_scan import (collect_config_files, load_properties,
+                                   scan_configs)
 from .analysis.containers import (
     collect_dockerfiles, scan_base_images, scan_dockerfiles,
 )
@@ -72,6 +73,8 @@ class ScanEngine:
         self.options = options or ScanOptions()
         self.registry = Registry()
 
+    _properties: dict = {}
+
     def scan(self, root: str) -> ScanResult:
         start = time.time()
         root = os.path.abspath(root)
@@ -81,6 +84,11 @@ class ScanEngine:
         # Dockerfile, which is exactly where cloud exposure lives.
         languages = detect_languages(root)
         findings: list = []
+        # Values from the repository's .properties files, read once and handed
+        # to the engines that can resolve a configured constant at a call
+        # site: a hash or cipher chosen in configuration is invisible to both
+        # pattern matching and taint tracking without them.
+        self._properties = load_properties(root)
         frameworks: dict = {}
         module_dirs: dict = {}
         files_scanned = 0
@@ -230,7 +238,8 @@ class ScanEngine:
         if language == "java":
             parsed, unreadable = self._parse_all(JavaParser(), source_files)
             symbols = build_java_symbols(parsed)
-            engine = JavaTaintEngine(symbols, rules, framework, language)
+            engine = JavaTaintEngine(symbols, rules, framework, language,
+                                     properties=self._properties)
             return engine.analyze(parsed), len(parsed), unreadable
 
         if language == "javascript":

@@ -129,7 +129,7 @@ def _unquote(text: str):
     return UNKNOWN
 
 
-def const_eval(node: Node, tenv: dict, depth: int = 0):
+def const_eval(node: Node, tenv: dict, depth: int = 0, props: dict = None):
     """Evaluate a Java expression to a Python value, or UNKNOWN.
 
     Deliberately narrow: integers, booleans and plain string literals, with
@@ -156,14 +156,14 @@ def const_eval(node: Node, tenv: dict, depth: int = 0):
     if t == "identifier":
         return const_get(tenv, ja.text(node))
     if t == "method_invocation":
-        return _const_method(node, tenv, depth)
+        return _const_method(node, tenv, depth, props)
     if t == "parenthesized_expression":
         kids = [c for c in node.named_children if c.type not in _COMMENTS]
-        return const_eval(kids[0], tenv, depth + 1) if kids else UNKNOWN
+        return const_eval(kids[0], tenv, depth + 1, props) if kids else UNKNOWN
     if t == "unary_expression":
         op = node.child_by_field_name("operator")
         operand = node.child_by_field_name("operand")
-        v = const_eval(operand, tenv, depth + 1)
+        v = const_eval(operand, tenv, depth + 1, props)
         if v is UNKNOWN or op is None:
             return UNKNOWN
         o = ja.text(op)
@@ -175,7 +175,7 @@ def const_eval(node: Node, tenv: dict, depth: int = 0):
             return not v
         return UNKNOWN
     if t == "binary_expression":
-        return _const_binary(node, tenv, depth)
+        return _const_binary(node, tenv, depth, props)
     return UNKNOWN
 
 
@@ -191,14 +191,27 @@ _CONST_STRING_METHODS = {
 }
 
 
-def _const_method(node: Node, tenv: dict, depth: int):
+def _const_method(node: Node, tenv: dict, depth: int, props: dict = None):
     obj, mname, args = ja.mi_parts(node)
+    if mname in ("getProperty", "getString", "get") and props:
+        # `props.getProperty("hashAlg1")` resolves against the .properties
+        # files in the repository. Without this the algorithm is just "some
+        # string decided at runtime" and the call cannot be judged at all,
+        # even though the value sits a directory away. A second argument is
+        # the default, used only when the key is absent.
+        vals = [const_eval(a, tenv, depth + 1, props) for a in (args or [])]
+        if vals and isinstance(vals[0], str):
+            if vals[0] in props:
+                return props[vals[0]]
+            if len(vals) > 1 and isinstance(vals[1], str):
+                return vals[1]
+        return UNKNOWN
     if mname not in _CONST_STRING_METHODS:
         return UNKNOWN
-    recv = const_eval(obj, tenv, depth + 1)
+    recv = const_eval(obj, tenv, depth + 1, props)
     if not isinstance(recv, str):
         return UNKNOWN
-    vals = [const_eval(a, tenv, depth + 1) for a in (args or [])]
+    vals = [const_eval(a, tenv, depth + 1, props) for a in (args or [])]
     if any(v is UNKNOWN for v in vals):
         return UNKNOWN
     try:
@@ -241,13 +254,13 @@ def _const_method(node: Node, tenv: dict, depth: int):
     return UNKNOWN
 
 
-def _const_binary(node: Node, tenv: dict, depth: int):
+def _const_binary(node: Node, tenv: dict, depth: int, props: dict = None):
     op_node = node.child_by_field_name("operator")
     if op_node is None:
         return UNKNOWN
     op = ja.text(op_node)
-    left = const_eval(node.child_by_field_name("left"), tenv, depth + 1)
-    right = const_eval(node.child_by_field_name("right"), tenv, depth + 1)
+    left = const_eval(node.child_by_field_name("left"), tenv, depth + 1, props)
+    right = const_eval(node.child_by_field_name("right"), tenv, depth + 1, props)
 
     # Short-circuit operators can decide on one side alone.
     if op == "&&":
@@ -304,6 +317,46 @@ def _const_binary(node: Node, tenv: dict, depth: int):
     return UNKNOWN
 
 
+# getInstance families and what counts as weak for each. The value is the
+# resolved algorithm string, so these match it whole rather than searching
+# source text the way the pattern rules do.
+#
+# The hash and cipher entries deliberately reuse the pattern rules' ids. A
+# weak algorithm named literally in the source and one resolved through a
+# config lookup are the same finding at the same line, and the per-location
+# dedup then reports it once however it was found.
+_ALGORITHM_FAMILIES = {
+    "messagedigest": (
+        "java-crypto-weak-hash-algorithm",
+        re.compile(r"(?:MD2|MD4|MD5|SHA-?1)$", re.IGNORECASE),
+        "Weak cryptographic hash (MD5/SHA-1)", "low", "CWE-328",
+        "MD2, MD4, MD5 and SHA-1 are collision-prone and unfit for "
+        "signatures, integrity checks or password storage.",
+    ),
+    "signature": (
+        "java-crypto-weak-signature",
+        re.compile(r"(?:MD2|MD5|SHA-?1)with\w+$", re.IGNORECASE),
+        "Weak signature algorithm", "medium", "CWE-328",
+        "A signature over MD5 or SHA-1 can be forged by finding a collision.",
+    ),
+    "mac": (
+        "java-crypto-weak-mac",
+        re.compile(r"Hmac(?:MD5|SHA1)$", re.IGNORECASE),
+        "Weak MAC algorithm", "medium", "CWE-328",
+        "HMAC-MD5 and HMAC-SHA1 are deprecated for new designs.",
+    ),
+}
+for _f in ("cipher", "keygenerator", "secretkeyfactory"):
+    _ALGORITHM_FAMILIES[_f] = (
+        "java-crypto-weak-cipher",
+        re.compile(r"(?:DES|DESede|TripleDES|RC2|RC4|ARCFOUR|Blowfish|IDEA)"
+                   r"(?:/|$)|[A-Za-z0-9]+/ECB", re.IGNORECASE),
+        "Weak or broken cipher algorithm", "medium", "CWE-327",
+        "DES, 3DES, RC2, RC4, Blowfish and IDEA are broken or too weak for "
+        "current use, and ECB mode leaks plaintext structure.",
+    )
+
+
 def _constructed_type(value: Node):
     """Class name from `new Foo(...)`, or None."""
     if value is None or value.type != "object_creation_expression":
@@ -316,7 +369,8 @@ def _constructed_type(value: Node):
 
 class JavaTaintEngine:
     def __init__(self, symbols: JavaSymbolTable, rules: RuleSet,
-                 framework: str, language: str = "java") -> None:
+                 framework: str, language: str = "java",
+                 properties: dict = None) -> None:
         self.symbols = symbols
         self.rules = rules
         self.framework = framework
@@ -324,6 +378,9 @@ class JavaTaintEngine:
         self.findings: list[Finding] = []
         self._seen: set = set()
         self._call_memo: dict = {}
+        # Values read from the repository's .properties files, so a crypto
+        # algorithm chosen in configuration can be resolved at the call site.
+        self.properties = properties or {}
 
     # ------------------------------------------------------------------
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
@@ -413,7 +470,8 @@ class JavaTaintEngine:
                     if value is not None:
                         vt = self.taint_of(value, sf, env, tenv, ctx)
                         self._assign(name, vt, sf, env, d)
-                        const_set(tenv, name, const_eval(value, tenv))
+                        const_set(tenv, name,
+                                  const_eval(value, tenv, 0, self.properties))
                     else:
                         const_set(tenv, name, UNKNOWN)
             return None
@@ -462,7 +520,8 @@ class JavaTaintEngine:
             op = node.child_by_field_name("operator")
             simple = op is None or ja.text(op) == "="
             const_set(tenv, ja.text(lhs),
-                      const_eval(rhs, tenv) if simple else UNKNOWN)
+                      const_eval(rhs, tenv, 0, self.properties)
+                      if simple else UNKNOWN)
         elif lhs.type in ("field_access",):
             vt = self.taint_of(rhs, sf, env, tenv, ctx)
             self._assign(ja.text(lhs), vt, sf, env, lhs)
@@ -493,7 +552,8 @@ class JavaTaintEngine:
         # A decidable condition leaves one live arm. Walking the dead one too
         # and merging its environment is what let a constant assignment be
         # overwritten by the taint from a branch that never runs.
-        verdict = const_eval(node.child_by_field_name("condition"), tenv)
+        verdict = const_eval(node.child_by_field_name("condition"), tenv, 0,
+                             self.properties)
         live = None
         if verdict is True:
             live = node.child_by_field_name("consequence")
@@ -554,7 +614,7 @@ class JavaTaintEngine:
         if not groups:
             return None
 
-        selector = const_eval(cond, tenv)
+        selector = const_eval(cond, tenv, 0, self.properties)
         live = None
         if selector is not UNKNOWN:
             live = self._switch_live_groups(groups, selector)
@@ -735,7 +795,7 @@ class JavaTaintEngine:
             return self.taint_of(nc[0], sf, env, tenv, ctx) if nc else None
         if t == "ternary_expression":
             cond = node.child_by_field_name("condition")
-            verdict = const_eval(cond, tenv)
+            verdict = const_eval(cond, tenv, 0, self.properties)
             if verdict in (True, False):
                 # Same reasoning as handle_if: only the live arm contributes.
                 self.taint_of(cond, sf, env, tenv, ctx)
@@ -836,6 +896,7 @@ class JavaTaintEngine:
         # attacker-controlled path is an SSRF/traversal sink *and* returns
         # attacker-influenced data). Returning the source taint first would
         # silently drop the sink.
+        self.check_algorithm(mname, obj, args, node, sf, tenv)
         san = self.match_sanitizer(mname)
         if san is None:
             self.check_method_sink(mname, obj, args, node, sf, env, tenv, ctx)
@@ -1112,6 +1173,62 @@ class JavaTaintEngine:
                                         Ctx(depth=ctx.depth + 1, current_class=m.class_name))
         self._call_memo[key] = result
         return result
+
+    def check_algorithm(self, mname, obj, args, node, sf, tenv) -> None:
+        """Report a weak algorithm whose name is only known after folding.
+
+        `MessageDigest.getInstance("MD5")` is caught by a pattern rule reading
+        the source text. `MessageDigest.getInstance(props.getProperty(
+        "hashAlg1"))` is not, and no amount of taint tracking helps: the
+        question is what the algorithm *is*, not where it came from. Folding
+        the argument — through locals, string methods and the repository's own
+        .properties files — answers it.
+        """
+        if mname != "getInstance" or not args:
+            return
+        family = _ALGORITHM_FAMILIES.get(self._algorithm_family(obj, node))
+        if family is None:
+            return
+        value = const_eval(args[0], tenv, 0, self.properties)
+        if not isinstance(value, str):
+            return
+        rule_id, pattern, title, severity, cwe, description = family
+        if not pattern.match(value.strip()):
+            return
+        loc = make_loc(sf, node)
+        # Keyed without the column, to match the pattern rules' key shape: a
+        # weak algorithm named literally in the source and the same one
+        # resolved through a config lookup are one finding at one line, and
+        # the two paths must be able to collide.
+        key = (rule_id, sf.path, loc.line)
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self.findings.append(Finding(
+            rule_id=rule_id, title=title, severity=Severity(severity),
+            cwe=cwe, owasp="A02:2021 — Cryptographic Failures",
+            category="weak-crypto",
+            description=f"{description} The algorithm resolves to "
+                        f"'{value.strip()}'.",
+            remediation="Use SHA-256 or better for hashing, and "
+                        "AES/GCM/NoPadding for encryption. Change the "
+                        "configured value as well as the call site.",
+            confidence="high", framework=self.framework,
+            language=self.language, location=loc, source=None,
+            trace=[TaintStep(location=loc, description=title,
+                             code=sf.node_line(node))],
+            tags=["weak-crypto"],
+        ))
+
+    @staticmethod
+    def _algorithm_family(obj, node) -> str:
+        """Which getInstance this is: MessageDigest, Cipher, or neither."""
+        text = (ja.text(obj) if obj is not None else ja.text(node)).lower()
+        for family in ("messagedigest", "cipher", "keygenerator",
+                       "secretkeyfactory", "signature", "mac"):
+            if family in text:
+                return family
+        return ""
 
     def emit_finding(self, sink, taint, node, sf):
         loc = make_loc(sf, node)

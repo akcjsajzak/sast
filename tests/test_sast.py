@@ -2155,6 +2155,70 @@ class TestCSharpProbeShapes(unittest.TestCase):
         self.assertIn("cs-sqli-mysqlcommand", rules)
 
 
+class TestConfiguredCrypto(unittest.TestCase):
+    """A hash or cipher chosen in a .properties file.
+
+    `MessageDigest.getInstance(props.getProperty("hashAlg"))` is a call no
+    amount of taint tracking can judge: the question is what the algorithm
+    *is*. The answer sits in the repository, so the engine reads it.
+    """
+
+    PROPS = ("hashAlg1=MD5\n"
+             "hashAlg2=SHA-256\n"
+             "cryptoAlg1=DES/ECB/PKCS5Padding\n")
+
+    def _rules(self, body):
+        src = ("import java.util.Properties;\n"
+               "public class H {\n"
+               "  public void f(Properties p) throws Exception {\n"
+               f"    {body}\n  }}\n}}\n")
+        return {f.rule_id for f in
+                _scan({"app.properties": self.PROPS, "H.java": src}).findings}
+
+    def test_weak_key_is_resolved_at_the_call_site(self):
+        rules = self._rules(
+            'String a = p.getProperty("hashAlg1", "SHA512");'
+            ' java.security.MessageDigest.getInstance(a);')
+        self.assertIn("java-crypto-weak-hash-algorithm", rules)
+
+    def test_strong_key_stays_silent(self):
+        rules = self._rules(
+            'String a = p.getProperty("hashAlg2", "MD5");'
+            ' java.security.MessageDigest.getInstance(a);')
+        self.assertNotIn("java-crypto-weak-hash-algorithm", rules)
+
+    def test_absent_key_falls_back_to_the_default(self):
+        rules = self._rules(
+            'String a = p.getProperty("nosuchkey", "MD5");'
+            ' java.security.MessageDigest.getInstance(a);')
+        self.assertIn("java-crypto-weak-hash-algorithm", rules)
+
+    def test_cipher_family(self):
+        rules = self._rules(
+            'javax.crypto.Cipher.getInstance(p.getProperty("cryptoAlg1"));')
+        self.assertIn("java-crypto-weak-cipher", rules)
+
+    def test_the_properties_file_is_flagged_on_its_own(self):
+        """Even with no code reading it, the configured value is the bug."""
+        rules = {f.rule_id for f in
+                 _scan({"app.properties": self.PROPS}).findings}
+        self.assertIn("config-weak-hash-algorithm", rules)
+        self.assertIn("config-weak-cipher-algorithm", rules)
+
+    def test_ambiguous_key_is_not_resolved(self):
+        """Two files disagreeing means nothing is known; do not guess."""
+        src = ("import java.util.Properties;\n"
+               "public class H {\n"
+               "  public void f(Properties p) throws Exception {\n"
+               '    String a = p.getProperty("alg", "SHA-256");\n'
+               "    java.security.MessageDigest.getInstance(a);\n  }\n}\n")
+        rules = {f.rule_id for f in _scan({
+            "a.properties": "alg=MD5\n",
+            "b.properties": "alg=SHA-256\n",
+            "H.java": src}).findings}
+        self.assertNotIn("java-crypto-weak-hash-algorithm", rules)
+
+
 class TestFindingDeduplication(unittest.TestCase):
     def test_one_finding_per_rule_and_location(self):
         """A sink reached from several sources is still one line to fix."""

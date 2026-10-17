@@ -165,6 +165,39 @@ _RULES = [
         severity=Severity.LOW, cwe="CWE-548", category="information-disclosure",
         files=("web.xml",),
     ),
+
+    # --- Crypto chosen in configuration ---
+    # `MessageDigest.getInstance(props.getProperty("hashAlg"))` is a call the
+    # taint engines see but cannot judge: the algorithm is a string decided at
+    # runtime. The value is right here in the repository, so read it.
+    _CRule(
+        "config-weak-hash-algorithm",
+        r"^[ \t]*[\w.\-]*(?:hash|digest|checksum|mac|signature|sign)[\w.\-]*"
+        r"[ \t]*[=:][ \t]*\"?(MD2|MD4|MD5|SHA-?1|SHA1withRSA|MD5withRSA)\b",
+        "Weak hash algorithm selected in configuration",
+        "MD2, MD4, MD5 and SHA-1 are collision-prone and unfit for signatures, "
+        "integrity checks or password storage. Code that reads this key will "
+        "use the weak algorithm no matter how the call site is written.",
+        "Set the value to SHA-256 or better; use bcrypt, scrypt or argon2 for "
+        "passwords.",
+        severity=Severity.MEDIUM, cwe="CWE-328", owasp=_A02,
+        category="weak-crypto",
+    ),
+    _CRule(
+        "config-weak-cipher-algorithm",
+        r"^[ \t]*[\w.\-]*(?:crypt|cipher|algo|encryption|transformation)[\w.\-]*"
+        r"[ \t]*[=:][ \t]*\"?"
+        r"(DES|DESede|TripleDES|RC2|RC4|ARCFOUR|Blowfish|IDEA"
+        r"|[A-Za-z0-9]+/ECB[\w/]*)\b",
+        "Weak or broken cipher selected in configuration",
+        "DES, 3DES, RC2, RC4, Blowfish and IDEA are broken or too weak for "
+        "current use, and ECB mode leaks plaintext structure by mapping equal "
+        "blocks to equal ciphertext. Code that reads this key will use it "
+        "whatever the call site looks like.",
+        "Set the value to AES/GCM/NoPadding with a 256-bit key.",
+        severity=Severity.HIGH, cwe="CWE-327", owasp=_A02,
+        category="weak-crypto",
+    ),
 ]
 
 
@@ -174,9 +207,53 @@ def _is_config_file(fname: str) -> bool:
         return True
     if low.startswith(".env."):
         return True
+    # Any .properties file, not just Spring's. A Java application puts its
+    # configuration in whatever name it likes, and the choice of hash or
+    # cipher often lives there rather than in the source — which is exactly
+    # the case the source scanners cannot see.
+    if low.endswith(".properties"):
+        return True
     return any(low.startswith(p) for p in _CONFIG_PREFIXES) and low.endswith(
-        (".properties", ".yml", ".yaml")
+        (".yml", ".yaml")
     )
+
+
+def load_properties(root: str) -> dict:
+    """Return {key: value} for every `.properties` file under `root`.
+
+    A value only survives when every file that defines the key agrees on it.
+    Code reading an ambiguous key could get either value, so claiming one
+    would let the taint engines fold a constant that is not constant. The
+    result feeds `MessageDigest.getInstance(props.getProperty("hashAlg"))`,
+    where the algorithm is a string the source alone cannot judge.
+    """
+    from ..detection.language import IGNORED_DIRS
+
+    seen: dict = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in IGNORED_DIRS and not d.startswith(".")]
+        for fname in filenames:
+            if not fname.lower().endswith(".properties"):
+                continue
+            try:
+                with open(os.path.join(dirpath, fname), "r",
+                          encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            for raw in text.splitlines():
+                line = raw.strip()
+                if not line or line[0] in "#!":
+                    continue
+                for sep in ("=", ":"):
+                    if sep in line:
+                        key, value = line.split(sep, 1)
+                        key, value = key.strip(), value.strip()
+                        if key:
+                            seen.setdefault(key, set()).add(value)
+                        break
+    return {k: next(iter(v)) for k, v in seen.items() if len(v) == 1}
 
 
 def collect_config_files(root: str) -> list[str]:
