@@ -31,7 +31,10 @@ TAG_LABELS = {
 
 _ALL_TAGS = ["sql", "xss", "cmd", "ssrf", "lfi", "deser", "xxe", "ldap",
              "redirect", "path", "upload", "code", "mass", "log",
-             "ssti", "el", "xpath", "redos", "session", "csv"]
+             "ssti", "el", "xpath", "redos", "session", "csv",
+             # `email` was used by the mail() rule but never produced by any
+             # source, so that rule could not fire at all.
+             "email"]
 
 _SQL = ["sql"]
 _XSS = ["xss"]
@@ -187,6 +190,7 @@ def _sources() -> list[TaintSource]:
 def _sinks() -> list[SinkRule]:
     k = []
     A03 = "A03:2021 — Injection"
+    A01 = "A01:2021 — Broken Access Control"
     A10 = "A10:2021 — Server-Side Request Forgery (SSRF)"
 
     # --- SQL injection (raw PHP) ---
@@ -415,6 +419,82 @@ def _sinks() -> list[SinkRule]:
         remediation="Validate and strip CR/LF from all mail() inputs.",
         tags=["email"],
     ))
+
+    # --- Dynamically chosen code ---
+    # An attacker who picks which function runs has arbitrary code execution
+    # against whatever is loaded, without needing eval().
+    for fn, idx in (("call_user_func", 0), ("call_user_func_array", 0),
+                    ("forward_static_call", 0),
+                    ("forward_static_call_array", 0),
+                    ("array_map", 0), ("array_filter", 1),
+                    ("array_walk", 1), ("usort", 1),
+                    ("register_shutdown_function", 0),
+                    ("set_error_handler", 0)):
+        k.append(SinkRule(
+            rule_id=f"php-code-{fn}", kind="function", match=fn,
+            title=f"Attacker-controlled callable passed to {fn}()",
+            severity="critical", cwe="CWE-470", owasp=A03,
+            category="unsafe-reflection",
+            description="The function to call is chosen by untrusted input, "
+                        "so the attacker decides which code runs.",
+            remediation="Map the input through a fixed allow-list of callables.",
+            tags=["code", "cmd"], arg_index=idx,
+        ))
+    k.append(SinkRule(
+        rule_id="php-code-create_function", kind="function",
+        match="create_function",
+        title="Code injection via create_function()",
+        severity="critical", cwe="CWE-95", owasp=A03, category="code-injection",
+        description="create_function() compiles its body as PHP, so untrusted "
+                    "input there is arbitrary code execution. It was removed "
+                    "in PHP 8.",
+        remediation="Use a closure, and never build one from input.",
+        tags=["code"], arg_index=1,
+    ))
+    k.append(SinkRule(
+        rule_id="php-code-dynamic-call", kind="dynamic_call", match="",
+        title="Call through an attacker-controlled function name",
+        severity="critical", cwe="CWE-470", owasp=A03,
+        category="unsafe-reflection",
+        description="The name of the function being called comes from "
+                    "untrusted input, so the attacker chooses which code runs.",
+        remediation="Dispatch through a fixed map of allowed names.",
+        tags=["code", "cmd"],
+    ))
+
+    # --- Variable variables ---
+    # `$$name = x` writes to a variable the attacker names, which can
+    # overwrite anything in scope. `extract()` has the same effect and is
+    # already covered; this is the explicit form.
+    k.append(SinkRule(
+        rule_id="php-mass-variable-variable", kind="variable_variable",
+        match="",
+        title="Write to an attacker-named variable",
+        severity="high", cwe="CWE-621", owasp=A03,
+        category="variable-overwrite",
+        description="A variable variable lets untrusted input choose which "
+                    "variable is written, so any value in scope — including "
+                    "one a later security check reads — can be overwritten.",
+        remediation="Use an array keyed by the input instead of naming a "
+                    "variable with it.",
+        tags=["mass", "code"],
+    ))
+
+    # --- Directory listing by an attacker-controlled path ---
+    for fn in ("scandir", "opendir", "glob", "dir", "rmdir", "mkdir",
+               "is_dir", "disk_free_space"):
+        k.append(SinkRule(
+            rule_id=f"php-path-{fn}", kind="function", match=fn,
+            title=f"Path traversal via {fn}()",
+            severity="medium", cwe="CWE-22", owasp=A01,
+            category="path-traversal",
+            description="An attacker-controlled path lets the caller reach "
+                        "directories outside the intended root, which "
+                        "discloses the layout of the filesystem.",
+            remediation="Resolve the path with realpath() and verify it stays "
+                        "inside an allow-listed root.",
+            tags=_LFI, arg_index=0, confidence="medium",
+        ))
 
     # --- SSRF (additional transports) ---
     k.append(SinkRule(
@@ -647,6 +727,9 @@ def _sanitizers() -> list[SanitizerRule]:
     return s
 
 
+A03_P = "A03:2021 — Injection"
+
+
 def _patterns() -> list[PatternRule]:
     A02 = "A02:2021 — Cryptographic Failures"
     A05 = "A05:2021 — Security Misconfiguration"
@@ -743,6 +826,23 @@ def _patterns() -> list[PatternRule]:
         description="LIBXML_NOENT/LIBXML_DTDLOAD substitute external entities while "
                     "parsing, which is the XXE primitive.",
         remediation="Parse without these flags.",
+    ))
+    p.append(PatternRule(
+        rule_id="php-code-preg-replace-eval",
+        node_type="function_call_expression",
+        # The modifiers sit inside the quoted pattern, after its final
+        # delimiter: '/a/e', "#x#ie". Matching them outside the quotes found
+        # nothing at all.
+        match=r"""preg_replace\s*\(\s*(['"])[^'"]*[/#~!%|][a-zA-Z]*e[a-zA-Z]*\1""",
+        match_field="text", regex=True,
+        title="preg_replace() with the /e modifier",
+        severity="critical", cwe="CWE-95", owasp=A03_P,
+        category="code-injection",
+        description="The /e modifier makes preg_replace() evaluate its "
+                    "replacement as PHP, so anything reaching the replacement "
+                    "— or the subject, through a backreference — is executed. "
+                    "It was removed in PHP 7.",
+        remediation="Use preg_replace_callback() with a fixed callback.",
     ))
     return p
 

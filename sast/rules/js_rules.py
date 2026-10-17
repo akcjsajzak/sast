@@ -18,7 +18,9 @@ A08 = "A08:2021 — Software and Data Integrity Failures"
 A10 = "A10:2021 — Server-Side Request Forgery (SSRF)"
 
 _ALL = ["sql", "xss", "cmd", "ssrf", "lfi", "path", "deser", "redirect",
-        "code", "log", "ssti", "nosql", "proto", "redos", "xxe", "open"]
+        "code", "log", "ssti", "nosql", "proto", "redos", "xxe", "open",
+        # Used by the response-header rules; without it they could not fire.
+        "header"]
 
 _XSS = ["xss"]
 _CMD = ["cmd"]
@@ -131,13 +133,13 @@ def _sinks() -> list[SinkRule]:
 
     def sink(rule_id, kind, match, title, severity, cwe, owasp, category,
              description, remediation, tags, arg_index=-1, obj_hint=None,
-             frameworks=("*",), confidence="high"):
+             frameworks=("*",), confidence="high", arg_shape=()):
         k.append(SinkRule(
             rule_id=rule_id, kind=kind, match=match, title=title,
             severity=severity, cwe=cwe, owasp=owasp, category=category,
             description=description, remediation=remediation, tags=tags,
             arg_index=arg_index, obj_hint=obj_hint, frameworks=frameworks,
-            confidence=confidence,
+            confidence=confidence, arg_shape=arg_shape,
         ))
 
     # --- Code injection ---
@@ -181,7 +183,10 @@ def _sinks() -> list[SinkRule]:
              f"The executable name passed to {m}() is attacker-controlled.",
              "Validate the command against an allow-list; never let input choose "
              "the binary, and keep shell:false.",
-             _CMD, arg_index=0, confidence="medium")
+             # Any argument, not just the program. `spawn('sh', ['-c', q])` is
+             # the canonical injection and puts the attacker's data in the
+             # args array, which an arg_index of 0 never looked at.
+             _CMD, confidence="medium")
 
     # --- SQL / NoSQL injection ---
     for m in ("query", "execute", "raw", "unsafe"):
@@ -230,6 +235,80 @@ def _sinks() -> list[SinkRule]:
          "to an arbitrary origin, or a javascript: URL.",
          "Validate the target against an allow-list of paths or origins.",
          _REDIR + _XSS, obj_hint="location")
+
+    # --- XSS: the server response ---
+    # The DOM sinks above are only half the picture. An Express handler writes
+    # the response by hand and nothing escapes for it, so attacker data in the
+    # body is reflected XSS — and `res.send` is the single most common sink in
+    # a Node web application. None of these were covered.
+    # Only a string argument. Express sends an object or an array as JSON,
+    # which a browser never renders as HTML, and reporting those put 18 false
+    # findings on dvws-node alone. A concatenation or a template literal is
+    # the shape that builds HTML, and a bare identifier could be either — so
+    # `res.send(q)` with a tainted string is a known miss, taken knowingly
+    # rather than paid for with the false ones.
+    _HTML_SHAPE = ("string", "template_string", "binary_expression")
+    for m in ("send", "write", "end", "sendStatus"):
+        sink(f"js-xss-res-{m.lower()}", "call", m,
+             f"Reflected XSS via res.{m}()", "high", "CWE-79", A03, "xss",
+             f"res.{m}() writes its argument into the response body with no "
+             "escaping, so markup in it is served to the browser. Express "
+             "sets an HTML content type for a string.",
+             "Escape the value for HTML, or send it as JSON with an explicit "
+             "content type.",
+             _XSS, arg_index=0, obj_hint="res", confidence="medium",
+             arg_shape=_HTML_SHAPE)
+    sink("js-xss-res-jsonp", "call", "jsonp",
+         "XSS via res.jsonp()", "medium", "CWE-79", A03, "xss",
+         "A JSONP response is executed as script by whoever includes it, so "
+         "attacker-controlled content in it runs in their page — and the "
+         "callback name is reflected into the response unescaped.",
+         "Prefer CORS with res.json(); if JSONP is required, allow-list the "
+         "callback name against /^[A-Za-z_$][\w$]*$/.",
+         _XSS, obj_hint="res", confidence="medium",
+         arg_shape=_HTML_SHAPE)
+    sink("js-ssti-res-render", "call", "render",
+         "Template chosen by untrusted input", "high", "CWE-1336", A03, "ssti",
+         "The template name comes from request data, so the attacker selects "
+         "which template renders — and with a traversal, which file is read "
+         "as one.",
+         "Map the input through a fixed allow-list of template names.",
+         ["ssti", "path", "lfi"], arg_index=0, obj_hint="res",
+         confidence="medium")
+    for m in ("setHeader", "header", "append", "writeHead"):
+        sink(f"js-header-{m.lower()}", "call", m,
+             "Response header built from untrusted input", "high", "CWE-113",
+             A03, "header-injection",
+             "A header value taken from the request is dangerous in three "
+             "ways, depending on the header: CR or LF in it splits the "
+             "response and injects headers or a body; a Location built this "
+             "way is an open redirect; and an Access-Control-Allow-Origin "
+             "echoing the request's Origin defeats CORS entirely, since every "
+             "site then passes the check.",
+             "Strip CR and LF from the value; allow-list redirect targets; and "
+             "never reflect Origin into Access-Control-Allow-Origin — compare "
+             "it against a fixed list of permitted origins.",
+             ["header", "redirect", "xss"], obj_hint="res",
+             confidence="medium")
+    sink("js-xss-res-cookie", "call", "cookie",
+         "Untrusted data written into a cookie", "medium", "CWE-79", A03, "xss",
+         "The cookie value comes from request data, so it is reflected to the "
+         "browser on every later request and read back as trusted state.",
+         "Validate the value, and do not store request data a later check "
+         "relies on.",
+         _XSS + ["header"], arg_index=1, obj_hint="res", confidence="medium")
+
+    # --- Prototype pollution through a merge of parsed input ---
+    for m in ("assign", "assignIn", "defaultsDeep", "extend"):
+        sink(f"js-proto-{m.lower()}", "call", m,
+             f"Prototype pollution via {m}()", "high", "CWE-1321", A03,
+             "prototype-pollution",
+             "Copying attacker-controlled keys onto an object lets a "
+             "`__proto__` or `constructor.prototype` key reach Object's "
+             "prototype, which changes behaviour everywhere in the process.",
+             "Reject keys named __proto__, constructor and prototype, or build "
+             "the object with a null prototype.",
+             ["proto", "deser"], confidence="medium")
 
     # --- XSS: framework sinks ---
     sink("react-xss-dangerously-set-inner-html", "jsx_attribute",

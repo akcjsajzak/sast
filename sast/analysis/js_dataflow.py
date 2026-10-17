@@ -599,6 +599,9 @@ class JsTaintEngine:
             for i in indices:
                 if i >= len(args):
                     continue
+                shape = ja.strip(args[i])
+                if not sink.shape_allows(shape.type if shape else ""):
+                    continue
                 t = self.taint_of(args[i], sf, env, ctx)
                 if t is None:
                     continue

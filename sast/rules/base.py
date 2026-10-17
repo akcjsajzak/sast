@@ -119,6 +119,15 @@ class SinkRule:
     cls: Optional[str] = None
     obj_hint: Optional[str] = None  # substring the receiver must contain (Java)
     confidence: str = "high"
+    # Node types the matched argument must have for the sink to apply.
+    # `res.send(x)` is XSS only when x is a string: Express sends an object or
+    # an array as JSON, which a browser never renders as HTML, so reporting
+    # those put 18 false findings on one application. Empty means any shape.
+    arg_shape: tuple = ()
+
+    def shape_allows(self, node_type: str) -> bool:
+        return not self.arg_shape or node_type in self.arg_shape
+
     # Fire on taint in the *receiver* rather than an argument. A handful of
     # sinks are dangerous because of what they are called on, not what they
     # are passed: `untrusted.format(x)` can walk attributes out of x, whereas

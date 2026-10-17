@@ -384,6 +384,7 @@ class TaintEngine:
             return
         lhs, rhs = nc[0], nc[-1]
         t = self.taint_of(rhs, sf, env, ctx)
+        self.check_variable_variable_sink(lhs, sf, env, ctx)
         self.assign(lhs, t, sf, env)
         self._record_facts(lhs, rhs, env)
 
@@ -798,6 +799,10 @@ class TaintEngine:
         if kind == "function" and not callee:
             # `$fn($x)` — resolve through a variable holding a function name
             # or a closure.
+            # Before resolving it: if the *name* being called is itself
+            # attacker-controlled, the attacker chooses which code runs, which
+            # is a finding regardless of what this happens to resolve to.
+            self.check_dynamic_call_sink(node, sf, env, ctx)
             resolved = self._resolve_dynamic_call(node, args, sf, env, ctx)
             if resolved is not _UNRESOLVED:
                 return resolved
@@ -1164,6 +1169,38 @@ class TaintEngine:
             if taint is not None and (taint.tags & set(sink.tags)):
                 self.emit_finding(sink, taint, node, sf)
                 break
+
+    def check_variable_variable_sink(self, left: Node, sf: SourceFile,
+                                     env: dict, ctx: Ctx) -> None:
+        """Report `$$name = x` where the name comes from untrusted input."""
+        rules = [r for r in self.rules.sinks if r.kind == "variable_variable"]
+        if not rules or left is None or left.type != "dynamic_variable_name":
+            return
+        nc = [c for c in left.named_children]
+        t = self.taint_of(nc[0], sf, env, ctx) if nc else None
+        if t is None:
+            return
+        for rule in rules:
+            if set(rule.tags) & t.tags:
+                self.emit_finding(rule, t, left, sf)
+                return
+
+    def check_dynamic_call_sink(self, node: Node, sf: SourceFile, env: dict,
+                               ctx: Ctx) -> None:
+        """Report `$fn()` where `$fn` holds attacker-controlled data."""
+        rules = [r for r in self.rules.sinks if r.kind == "dynamic_call"]
+        if not rules:
+            return
+        nc = [c for c in node.named_children if c.type != "arguments"]
+        if not nc:
+            return
+        t = self.taint_of(nc[0], sf, env, ctx)
+        if t is None:
+            return
+        for rule in rules:
+            if set(rule.tags) & t.tags:
+                self.emit_finding(rule, t, node, sf)
+                return
 
     def emit_finding(self, sink: SinkRule, taint: Taint, node: Node, sf: SourceFile):
         loc = make_loc(sf, node)

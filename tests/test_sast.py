@@ -2404,6 +2404,75 @@ class TestSameNamedFunctions(unittest.TestCase):
         self.assertEqual(len(lines), 2, lines)
 
 
+class TestPhpProbeShapes(unittest.TestCase):
+    """Sink shapes the PHP rules claimed, or should have, but did not match."""
+
+    def _rules(self, body):
+        return {f.rule_id for f in
+                _scan({"p.php": "<?php\n$q = $_GET['q'];\n" + body}).findings}
+
+    def test_newly_covered_sinks(self):
+        cases = {
+            "call_user_func($q);": "php-code-call_user_func",
+            "call_user_func_array($q, []);": "php-code-call_user_func_array",
+            "create_function('', $q);": "php-code-create_function",
+            "scandir($q);": "php-path-scandir",
+            "glob($q);": "php-path-glob",
+            # `mail` had a rule all along, but it asked for an `email` tag no
+            # source produced, so it could never fire.
+            "mail($q, 's', 'b');": "php-email-mail",
+            "$fn = $q; $fn();": "php-code-dynamic-call",
+            "$$q = 1;": "php-mass-variable-variable",
+            "preg_replace('/a/e', $q, 'x');": "php-code-preg-replace-eval",
+        }
+        for stmt, rule_id in cases.items():
+            self.assertIn(rule_id, self._rules(stmt), stmt)
+
+    def test_preg_replace_without_the_e_modifier_is_silent(self):
+        rules = self._rules("preg_replace('/file/i', $q, 'x');")
+        self.assertNotIn("php-code-preg-replace-eval", rules)
+
+
+class TestJsResponseSinks(unittest.TestCase):
+    """The JS rules covered DOM XSS but had no server-response sinks at all,
+    so `res.send` — the most common sink in an Express application — was
+    missed entirely."""
+
+    def _rules(self, body):
+        app = ("const express = require('express');\n"
+               "const app = express();\n"
+               "app.get('/x', (req, res) => {\n"
+               "  const q = req.query.q;\n"
+               f"  {body}\n"
+               "});\n")
+        return {f.rule_id for f in _scan({
+            "package.json": '{"name":"p","dependencies":{"express":"4.18.2"}}',
+            "app.js": app}).findings}
+
+    def test_string_built_response_is_xss(self):
+        for stmt, rule_id in {
+            "res.send('<b>' + q + '</b>');": "js-xss-res-send",
+            "res.write(`<i>${q}</i>`);": "js-xss-res-write",
+            "res.end('x' + q);": "js-xss-res-end",
+            "res.setHeader('Location', q);": "js-header-setheader",
+            "res.render(q);": "js-ssti-res-render",
+        }.items():
+            self.assertIn(rule_id, self._rules(stmt), stmt)
+
+    def test_object_and_array_responses_are_not_xss(self):
+        """Express sends these as JSON, which a browser never renders as
+        HTML. Reporting them put 18 false findings on dvws-node."""
+        for stmt in ("res.send({ a: q });", "res.send([q]);"):
+            self.assertNotIn("js-xss-res-send", self._rules(stmt), stmt)
+
+    def test_spawn_argument_array(self):
+        """`spawn('sh', ['-c', q])` puts the injection in the args array, not
+        in the program name."""
+        rules = self._rules(
+            "require('child_process').spawn('sh', ['-c', q]);")
+        self.assertIn("js-cmdi-spawn", rules)
+
+
 class TestFindingDeduplication(unittest.TestCase):
     def test_one_finding_per_rule_and_location(self):
         """A sink reached from several sources is still one line to fix."""
