@@ -1344,6 +1344,25 @@ class TestSecretsScanning(unittest.TestCase):
         self.assertLess(shannon_entropy("aaaaaaaaaaaaaaaa"), 1.0)
         self.assertNotIn("SECRET", redact("MYSUPERSECRETVALUE"))
 
+    def test_ci_and_credential_directories_are_searched(self):
+        """Hidden directories holding pipelines or credentials are scanned.
+
+        Every walker used to skip any dot-directory, which hid a token in
+        .github/workflows — one of the likeliest places to commit one.
+        """
+        line = f"aws_key: {FAKE_AWS_KEY}"
+        for rel in (".github/workflows/ci.yml", ".gitlab/ci/deploy.yml",
+                    ".circleci/config.yml", ".aws/credentials",
+                    ".docker/config.json", "svc/.github/workflows/ci.yml"):
+            self.assertIn("secret-aws-access-key-id",
+                          self._rules({rel: line}), rel)
+
+    def test_caches_and_vcs_directories_stay_skipped(self):
+        line = f"aws_key: {FAKE_AWS_KEY}"
+        for rel in (".git/config", ".venv/lib/settings.py",
+                    ".next/server/app.js", ".terraform/modules/x.tf"):
+            self.assertEqual(self._rules({rel: line}), set(), rel)
+
 
 class TestCrossCuttingScanners(unittest.TestCase):
     def test_repo_with_no_source_language_is_still_scanned(self):

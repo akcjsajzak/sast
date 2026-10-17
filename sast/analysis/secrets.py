@@ -202,13 +202,29 @@ def is_scannable(path: str) -> bool:
     return "." not in name and name in _TEXT_FILENAMES
 
 
+# Hidden directories that are searched despite the leading dot. The other
+# walkers skip every dot-directory, which is right for caches and build
+# output (.venv, .next, .terraform) but wrong here: CI pipelines live in
+# .github/.gitlab/.circleci and are among the likeliest places to find a
+# committed credential, and .aws/.docker/.kube hold credential files
+# outright. An allow-list rather than "everything but caches", because an
+# unknown tool's dot-directory is more often vendored code than config.
+_SECRET_DOT_DIRS = {
+    ".github", ".gitlab", ".circleci", ".buildkite", ".azuredevops",
+    ".azure-pipelines", ".woodpecker", ".gitea", ".forgejo", ".devcontainer",
+    ".aws", ".docker", ".kube",
+}
+
+
 def collect_scannable_files(root: str, max_bytes: int = 1024 * 1024) -> list[str]:
     from ..detection.language import IGNORED_DIRS
 
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
-            d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")
+            d for d in dirnames
+            if d not in IGNORED_DIRS
+            and (not d.startswith(".") or d.lower() in _SECRET_DOT_DIRS)
         ]
         for fname in filenames:
             path = os.path.join(dirpath, fname)

@@ -180,7 +180,10 @@ check it rather than trust it.
 ### Secrets
 
 Searched across every text file, because a credential is as dangerous in a
-README or CI config as in source. Two approaches: about 22 provider patterns
+README or CI config as in source. Hidden directories are skipped except the
+ones that hold pipelines or credentials (`.github`, `.gitlab`, `.circleci`,
+`.aws`, `.docker`, `.kube` and similar), so a token in a workflow file is
+found while `.git`, `.venv` and build caches stay out. Two approaches: about 22 provider patterns
 (AWS, GitHub, GitLab, Slack, Stripe, Google, OpenAI, Anthropic, npm, PyPI,
 SendGrid, Twilio, Azure, private keys, JWTs, database URIs) matched by their
 issuer-defined shape, plus Shannon entropy over credential-shaped assignments.
