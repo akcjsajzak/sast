@@ -23,6 +23,10 @@ from .dataflow import (
 from .lang_profile import LangProfile
 
 MAX_DEPTH = 8
+# How many implementations of one method name a call may be followed into.
+# Interface dispatch needs more than one, but a generated codebase can declare
+# the same name thousands of times, so the fan-out has to stay bounded.
+MAX_IMPLEMENTATIONS = 6
 MAX_STEPS = 15
 
 
@@ -235,12 +239,19 @@ class GenericTaintEngine:
             kids = [c for c in node.named_children if c.type not in self.p.comment]
             if not kids:
                 return node
-            # A cast names the type first and the expression second, so taking
-            # the first child turned `(char *)malloc(n)` into the type `char *`
-            # and lost the call — in C, where casting a malloc is the norm,
-            # that silently dropped the sink. The grammar's value field says
-            # which child is the expression; trust it when it exists.
-            valued = node.child_by_field_name(self.p.f_value)
+            # A wrapper that names a type first and the expression second —
+            # a C cast, a Go type conversion — strips to the type if you just
+            # take the first child, which loses the expression entirely:
+            # `(char *)malloc(n)` became `char *` and `[]byte(q)` became
+            # `[]byte`. Grammars disagree on what the expression field is
+            # called, so try the names they actually use before falling back
+            # to position.
+            valued = None
+            for field in (self.p.f_value, "operand", "argument", "expression"):
+                if field:
+                    valued = node.child_by_field_name(field)
+                    if valued is not None:
+                        break
             if valued is not None:
                 node = valued
             else:
@@ -404,10 +415,15 @@ class GenericTaintEngine:
         fn = self.strip(fn)
         if fn is None:
             return "", "", "", args
+        fn = self._unwrap_generic(fn)
         if fn.type in p.member:
             prop_node = fn.child_by_field_name(p.f_property)
-            name = _text(prop_node) if prop_node is not None else (
-                _text(fn.named_children[-1]) if fn.named_children else "")
+            if prop_node is None and fn.named_children:
+                prop_node = fn.named_children[-1]
+            # `ser.Deserialize<object>` keeps the method name inside a
+            # generic_name on the member side too, so unwrap here as well.
+            name = (_text(self._unwrap_generic(prop_node))
+                    if prop_node is not None else "")
             return name, self.root_of(fn), _text(fn), args
         return _text(fn), "", _text(fn), args
 
@@ -454,6 +470,22 @@ class GenericTaintEngine:
             merged = _merge_taint(merged, self.taint_of(a, sf, env, ctx))
         return merged if merged is not None else recv_taint
 
+    @staticmethod
+    def _unwrap_generic(fn: Node) -> Node:
+        """Drop the type arguments from a generic callee.
+
+        `ser.Deserialize<object>(x)` puts the name and its type arguments in
+        one `generic_name` node, so reading the callee's text gave
+        "Deserialize<object>" and matched no rule — every generic call was
+        invisible, which in C# includes most of the JSON and EF Core surface.
+        """
+        if fn.type != "generic_name":
+            return fn
+        for c in fn.named_children:
+            if c.type == "identifier":
+                return c
+        return fn
+
     def _receiver_node(self, call: Node):
         """The object a method call is made on, e.g. `a.b` in `a.b.c(x)`."""
         p = self.p
@@ -474,6 +506,20 @@ class GenericTaintEngine:
         sym = self.symbols.get(name)
         if sym is None:
             return None
+        result = self._invoke_symbol(sym, name, args, node, sf, env, ctx)
+        if result is not None:
+            return result
+        # The preferred implementation came back clean, but a call through an
+        # interface or a base class can land on any of them, and a flow that
+        # is injectable in one is a real flow. Only consulted when the first
+        # choice found nothing, so the common case costs nothing extra.
+        for alt in sym.get("alternatives", ()):
+            result = self._invoke_symbol(alt, name, args, node, sf, env, ctx)
+            if result is not None:
+                return result
+        return None
+
+    def _invoke_symbol(self, sym, name, args, node, sf, env, ctx):
         new_env = {}
         sig = []
         for i, pname in enumerate(sym["params"]):
@@ -777,8 +823,15 @@ def _hint(hint: str, root: str, path: str) -> bool:
 
 
 def build_symbols(files: list[SourceFile], profile: LangProfile) -> dict:
-    """Index function and method definitions by name across all files."""
+    """Index function and method definitions by name across all files.
+
+    The returned mapping holds one preferred implementation per name, and each
+    entry carries the other implementations of that name under
+    ``alternatives`` so a call through an interface can be followed into any
+    of them.
+    """
     symbols: dict = {}
+    alternatives: dict = {}
 
     def find_params(node: Node):
         """Locate the formal parameter list belonging to `node`.
@@ -794,6 +847,15 @@ def build_symbols(files: list[SourceFile], profile: LangProfile) -> dict:
         The search skips the body so a nested closure's parameters are never
         mistaken for the enclosing function's.
         """
+        # Ask the grammar first. A Go method declaration carries its receiver
+        # in a `parameter_list` too, and the receiver comes first, so scanning
+        # by node type bound the receiver's name instead of the real
+        # parameters — which is why no taint crossed into a Go method and
+        # govwa's `(p *Profile) UnsafeQueryGetData(uid string)` never saw its
+        # argument.
+        named = node.child_by_field_name(profile.f_parameters)
+        if named is not None and named.type in profile.params:
+            return named
         for c in node.named_children:
             if c.type in profile.params:
                 return c
@@ -844,6 +906,11 @@ def build_symbols(files: list[SourceFile], profile: LangProfile) -> dict:
                 names.append(_text(ident))
         return names
 
+    def self_has_body(node: Node) -> bool:
+        if node.child_by_field_name(profile.f_body) is not None:
+            return True
+        return any(c.type in profile.block for c in node.named_children)
+
     def walk(node: Node, sf: SourceFile):
         for child in node.named_children:
             if child.type in profile.function or child.type in profile.method:
@@ -852,11 +919,36 @@ def build_symbols(files: list[SourceFile], profile: LangProfile) -> dict:
                 # C/C++ wrap the name inside a declarator.
                 if name and "(" in name:
                     name = name.split("(", 1)[0].strip().lstrip("*")
-                if name and name not in symbols:
-                    symbols[name] = {"node": child, "source": sf,
-                                     "params": params_of(child)}
+                if not name:
+                    continue
+                # An interface or abstract declaration has no body, so
+                # resolving a call to it yields nothing. Indexing by bare name
+                # with first-one-wins let `IDbProvider.GetCustomerEmail` hide
+                # the implementation that actually builds the SQL, which is
+                # how a whole provider-backed data layer went untracked.
+                # Prefer a declaration that can actually be analysed.
+                entry = {"node": child, "source": sf,
+                         "params": params_of(child),
+                         "bodied": self_has_body(child)}
+                existing = symbols.get(name)
+                if existing is None or (entry["bodied"]
+                                        and not existing["bodied"]):
+                    symbols[name] = entry
+                # Keep the other implementations too. A call through an
+                # interface can dispatch to any of them, and picking one by
+                # file order meant WebGoat.NET's SQL layer resolved to a stub
+                # provider while the injectable one went unanalysed. The list
+                # is capped because a generated codebase can declare the same
+                # method name thousands of times.
+                if entry["bodied"]:
+                    others = alternatives.setdefault(name, [])
+                    if len(others) < MAX_IMPLEMENTATIONS:
+                        others.append(entry)
             walk(child, sf)
 
     for sf in files:
         walk(sf.root, sf)
+    for name, entry in symbols.items():
+        entry["alternatives"] = [e for e in alternatives.get(name, ())
+                                 if e["node"] is not entry["node"]]
     return symbols

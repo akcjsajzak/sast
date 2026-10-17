@@ -11,7 +11,7 @@ A07 = "A07:2021 — Identification and Authentication Failures"
 A10 = "A10:2021 — Server-Side Request Forgery (SSRF)"
 
 _ALL = ["sql", "cmd", "xss", "ssrf", "lfi", "path", "code", "ssti", "redirect",
-        "log", "xxe", "nosql"]
+        "log", "xxe", "nosql", "header"]
 
 
 def _sources() -> list[TaintSource]:
@@ -92,14 +92,25 @@ def _sinks() -> list[SinkRule]:
              ["sql"], arg_index=0)
 
     # Path traversal
-    for m in ("Open", "OpenFile", "ReadFile", "WriteFile", "Create", "Remove",
-              "RemoveAll", "Rename", "Mkdir", "MkdirAll"):
-        sink(f"go-path-{m.lower()}", m, f"Path traversal via os.{m}()", "high",
-             "CWE-22", A01, "path-traversal",
-             "An attacker-controlled path allows access outside the intended "
-             "directory.",
-             "Clean the path and verify it stays within an allow-listed root.",
-             ["path", "lfi"], arg_index=0, obj_hint="os")
+    # The same file operations live in both `os` and the older `io/ioutil`,
+    # and obj_hint takes one substring, so each package needs its own rule —
+    # hinting only on `os` meant `ioutil.WriteFile(userPath, ...)` was missed.
+    for pkg in ("os", "ioutil"):
+        for m in ("Open", "OpenFile", "ReadFile", "WriteFile", "Create",
+                  "Remove", "RemoveAll", "Rename", "Mkdir", "MkdirAll",
+                  "ReadDir", "TempFile"):
+            # The os rules keep their original ids; renaming them would
+            # invalidate anyone's existing suppressions.
+            rid = (f"go-path-{m.lower()}" if pkg == "os"
+                   else f"go-path-{pkg}-{m.lower()}")
+            sink(rid, m,
+                 f"Path traversal via {pkg}.{m}()", "high",
+                 "CWE-22", A01, "path-traversal",
+                 "An attacker-controlled path allows access outside the "
+                 "intended directory.",
+                 "Clean the path and verify it stays within an allow-listed "
+                 "root.",
+                 ["path", "lfi"], arg_index=0, obj_hint=pkg)
     for m in ("ServeFile", "Dir"):
         sink(f"go-path-{m.lower()}", m, f"Path traversal via http.{m}()", "high",
              "CWE-22", A01, "path-traversal",
@@ -127,6 +138,28 @@ def _sinks() -> list[SinkRule]:
              "contextual escaping.",
              "Render through html/template, which escapes by context.",
              ["xss"], obj_hint="w", confidence="medium")
+    # The fmt family takes the writer as its first argument rather than as a
+    # receiver, so a rule hinted on `w` never matched `fmt.Fprintf(w, ...)`.
+    for m in ("Fprintf", "Fprint", "Fprintln"):
+        sink(f"go-xss-fmt-{m.lower()}", m,
+             f"Reflected XSS via fmt.{m}() to the response", "medium",
+             "CWE-79", A03, "xss",
+             "Untrusted data is formatted into the HTTP response without "
+             "contextual escaping.",
+             "Render through html/template, which escapes by context.",
+             ["xss"], obj_hint="fmt", confidence="medium")
+    # http.Header.Set/Add take a header value that is never escaped. A CR or
+    # LF in it splits the response, and a tainted Location is an open redirect.
+    for m in ("Set", "Add"):
+        sink(f"go-header-{m.lower()}", m,
+             f"HTTP response header injection via Header.{m}()", "high",
+             "CWE-113", A03, "header-injection",
+             "An attacker-controlled header value can carry CR/LF and inject "
+             "further headers or a response body; a Location built this way "
+             "is also an open redirect.",
+             "Strip CR and LF from the value, and allow-list redirect targets.",
+             ["header", "redirect", "xss"], arg_index=1, obj_hint="header",
+             confidence="medium")
     sink("go-ssti-parse", "Parse", "Server-side template injection", "high",
          "CWE-1336", A03, "ssti",
          "A template parsed from attacker-controlled input can execute "

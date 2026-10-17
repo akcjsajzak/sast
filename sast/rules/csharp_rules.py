@@ -31,6 +31,15 @@ def _sources() -> list[TaintSource]:
             kind="call", match=m, tags=_ALL, obj_hint="request",
             description=f"Untrusted data from the HTTP request body ({m}())",
         ))
+    # Classic ASP.NET reads a parameter straight off the request object:
+    # `Request["city"]`, which has no member name at all — it is an indexer.
+    # Without the request itself as a source, that whole form was invisible,
+    # and it is the shape most WebForms code uses.
+    for kind in ("identifier", "member"):
+        s.append(TaintSource(
+            kind=kind, match="Request", tags=_ALL,
+            description="Untrusted data from the HTTP request object",
+        ))
     s.append(TaintSource(
         kind="member", match="Value", tags=_ALL, obj_hint="routedata",
         description="Untrusted data from a route value",
@@ -60,12 +69,14 @@ def _sinks() -> list[SinkRule]:
     k: list[SinkRule] = []
 
     def sink(rid, match, title, severity, cwe, owasp, category, desc, fix, tags,
-             arg_index=-1, obj_hint=None, confidence="high", kind="call"):
+             arg_index=-1, obj_hint=None, confidence="high", kind="call",
+             receiver_tainted=False):
         k.append(SinkRule(rule_id=rid, kind=kind, match=match, title=title,
                           severity=severity, cwe=cwe, owasp=owasp,
                           category=category, description=desc, remediation=fix,
                           tags=tags, arg_index=arg_index, obj_hint=obj_hint,
-                          confidence=confidence))
+                          confidence=confidence,
+                          receiver_tainted=receiver_tainted))
 
     # SQL
     for m in ("ExecuteReader", "ExecuteNonQuery", "ExecuteScalar",
@@ -77,11 +88,28 @@ def _sinks() -> list[SinkRule]:
              "passed as a parameter.",
              "Use SqlParameter / FromSqlInterpolated with bound values.",
              ["sql"], arg_index=0)
-    sink("cs-sqli-sqlcommand", "SqlCommand", "SQL injection via SqlCommand",
-         "high", "CWE-89", A03, "sql-injection",
-         "The command text is built from untrusted data.",
-         "Use parameterised commands with SqlParameter.",
-         ["sql"], arg_index=0)
+    # Every ADO.NET provider ships its own command and adapter class, and the
+    # name is the only thing that differs. Matching `SqlCommand` alone meant a
+    # MySQL or Postgres application — WebGoat.NET included — had none of its
+    # SQL sinks recognised.
+    for prefix in ("Sql", "MySql", "Npgsql", "SQLite", "Sqlite", "Oracle",
+                   "OleDb", "Odbc", "Db", "Firebird", "Fb"):
+        for suffix in ("Command", "DataAdapter"):
+            cls = prefix + suffix
+            sink(f"cs-sqli-{cls.lower()}", cls,
+                 f"SQL injection via {cls}", "high", "CWE-89", A03,
+                 "sql-injection",
+                 "The command text is built from untrusted data.",
+                 "Use parameterised commands with a provider parameter type.",
+                 ["sql"], arg_index=0)
+    for helper in ("ExecuteDataset", "ExecuteDataRow", "ExecuteReader",
+                   "ExecuteNonQuery", "ExecuteScalar"):
+        sink(f"cs-sqli-helper-{helper.lower()}", helper,
+             f"SQL injection via a SQL helper ({helper}())", "high", "CWE-89",
+             A03, "sql-injection",
+             "The statement passed to the helper is built from untrusted data.",
+             "Use parameterised commands with bound values.",
+             ["sql"], obj_hint="helper")
 
     # Command injection
     for m in ("Start",):
@@ -147,12 +175,83 @@ def _sinks() -> list[SinkRule]:
          "The redirect target comes from attacker-controlled input.",
          "Use LocalRedirect, or validate against an allow-list.",
          ["redirect"], arg_index=0)
-    sink("cs-xxe-load", "Load", "XML external entity processing", "high",
-         "CWE-611", A05, "xxe",
-         "Loading untrusted XML with a resolver that honours external entities "
-         "exposes local files and internal services.",
-         "Set XmlResolver = null and DtdProcessing = Prohibit.",
-         ["xxe"], arg_index=0, obj_hint="xml", confidence="medium")
+    for m in ("Load", "LoadXml", "XmlReader"):
+        sink(f"cs-xxe-{m.lower()}", m, "XML external entity processing", "high",
+             "CWE-611", A05, "xxe",
+             "Loading untrusted XML with a resolver that honours external "
+             "entities exposes local files and internal services.",
+             "Set XmlResolver = null and DtdProcessing = Prohibit.",
+             ["xxe"], arg_index=0, confidence="medium")
+
+    # An ADO.NET command carries its statement from the constructor or the
+    # CommandText property, and the execute call then takes no arguments at
+    # all — so the taint is in the receiver, not in an argument, and an
+    # argument-indexed rule could never match `cmd.ExecuteReader()`.
+    for m in ("ExecuteReader", "ExecuteNonQuery", "ExecuteScalar",
+              "ExecuteReaderAsync", "ExecuteNonQueryAsync",
+              "ExecuteScalarAsync"):
+        sink(f"cs-sqli-cmd-{m.lower()}", m,
+             f"SQL injection via a command built from untrusted data ({m}())",
+             "high", "CWE-89", A03, "sql-injection",
+             "The command this executes was built by concatenating untrusted "
+             "data into its statement text.",
+             "Use parameterised commands with SqlParameter.",
+             ["sql"], receiver_tainted=True)
+    sink("cs-sqli-commandtext", "CommandText",
+         "SQL injection via CommandText", "high", "CWE-89", A03,
+         "sql-injection",
+         "The statement assigned to CommandText is built from untrusted data.",
+         "Use parameterised commands with SqlParameter.",
+         ["sql"], kind="property_assign")
+
+    # XPath injection
+    for m in ("SelectSingleNode", "SelectNodes", "XPathSelectElement",
+              "XPathSelectElements", "Compile", "Evaluate"):
+        sink(f"cs-xpathi-{m.lower()}", m, "XPath injection", "high",
+             "CWE-643", A03, "xpath-injection",
+             "The XPath expression is built from untrusted data, so the query "
+             "can be rewritten to select data it should not reach.",
+             "Pass the value as an XPath variable rather than concatenating it.",
+             ["xpath", "sql"], arg_index=0)
+
+    # Path traversal through the stream constructors and the WebForms helper
+    # that maps a request-supplied path onto the filesystem.
+    for m in ("StreamReader", "StreamWriter", "FileStream", "FileInfo",
+              "MapPath", "OpenText", "CreateText", "AppendText"):
+        sink(f"cs-path-{m.lower()}", m, f"Path traversal via {m}()", "high",
+             "CWE-22", A01, "path-traversal",
+             "An attacker-controlled path allows access outside the intended "
+             "directory.",
+             "Resolve the path and verify it stays within an allow-listed root.",
+             ["path", "lfi"], arg_index=0)
+
+    # Response header injection / open redirect
+    for m in ("AppendHeader", "AddHeader"):
+        sink(f"cs-header-{m.lower()}", m,
+             "HTTP response header injection", "high", "CWE-113", A03,
+             "header-injection",
+             "An attacker-controlled header value can carry CR/LF and inject "
+             "further headers or a response body; a Location built this way "
+             "is also an open redirect.",
+             "Strip CR and LF from the value, and allow-list redirect targets.",
+             ["redirect", "xss"], arg_index=1, confidence="medium")
+
+    # Loading code chosen by untrusted input
+    for m in ("LoadFrom", "LoadFile", "UnsafeLoadFrom", "CreateInstance",
+              "GetType"):
+        sink(f"cs-code-{m.lower()}", m,
+             f"Code loaded from untrusted input via {m}()", "high", "CWE-470",
+             A08, "unsafe-reflection",
+             "The assembly or type to load is chosen by attacker-controlled "
+             "data, which decides what code runs.",
+             "Map the input through a fixed allow-list of types.",
+             ["code"], arg_index=0, confidence="medium")
+    sink("cs-code-assembly-load", "Load",
+         "Assembly loaded from untrusted input", "high", "CWE-470", A08,
+         "unsafe-reflection",
+         "The assembly to load is chosen by attacker-controlled data.",
+         "Map the input through a fixed allow-list.",
+         ["code"], arg_index=0, obj_hint="assembly", confidence="medium")
     return k
 
 
