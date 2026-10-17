@@ -49,8 +49,20 @@ It also surfaced a recurring failure mode worth naming: **a rule that cannot
 fire at all.** PHP's `mail()` asked for an `email` tag no source produced, Go's
 `ioutil` and `fmt.Fprintf` rules hinted on a receiver those calls never have,
 and the JS header rules needed a `header` tag that did not exist. Each looked
-complete in the rule file and detected nothing. A rule whose tags or hints
-cannot be satisfied is invisible without a probe.
+complete in the rule file and detected nothing.
+
+`TestRuleSetConsistency` now catches the mechanically detectable half of this
+— an unreachable tag, a kind no engine dispatches on, a regex that does not
+compile, a rule id used twice — so probes no longer have to rediscover it. It
+found three duplicate ids the moment it was written, two of them pre-existing:
+`js-nosqli-where` was two rules with one identity (the list held `$where` and
+`where`, which collapse when the `$` is stripped), and `js-proto-defaultsdeep`
+and `cs-sqli-sqlitecommand` were each declared twice. A report or a suppression
+could only ever have meant one of the pair.
+
+**An unsatisfiable `obj_hint` is the half still not covered**, since hints are
+matched against receiver text at scan time. That is what hid the Go `ioutil`
+and `fmt` rules, and only a probe finds it.
 
 ## OWASP Benchmark
 
@@ -257,13 +269,13 @@ out-of-bounds indexing.
 
 ## State of the tree
 
-`python3 -m unittest tests.test_sast` — 239 tests, all passing. 48 of them are
+`python3 -m unittest tests.test_sast` — 243 tests, all passing. 52 of them are
 new and cover every shape this work fixed: the Python propagation shapes, the
 C parameter and out-parameter handling, the Java constant folding in both
 directions, the Go and C# probe shapes, configured crypto, finding
 deduplication, numeric taint through arithmetic, same-named functions in
 separate files, the PHP and JavaScript probe shapes, and the memory-safety
-checker including its negative cases.
+checker including its negative cases, plus the rule-set consistency checks.
 
 I checked these actually fail without the fixes rather than trusting that they
 passed: reverting the Go parameter binding and the Java braceless-branch walk
