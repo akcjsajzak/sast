@@ -8,6 +8,7 @@ from typing import Callable, Optional
 
 from .advisory.analyzer import analyze_dependencies
 from .advisory.db import load_seed_db
+from .analysis.authz import scan_authz
 from .analysis.blade import scan_blade
 from .analysis.config_scan import (collect_config_files, load_properties,
                                    scan_configs)
@@ -74,6 +75,11 @@ class ScanOptions:
     # Called with a human-readable phase message as the scan progresses, so a
     # CLI can print it and a server can store or stream it. None silences it.
     progress: Optional[Callable[[str], None]] = None
+    # Broken-access-control candidates (IDOR, missing authorisation). Off by
+    # default and deliberately so: they trade precision for recall, which is
+    # what an auditor wants reading a report once and what nobody wants
+    # failing a build. See sast/analysis/authz.py.
+    audit: bool = False
 
 
 class ScanEngine:
@@ -276,23 +282,25 @@ class ScanEngine:
             findings = engine.analyze(parsed)
             if framework == "Laravel":
                 findings.extend(scan_blade(blade_files))
-            return (findings, len(parsed), unreadable,
-                    scan_routes(parsed, language, framework, root))
+            routes, extra = self._surface(parsed, language, framework, root)
+            return findings + extra, len(parsed), unreadable, routes
 
         if language == "java":
             parsed, unreadable = self._parse_all(JavaParser(), source_files)
             symbols = build_java_symbols(parsed)
             engine = JavaTaintEngine(symbols, rules, framework, language,
                                      properties=self._properties)
-            return (engine.analyze(parsed), len(parsed), unreadable,
-                    scan_routes(parsed, language, framework, root))
+            found = engine.analyze(parsed)
+            routes, extra = self._surface(parsed, language, framework, root)
+            return found + extra, len(parsed), unreadable, routes
 
         if language == "javascript":
             parsed, unreadable = self._parse_all(JsParser(), source_files)
             symbols = build_js_symbols(parsed)
             engine = JsTaintEngine(symbols, rules, framework, language)
-            return (engine.analyze(parsed), len(parsed), unreadable,
-                    scan_routes(parsed, language, framework, root))
+            found = engine.analyze(parsed)
+            routes, extra = self._surface(parsed, language, framework, root)
+            return found + extra, len(parsed), unreadable, routes
 
         # Python, Go, C#, C and C++ share one engine, configured by profile.
         profile = PROFILES.get(language)
@@ -310,10 +318,24 @@ class ScanEngine:
             # wherever its value came from.
             if language in ("c", "cpp"):
                 findings.extend(scan_memory_safety(parsed, language))
-            return (findings, len(parsed), unreadable,
-                    scan_routes(parsed, language, framework, root))
+            routes, extra = self._surface(parsed, language, framework, root)
+            return findings + extra, len(parsed), unreadable, routes
 
         return [], 0, 0, []
+
+    def _surface(self, parsed, language, framework, root):
+        """Routes for one language, plus the access-control candidates.
+
+        Both read the same trees the taint engine just built. The authz pass
+        needs the routes as well as the files, because deciding that an
+        unguarded route is anomalous means knowing whether its neighbours
+        are guarded.
+        """
+        routes = scan_routes(parsed, language, framework, root)
+        extra: list = []
+        if self.options.audit:
+            extra = scan_authz(parsed, routes, language, framework)
+        return routes, extra
 
     @staticmethod
     def _parse_all(parser, paths):

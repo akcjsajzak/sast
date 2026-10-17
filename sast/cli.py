@@ -48,6 +48,7 @@ def cmd_scan(args) -> int:
         scan_dependencies=enabled("deps"),
         reachability=not args.no_reachability,
         progress=None if args.quiet else _stderr_progress,
+        audit=args.audit,
     )
     engine = ScanEngine(options)
     result = engine.scan(args.path)
@@ -201,6 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip reachability analysis for dependencies")
     p_scan.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress progress output")
+    p_scan.add_argument("--audit", action="store_true",
+                        help="Also report broken-access-control candidates "
+                             "(IDOR, missing authorization). These trade "
+                             "precision for recall and need manual triage, "
+                             "so they are off by default and unsuitable for "
+                             "a build gate")
     p_scan.add_argument("--ignore-unreachable", action="store_true",
                         help="Omit vulnerable dependencies that no first-party "
                              "code imports")

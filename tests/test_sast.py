@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -2785,6 +2786,130 @@ class TestEntryPointBinding(unittest.TestCase):
         self.assertTrue(reqs)
         self.assertTrue(any("<command-injection payload>" in r for r in reqs))
 
+
+
+class TestBrokenAccessControl(unittest.TestCase):
+    """IDOR and missing-authorisation candidates (--audit only).
+
+    These deliberately trade precision for recall, so the tests pin both
+    directions: the shapes taken from real applications must be found, and
+    the shapes that make code *correct* — scoping a query to the session,
+    a login route that is public by design — must stay silent. Every
+    positive case here is reduced from an actual lab (NodeGoat
+    allocations, dvna userEditSubmit, govwa idor1ActionHandler).
+    """
+
+    def _audit(self, files, extra=None):
+        tmp = tempfile.mkdtemp()
+        for rel, content in {**files, **(extra or {})}.items():
+            path = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        return ScanEngine(ScanOptions(audit=True)).scan(tmp)
+
+    def _idor(self, files, extra=None):
+        return [f for f in self._audit(files, extra).findings
+                if f.rule_id == "authz-idor-candidate"]
+
+    def test_off_unless_audit_is_asked_for(self):
+        """A default scan must never emit these: they are not gate-grade."""
+        files = {"h.js": "module.exports.edit = function (req, res) {\n"
+                         "  db.User.find({ where: { id: req.body.id } });\n};\n"}
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "h.js"), "w") as fh:
+            fh.write(files["h.js"])
+        with open(os.path.join(tmp, "package.json"), "w") as fh:
+            fh.write('{"dependencies":{"express":"4.0.0"}}')
+        plain = ScanEngine(ScanOptions()).scan(tmp)
+        self.assertEqual(
+            [f for f in plain.findings if f.rule_id.startswith("authz-")], [])
+        audited = ScanEngine(ScanOptions(audit=True)).scan(tmp)
+        self.assertTrue(
+            [f for f in audited.findings if f.rule_id == "authz-idor-candidate"])
+
+    def test_destructured_path_param_reaching_a_dao(self):
+        """NodeGoat: `const { userId } = req.params` into a DAO lookup."""
+        found = self._idor({"a.js":
+            "module.exports.show = (req, res) => {\n"
+            "  const { userId } = req.params;\n"
+            "  allocationsDAO.getByUserIdAndThreshold(userId, 1, cb);\n"
+            "};\n"},
+            {"package.json": '{"dependencies":{"express":"4.0.0"}}'})
+        self.assertTrue(found)
+        self.assertIn("userId", found[0].description)
+
+    def test_body_id_reaching_a_write_is_high(self):
+        """dvna userEditSubmit: body id selects the row that gets rewritten."""
+        found = self._idor({"h.js":
+            "module.exports.userEditSubmit = function (req, res) {\n"
+            "  db.User.update({ name: req.body.name }, "
+            "{ where: { id: req.body.id } });\n"
+            "};\n"},
+            {"package.json": '{"dependencies":{"express":"4.0.0"}}'})
+        self.assertTrue(found)
+        self.assertEqual(found[0].severity.value, "high")
+
+    def test_session_reference_only_lowers_confidence(self):
+        """govwa compares the submitted id against a cookie, not the session.
+
+        A handler that touches the session may still be wrong, so it is
+        reported quietly rather than cleared — that case was found in the
+        wild and is the reason this is not a silencing condition.
+        """
+        found = self._idor({"h.js":
+            "module.exports.save = function (req, res) {\n"
+            "  const who = req.session.user;\n"
+            "  const uid = req.body.uid;\n"
+            "  if (uid !== req.cookies.uid) return;\n"
+            "  profile.updateProfile(uid, req.body.name);\n"
+            "};\n"},
+            {"package.json": '{"dependencies":{"express":"4.0.0"}}'})
+        self.assertTrue(found)
+        self.assertEqual(found[0].confidence, "low")
+
+    def test_non_identifier_parameters_are_not_candidates(self):
+        """BenchmarkJava reads a parameter and runs SQL 2740 times over.
+
+        None of it is IDOR, and what keeps it out is that the parameters are
+        not named like object identifiers. If this stops holding, the check
+        becomes unusable on any large application.
+        """
+        found = self._idor({"h.js":
+            "module.exports.search = function (req, res) {\n"
+            "  db.Product.findAll({ where: { name: req.query.keyword } });\n"
+            "};\n"},
+            {"package.json": '{"dependencies":{"express":"4.0.0"}}'})
+        self.assertEqual(found, [])
+
+    def test_no_data_access_is_not_a_candidate(self):
+        found = self._idor({"h.js":
+            "module.exports.echo = function (req, res) {\n"
+            "  res.send('id is ' + req.query.id);\n"
+            "};\n"},
+            {"package.json": '{"dependencies":{"express":"4.0.0"}}'})
+        self.assertEqual(found, [])
+
+    def test_public_by_design_routes_are_not_missing_authz(self):
+        """A login form nobody can reach without logging in is not a bug."""
+        res = self._audit({"r.js":
+            "router.post('/login', authCtl.login);\n"
+            "router.post('/items', requireAuth, itemCtl.create);\n"
+            "router.post('/orders', requireAuth, orderCtl.create);\n"},
+            {"package.json": '{"dependencies":{"express":"4.0.0"}}'})
+        paths = [f.description for f in res.findings
+                 if f.rule_id == "authz-missing-check"]
+        self.assertFalse([p for p in paths if "/login" in p], paths)
+
+    def test_missing_authz_needs_guarded_neighbours(self):
+        """An app that guards nothing gets one conclusion, not N findings."""
+        res = self._audit({"r.js":
+            "router.post('/a', ctl.a);\n"
+            "router.post('/b', ctl.b);\n"
+            "router.post('/c', ctl.c);\n"},
+            {"package.json": '{"dependencies":{"express":"4.0.0"}}'})
+        self.assertEqual(
+            [f for f in res.findings if f.rule_id == "authz-missing-check"], [])
 
 
 class TestRuleSetConsistency(unittest.TestCase):

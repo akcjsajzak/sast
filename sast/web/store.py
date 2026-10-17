@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS scans (
     error         TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS scans_created ON scans (created_at DESC);
+-- One triage verdict per finding per scan. Keyed on the finding's
+-- fingerprint rather than its position, so a verdict survives a re-scan
+-- that shifts line numbers.
+CREATE TABLE IF NOT EXISTS triage (
+    scan_id    TEXT NOT NULL,
+    finding_id TEXT NOT NULL,
+    verdict    TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (scan_id, finding_id)
+);
 """
 
 
@@ -165,6 +175,51 @@ class ScanStore:
             self._conn.execute(
                 "UPDATE scans SET progress=? WHERE id=?", (message, scan_id))
             self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Triage verdicts
+    VERDICTS = ("real", "investigate", "false")
+
+    def triage(self, scan_id: str) -> dict:
+        """Every verdict recorded against one scan's findings."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT finding_id, verdict FROM triage WHERE scan_id=?",
+                (scan_id,),
+            ).fetchall()
+        return {row["finding_id"]: row["verdict"] for row in rows}
+
+    def set_triage(self, scan_id: str, verdicts: dict) -> int:
+        """Record or clear verdicts. An empty verdict removes the row.
+
+        Unknown verdict values are dropped rather than stored: the column
+        feeds a UI that only understands three states, and a request is not
+        a reason to put a fourth one in the database.
+        """
+        written = 0
+        with self._lock:
+            for finding_id, verdict in (verdicts or {}).items():
+                if not isinstance(finding_id, str) or not finding_id:
+                    continue
+                if len(finding_id) > 128:
+                    continue
+                if verdict in (None, ""):
+                    self._conn.execute(
+                        "DELETE FROM triage WHERE scan_id=? AND finding_id=?",
+                        (scan_id, finding_id))
+                    written += 1
+                    continue
+                if verdict not in self.VERDICTS:
+                    continue
+                self._conn.execute(
+                    "INSERT INTO triage (scan_id, finding_id, verdict, updated_at)"
+                    " VALUES (?,?,?,?) ON CONFLICT(scan_id, finding_id)"
+                    " DO UPDATE SET verdict=excluded.verdict,"
+                    " updated_at=excluded.updated_at",
+                    (scan_id, finding_id, verdict, _now()))
+                written += 1
+            self._conn.commit()
+        return written
 
     def fail(self, scan_id: str, error: str) -> None:
         with self._lock:

@@ -84,6 +84,11 @@ class Route:
     # The handler body, for tying findings to this route. Set once the
     # handler is resolved; (file, start_line, end_line).
     body: tuple = ()
+    # False when the route is a directly-requestable file rather than a
+    # declaration. It matters for anything reasoning about guards: a file
+    # route has no declaration site, so "no guard written here" is vacuous
+    # rather than suspicious.
+    declared: bool = True
 
     @property
     def open(self) -> bool:
@@ -110,6 +115,7 @@ class Route:
             "params": self.params,
             "guards": self.guards,
             "guarded": not self.open,
+            "declared": self.declared,
         }
 
 
@@ -323,12 +329,31 @@ def _body_span(node, path: str) -> tuple:
 
 
 def _is_guard(name: str) -> bool:
+    """True when an identifier names an authorisation check.
+
+    Judged on the *last* segment first. Testing the whole dotted name meant
+    `authHandler.isAuthenticated` matched the `authhandler` exception —
+    written to keep a controller called `authHandler` from reading as its own
+    guard — and dvna's entire authenticated surface was reported as open. The
+    namespace is only consulted when the tail carries no signal of its own,
+    so `auth.check(...)` still counts.
+    """
     low = name.lower().lstrip("@#[").rstrip("]")
     if not low:
         return False
-    if any(low == e or low.startswith(e) for e in GUARD_EXCEPTIONS):
+    tail = re.split(r"[.:>\-]+", low)[-1] or low
+
+    def excepted(value: str) -> bool:
+        return any(value == e or value.startswith(e) for e in GUARD_EXCEPTIONS)
+
+    def hinted(value: str) -> bool:
+        return any(hint in value for hint in GUARD_HINTS)
+
+    if excepted(tail):
         return False
-    return any(hint in low for hint in GUARD_HINTS)
+    if hinted(tail):
+        return True
+    return hinted(low) and not excepted(low)
 
 
 def _guards_in(names) -> list:
@@ -750,15 +775,22 @@ def _file_routes(sf, framework: str, language: str, root: str) -> list:
     ))
     guards = _guards_in(re.findall(r"(?:require|include)(?:_once)?\s*\(?\s*"
                                    r"['\"]([\w./-]+)['\"]", text))
-    guards += [m for m in re.findall(r"\b(\w*(?:is_?logged_?in|check_?auth|"
-                                     r"require_?login|is_?admin)\w*)\s*\(",
-                                     text, re.I)]
+    # A page that is served directly enforces its own access control in its
+    # body, not at a declaration. DVWA writes
+    # `dvwaPageStartup( array( 'authenticated' ) )`, where neither the
+    # function name nor an include carries the signal — the argument does.
+    # Reading only include names reported 163 of its 169 pages as open.
+    guards += re.findall(
+        r"\b(\w*(?:authenticat|authoris|authoriz|is_?logged_?in|"
+        r"check_?auth|require_?login|must_?login|ensure_?login|"
+        r"login_?required|is_?admin)\w*)\b", text, re.I)[:3]
     return [Route(
         method=methods[0] if len(methods) == 1 else (ANY if not methods else "GET,POST"),
         path=url, handler=os.path.basename(rel),
         file=sf.path, line=1, framework=framework, language=language,
         params=params, guards=list(dict.fromkeys(guards)),
-        body=(sf.path, 1, max(1, text.count("\n") + 1)))]
+        body=(sf.path, 1, max(1, text.count("\n") + 1)),
+        declared=False)]
 
 
 def _chained_guards(routes: list, sf) -> None:

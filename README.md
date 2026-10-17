@@ -133,6 +133,34 @@ live in a servlet filter, a security config, a reverse proxy or a gateway,
 none of which is visible at the route declaration — so absence of a detected
 guard is a lead to check, not a conclusion.
 
+### Broken access control (opt-in: `--audit`)
+
+OWASP A01 is the largest category in the Top 10 and the one taint analysis
+cannot reach: the code is dangerous for what it *fails* to do, so there is no
+sink. What is tractable is the shape of the omission, and `--audit` reports
+two of them as **candidates for a human to triage**, never as conclusions:
+
+- **IDOR** — an object identifier the client supplies is used to read or
+  write that object. Reported higher when nothing in the handler consults the
+  logged-in user, and lower when it does, because a handler that reads the
+  session may still compare against the wrong thing.
+- **Missing authorization** — a state-changing route with no guard, where
+  neighbouring routes declared alongside it *do* have one. The inconsistency
+  is the signal; an application that guards nothing is not reported at all.
+
+This is off by default and deliberately so. It trades precision for recall,
+which is what an auditor reading a report once wants, and the opposite of
+what belongs in a build gate — so `--audit` keeps it out of CI by
+construction.
+
+Measured by hand against the known labs: it finds the IDOR in NodeGoat
+allocations and benefits, dvna's `modifyProductSubmit` and `userEditSubmit`,
+govwa's `idor1`/`idor2`, and all three unscoped note operations in
+dvws-node, plus the unauthenticated `POST /v2/admin/create-user` whose
+neighbours all carry `validateToken`. BenchmarkJava's 2740 servlets produce
+none, which is the point: they read parameters and run SQL all day, but
+their parameters are not named like object identifiers.
+
 ### Dependencies
 
 `composer.lock`, `pom.xml`/`build.gradle`, and `package-lock.json`/`yarn.lock`/
@@ -326,6 +354,13 @@ The limits are documented rather than hidden:
   smart pointers, so it says nothing about C++ allocation. Covering it needs
   a correct-C++ corpus to measure false positives against first; guessing
   without one is how a checker becomes noise.
+- Access-control candidates (`--audit`) are heuristics, not proofs. They
+  miss an ownership check written somewhere this cannot follow, and they
+  miss an IDOR whose parameter is not named like an identifier — the filter
+  that keeps BenchmarkJava quiet also hides anything called `q` or `ref2`.
+  The missing-authorization half compares routes declared in the same
+  directory, so an application split across several trees is judged in
+  parts.
 - Route extraction reads static declarations. Routes built by a loop, a
   factory or a plugin registry are missed, and a handler whose name is
   defined in several files is left unbound rather than tied to the wrong one
@@ -354,5 +389,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-262 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+270 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.

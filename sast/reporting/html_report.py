@@ -136,11 +136,44 @@ def render_html(result: ScanResult) -> str:
         meta_items=meta_items,
         summary=summary,
         surface=_surface_section(result.routes, root),
+        categories=_category_section(findings),
         total=total_cards,
         finding_count=len(findings),
         dep_count=len(deps),
         rows=finding_rows,
         dep_rows=dep_rows,
+    )
+
+
+def _category_section(findings: list) -> str:
+    """A toggle per rule category, every one of them on to begin with.
+
+    A report mixes concerns that different people act on — injection,
+    memory safety, access control, misconfiguration — and an auditor
+    usually wants one of them at a time. These are independent toggles
+    rather than a single-choice filter, because narrowing to two related
+    categories is the common move and a radio button cannot express it.
+    """
+    counts: dict = {}
+    for f in findings:
+        key = f.category or "uncategorised"
+        counts[key] = counts.get(key, 0) + 1
+    if len(counts) < 2:
+        # One category is not a choice, and an empty row is just clutter.
+        return ""
+    chips = "".join(
+        f'<button type="button" class="tbtn catchip on" '
+        f'data-cat-filter="{_esc(name)}">{_esc(name)} '
+        f'<span class="catn">{n}</span></button>'
+        for name, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+    return (
+        '<div id="cat-bar">'
+        '<span class="lbl">Category</span>'
+        f'{chips}'
+        '<button type="button" class="tbtn" id="cat-all">All</button>'
+        '<button type="button" class="tbtn" id="cat-none">None</button>'
+        '</div>'
     )
 
 
@@ -191,6 +224,28 @@ def _stat_card(key: str, label: str, count: int, active: bool = False) -> str:
 # ---------------------------------------------------------------------------
 # Finding card
 # ---------------------------------------------------------------------------
+# The three verdicts a reviewer can record against a finding. Kept to three
+# on purpose: a triage pass answers "is this real", and a longer list turns
+# a decision into a taxonomy exercise.
+TRIAGE_STATES = (
+    ("real", "Real", "A confirmed issue"),
+    ("investigate", "To investigate", "Needs more work before a verdict"),
+    ("false", "False positive", "Not an issue here"),
+)
+
+_TRIAGE_CONTROL = (
+    '<div class="triage" role="group" aria-label="Triage">'
+    '<span class="lbl">Triage</span>'
+    + "".join(
+        f'<button type="button" class="tbtn tb-{key}" data-triage-set="{key}" '
+        f'title="{desc}">{label}</button>'
+        for key, label, desc in TRIAGE_STATES)
+    + '<button type="button" class="tbtn tb-clear" data-triage-set="" '
+      'title="Clear the verdict">Clear</button>'
+      '</div>'
+)
+
+
 def _finding_card(i: int, f, root: str) -> str:
     sink_loc = f"{_rel(root, f.location.file)}:{_esc(f.location.line)}"
 
@@ -224,7 +279,9 @@ def _finding_card(i: int, f, root: str) -> str:
     trace = _trace_timeline(f, root)
 
     return f"""
-    <article class="finding" data-sev="{_esc(f.severity.value)}">
+    <article class="finding" data-sev="{_esc(f.severity.value)}"
+             data-cat="{_esc(f.category)}"
+             data-fid="{_esc(f.fingerprint(root))}" data-triage="">
       <div class="accent sev-bar-{_esc(f.severity.value)}"></div>
       <div class="finding-main">
         <header class="fh">
@@ -236,6 +293,7 @@ def _finding_card(i: int, f, root: str) -> str:
           <div class="sink mono"><span class="lbl">Sink</span>{sink_loc}</div>
           {entry}
           <div class="chips">{chips}</div>
+          {_TRIAGE_CONTROL}
         </header>
         <div class="fb">
           <p class="desc">{_esc(f.description)}</p>
@@ -546,6 +604,38 @@ h2.sec .n {{
 .rt-h {{ color:var(--muted-2); }}
 .rt-f {{ color:var(--muted-2); font-size:11px; word-break:break-all; }}
 
+/* Triage */
+.triage {{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:9px; }}
+.tbtn {{
+  font:inherit; font-size:11px; font-weight:600; cursor:pointer;
+  padding:3px 9px; border-radius:7px; border:1px solid var(--border);
+  background:var(--chip-bg); color:var(--muted-2); transition:all .12s;
+}}
+.tbtn:hover {{ border-color:var(--muted-2); color:var(--fg); }}
+.tb-clear {{ opacity:.55; }}
+.finding[data-triage="real"] .tb-real {{
+  background:rgba(239,68,68,.16); border-color:#ef4444; color:#ef4444; }}
+.finding[data-triage="investigate"] .tb-investigate {{
+  background:rgba(245,158,11,.16); border-color:#f59e0b; color:#f59e0b; }}
+.finding[data-triage="false"] .tb-false {{
+  background:rgba(100,116,139,.18); border-color:#64748b; color:#64748b; }}
+/* A dismissed finding stays readable but stops competing for attention. */
+.finding[data-triage="false"] .finding-main {{ opacity:.55; }}
+.finding[data-triage="false"] .title {{ text-decoration:line-through; }}
+.tnote {{ font-size:11.5px; color:var(--muted-2); margin-left:2px; }}
+#triage-bar {{
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  margin:0 0 14px; font-size:12px; color:var(--muted-2);
+}}
+#triage-bar .tbtn.on {{ border-color:var(--muted-2); color:var(--fg); }}
+#cat-bar {{
+  display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+  margin:0 0 10px; font-size:12px; color:var(--muted-2);
+}}
+.catchip {{ opacity:.45; }}
+.catchip.on {{ opacity:1; border-color:var(--muted-2); color:var(--fg); }}
+.catn {{ opacity:.65; font-weight:500; }}
+
 .reach {{
   display:flex; align-items:baseline; gap:9px; flex-wrap:wrap;
   margin:2px 0 11px; font-size:12.5px;
@@ -645,6 +735,17 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
 
 <main>
   {surface}
+  {categories}
+  <div id="triage-bar">
+    <span class="lbl">Triage</span>
+    <button type="button" class="tbtn on" data-triage-filter="all">All</button>
+    <button type="button" class="tbtn" data-triage-filter="real">Real <span data-tc="real">0</span></button>
+    <button type="button" class="tbtn" data-triage-filter="investigate">To investigate <span data-tc="investigate">0</span></button>
+    <button type="button" class="tbtn" data-triage-filter="false">False positive <span data-tc="false">0</span></button>
+    <button type="button" class="tbtn" data-triage-filter="untriaged">Unreviewed <span data-tc="untriaged">0</span></button>
+    <span class="tnote" id="triage-where"></span>
+    <button type="button" class="tbtn" id="triage-export">Export JSON</button>
+  </div>
   <h2 class="sec">Code Findings <span class="n">{finding_count}</span></h2>
   <div id="list">{rows}</div>
 
@@ -664,18 +765,162 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
   var total = cards.length;
   var active = 'all';
 
+  // ---- Triage -----------------------------------------------------------
+  // Verdicts live on the server when this page is served by `sast server`,
+  // so a second reviewer on another machine sees the same state. Opened as
+  // a file there is no server to ask, and they fall back to this browser's
+  // localStorage. Either way the page works; only the sharing differs.
+  var triage = {{}};
+  var tFilter = 'all';
+  // Every category starts enabled, so the default view is the whole report.
+  var catChips = Array.prototype.slice.call(
+    document.querySelectorAll('[data-cat-filter]'));
+  var activeCats = null;  // null means "no category filtering at all"
+  if (catChips.length) {{
+    activeCats = {{}};
+    catChips.forEach(function(c){{
+      activeCats[c.getAttribute('data-cat-filter')] = true;
+    }});
+  }}
+  var scanId = (function(){{
+    var m = location.pathname.match(new RegExp('/report/([A-Za-z0-9_-]+)'));
+    return m ? m[1] : '';
+  }})();
+  var remote = !!scanId && location.protocol.indexOf('http') === 0;
+  var storeKey = 'sast-triage:' + (scanId || location.pathname);
+  var whereEl = document.getElementById('triage-where');
+
+  function loadLocal(){{
+    try {{ return JSON.parse(localStorage.getItem(storeKey) || '{{}}') || {{}}; }}
+    catch (e) {{ return {{}}; }}
+  }}
+  function saveLocal(){{
+    try {{ localStorage.setItem(storeKey, JSON.stringify(triage)); }}
+    catch (e) {{ /* private mode, quota, blocked storage: keep going */ }}
+  }}
+  function persist(fid, state){{
+    if (!remote) {{ saveLocal(); return; }}
+    var payload = {{ verdicts: {{}} }};
+    payload.verdicts[fid] = state;
+    fetch('/api/triage/' + scanId, {{
+      method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(payload)
+    }}).catch(function(){{
+      // The server went away mid-review; keep the verdict locally so the
+      // reviewer does not silently lose their work.
+      remote = false; saveLocal(); setWhere();
+    }});
+  }}
+  function setWhere(){{
+    whereEl.textContent = remote ? 'saved on the server'
+                                 : 'saved in this browser';
+  }}
+
+  function paint(){{
+    var counts = {{ real:0, investigate:0, 'false':0, untriaged:0 }};
+    cards.forEach(function(c){{
+      var fid = c.getAttribute('data-fid');
+      var state = triage[fid] || '';
+      c.setAttribute('data-triage', state);
+      counts[state || 'untriaged'] = (counts[state || 'untriaged'] || 0) + 1;
+    }});
+    Object.keys(counts).forEach(function(k){{
+      var el = document.querySelector('[data-tc="' + k + '"]');
+      if (el) el.textContent = counts[k];
+    }});
+  }}
+
   function apply(){{
     var term = q.value.trim().toLowerCase();
     var shown = 0;
     cards.forEach(function(c){{
+      var state = triage[c.getAttribute('data-fid')] || '';
       var okSev = (active === 'all') || (c.getAttribute('data-sev') === active);
       var okTerm = !term || c.textContent.toLowerCase().indexOf(term) !== -1;
-      var show = okSev && okTerm;
+      var okTriage = (tFilter === 'all')
+        || (tFilter === 'untriaged' ? !state : state === tFilter);
+      var cat = c.getAttribute('data-cat') || 'uncategorised';
+      var okCat = !activeCats || activeCats[cat] === true;
+      var show = okSev && okTerm && okTriage && okCat;
       c.style.display = show ? '' : 'none';
       if (show) shown++;
     }});
     countEl.textContent = 'Showing ' + shown + ' of ' + total;
     noResults.style.display = (shown === 0 && total > 0) ? 'block' : 'none';
+  }}
+
+  document.addEventListener('click', function(ev){{
+    var btn = ev.target.closest ? ev.target.closest('[data-triage-set]') : null;
+    if (btn) {{
+      var card = btn.closest('.finding');
+      if (!card) return;
+      var fid = card.getAttribute('data-fid');
+      var state = btn.getAttribute('data-triage-set');
+      if (state) {{ triage[fid] = state; }} else {{ delete triage[fid]; }}
+      persist(fid, state);
+      paint(); apply();
+      return;
+    }}
+    var cbtn = ev.target.closest ? ev.target.closest('[data-cat-filter]') : null;
+    if (cbtn && activeCats) {{
+      var name = cbtn.getAttribute('data-cat-filter');
+      activeCats[name] = !activeCats[name];
+      cbtn.classList.toggle('on', activeCats[name]);
+      apply();
+      return;
+    }}
+    if (ev.target.id === 'cat-all' || ev.target.id === 'cat-none') {{
+      var want = ev.target.id === 'cat-all';
+      catChips.forEach(function(c){{
+        activeCats[c.getAttribute('data-cat-filter')] = want;
+        c.classList.toggle('on', want);
+      }});
+      apply();
+      return;
+    }}
+    var fbtn = ev.target.closest ? ev.target.closest('[data-triage-filter]') : null;
+    if (fbtn) {{
+      Array.prototype.slice.call(
+        document.querySelectorAll('[data-triage-filter]')).forEach(
+          function(x){{ x.classList.remove('on'); }});
+      fbtn.classList.add('on');
+      tFilter = fbtn.getAttribute('data-triage-filter');
+      apply();
+    }}
+  }});
+
+  var exportBtn = document.getElementById('triage-export');
+  if (exportBtn) exportBtn.addEventListener('click', function(){{
+    var rows = cards.map(function(c){{
+      return {{
+        id: c.getAttribute('data-fid'),
+        verdict: triage[c.getAttribute('data-fid')] || 'untriaged',
+        severity: c.getAttribute('data-sev'),
+        title: (c.querySelector('.title') || {{}}).textContent || '',
+        location: (c.querySelector('.sink') || {{}}).textContent || ''
+      }};
+    }});
+    var blob = new Blob([JSON.stringify(rows, null, 2)],
+                        {{ type: 'application/json' }});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'sast-triage.json';
+    a.click();
+    setTimeout(function(){{ URL.revokeObjectURL(a.href); }}, 1000);
+  }});
+
+  function startTriage(){{
+    setWhere();
+    if (!remote) {{ triage = loadLocal(); paint(); apply(); return; }}
+    fetch('/api/triage/' + scanId)
+      .then(function(r){{ return r.ok ? r.json() : null; }})
+      .then(function(d){{
+        triage = (d && d.verdicts) || {{}};
+        paint(); apply();
+      }})
+      .catch(function(){{
+        remote = false; triage = loadLocal(); setWhere(); paint(); apply();
+      }});
   }}
 
   stats.forEach(function(s){{
@@ -699,6 +944,7 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
   }});
 
   apply();
+  startTriage();
 }})();
 </script>
 </body>

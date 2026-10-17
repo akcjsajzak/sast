@@ -1,6 +1,8 @@
 """Core data model for the SAST engine."""
 from __future__ import annotations
 
+import hashlib
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -136,6 +138,25 @@ class Finding:
     entry_point: Optional[EntryPoint] = None
     # A ready-to-send request reproducing the entry point, when one applies.
     request: str = ""
+
+    def fingerprint(self, root: str = "") -> str:
+        """A stable identity for this finding across scans.
+
+        Built from the rule, the path relative to the scan root and the
+        normalised text of the offending line — deliberately *not* the line
+        number, so a finding keeps its identity when code is inserted above
+        it. That is what lets a triage verdict survive a re-scan instead of
+        coming back as a new unreviewed finding.
+        """
+        path = self.location.file or ""
+        if root:
+            try:
+                path = os.path.relpath(path, root)
+            except ValueError:
+                pass
+        code = " ".join((self.location.code or "").split())
+        material = "\x00".join((self.rule_id, path.replace(os.sep, "/"), code))
+        return hashlib.sha1(material.encode("utf-8", "replace")).hexdigest()[:16]
 
     def to_dict(self) -> dict:
         return {

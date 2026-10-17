@@ -31,6 +31,10 @@ from .store import ScanStore
 from .ui import render_page
 
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024
+# Triage verdicts are a handful of 16-character ids and one word each, so
+# anything large is either a mistake or someone probing. 1 MB covers a report
+# with tens of thousands of findings.
+MAX_TRIAGE_BYTES = 1024 * 1024
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".sast")
 
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
@@ -220,6 +224,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, report.encode("utf-8"), "text/html; charset=utf-8")
             return
 
+        if path.startswith("/api/triage/"):
+            scan_id = path.rsplit("/", 1)[-1]
+            if self.store.get(scan_id) is None:
+                self._error(404, "No such scan.")
+                return
+            self._json(200, {"verdicts": self.store.triage(scan_id)})
+            return
+
         if path == "/healthz":
             self._json(200, {"status": "ok"})
             return
@@ -245,7 +257,40 @@ class Handler(BaseHTTPRequestHandler):
             scan_id = path.rsplit("/", 1)[-1]
             self._json(200, {"deleted": self.store.delete(scan_id)})
             return
+        if path.startswith("/api/triage/"):
+            self._handle_triage(path.rsplit("/", 1)[-1])
+            return
         self._error(404, "Not found.")
+
+    def _handle_triage(self, scan_id: str) -> None:
+        """Record triage verdicts sent by a report page.
+
+        Bounded well below the upload limit: this carries a handful of
+        16-character ids and a word each, never a file.
+        """
+        if self.store.get(scan_id) is None:
+            self._error(404, "No such scan.")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._error(400, "Invalid Content-Length.")
+            return
+        if length <= 0 or length > MAX_TRIAGE_BYTES:
+            self._error(400, "Expected a small JSON body of verdicts.")
+            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._error(400, "Body is not valid JSON.")
+            return
+        verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
+        if not isinstance(verdicts, dict):
+            self._error(400, "Expected a 'verdicts' object.")
+            return
+        written = self.store.set_triage(scan_id, verdicts)
+        self._json(200, {"saved": written,
+                         "verdicts": self.store.triage(scan_id)})
 
     # ------------------------------------------------------------------
     def _handle_start(self) -> None:
