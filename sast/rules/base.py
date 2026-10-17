@@ -24,6 +24,22 @@ class TaintSource:
     frameworks: tuple = ALL
     cls: Optional[str] = None  # class name, for 'static'/'method' matching
     arg_literal: Optional[tuple] = None  # (arg_index, literal) — only a source when arg matches
+    # (arg_index, (literal, ...)) — *not* a source when that argument is one of
+    # these. `System.getProperty` is a plausible source in general, but the
+    # JVM's own properties ("os.name", "user.dir") are configuration the
+    # attacker does not set, and treating them as request data put a finding on
+    # every servlet that asked the platform where it was running.
+    arg_not_literal: Optional[tuple] = None
+
+    def arg_allows(self, arg_texts: list) -> bool:
+        """False when an argument rules this source out."""
+        if self.arg_not_literal:
+            idx, blocked = self.arg_not_literal
+            if idx < len(arg_texts):
+                text = (arg_texts[idx] or "").strip().strip('"\'')
+                if text in blocked:
+                    return False
+        return True
     obj_hint: Optional[str] = None  # substring the receiver must contain (Java)
     # Subscript keys this source applies to, e.g. $_SERVER['HTTP_HOST']. An
     # entry ending in '*' matches by prefix. None = any key (whole container).

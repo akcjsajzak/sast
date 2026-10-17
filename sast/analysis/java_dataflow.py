@@ -72,6 +72,238 @@ NON_PROPAGATING = frozenset({
 })
 
 
+# Constant folding
+#
+# A branch whose condition is decidable at compile time has one live arm, and
+# merging both arms' environments is what made a sanitized value look tainted:
+# `if ((7 * 42) - num > 200) bar = "safe"; else bar = param;` always takes the
+# first arm, yet the merge handed `bar` the taint from the second. Folding the
+# condition and walking only the live arm is a pure precision gain — anything
+# not decidable stays UNKNOWN and both arms are walked exactly as before, so
+# this can never hide a real flow.
+#
+# Constants live in the type environment under a prefix no Java identifier can
+# carry, which gets them branch scoping and merging for free.
+_CONST_PREFIX = "\0const:"
+
+UNKNOWN = object()
+
+_INT_MIN, _INT_MAX = -(2 ** 31), 2 ** 31 - 1
+
+
+def _wrap_int(n: int) -> int:
+    """Java int arithmetic wraps at 32 bits; Python's does not."""
+    return (n + 2 ** 31) % 2 ** 32 - 2 ** 31
+
+
+def const_get(tenv: dict, name: str):
+    return tenv.get(_CONST_PREFIX + name, UNKNOWN)
+
+
+def const_set(tenv: dict, name: str, value) -> None:
+    key = _CONST_PREFIX + name
+    if value is UNKNOWN:
+        tenv.pop(key, None)
+    else:
+        tenv[key] = value
+
+
+def _parse_int_literal(text: str):
+    text = text.replace("_", "").rstrip("lL")
+    try:
+        if text[:2].lower() in ("0x", "0b"):
+            return int(text, 0)
+        if len(text) > 1 and text.startswith("0"):
+            return int(text, 8)
+        return int(text, 10)
+    except ValueError:
+        return UNKNOWN
+
+
+def _unquote(text: str):
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        body = text[1:-1]
+        if "\\" in body:
+            return UNKNOWN  # escapes are not worth decoding for this
+        return body
+    return UNKNOWN
+
+
+def const_eval(node: Node, tenv: dict, depth: int = 0):
+    """Evaluate a Java expression to a Python value, or UNKNOWN.
+
+    Deliberately narrow: integers, booleans and plain string literals, with
+    the operators Java gives them. Anything else — a method call, a field, a
+    float, an escaped string — is UNKNOWN, and every caller treats UNKNOWN as
+    "assume nothing".
+    """
+    if node is None or depth > 16:
+        return UNKNOWN
+    t = node.type
+    if t in ("decimal_integer_literal", "hex_integer_literal",
+             "octal_integer_literal", "binary_integer_literal"):
+        return _parse_int_literal(ja.text(node))
+    if t in ("true", "false"):
+        return t == "true"
+    if t in ("true_literal", "false_literal"):
+        return t.startswith("true")
+    if t == "boolean_literal":
+        return ja.text(node) == "true"
+    if t == "string_literal":
+        return _unquote(ja.text(node))
+    if t == "character_literal":
+        return _unquote(ja.text(node))
+    if t == "identifier":
+        return const_get(tenv, ja.text(node))
+    if t == "method_invocation":
+        return _const_method(node, tenv, depth)
+    if t == "parenthesized_expression":
+        kids = [c for c in node.named_children if c.type not in _COMMENTS]
+        return const_eval(kids[0], tenv, depth + 1) if kids else UNKNOWN
+    if t == "unary_expression":
+        op = node.child_by_field_name("operator")
+        operand = node.child_by_field_name("operand")
+        v = const_eval(operand, tenv, depth + 1)
+        if v is UNKNOWN or op is None:
+            return UNKNOWN
+        o = ja.text(op)
+        if o == "-" and isinstance(v, int) and not isinstance(v, bool):
+            return _wrap_int(-v)
+        if o == "+" and isinstance(v, int) and not isinstance(v, bool):
+            return v
+        if o == "!" and isinstance(v, bool):
+            return not v
+        return UNKNOWN
+    if t == "binary_expression":
+        return _const_binary(node, tenv, depth)
+    return UNKNOWN
+
+
+# String methods that are pure and total, so calling one on a constant
+# receiver with constant arguments gives a constant. `"ABC".charAt(1)` is how
+# the Benchmark picks a switch label, and without it the selector is unknown
+# and every case has to be treated as reachable.
+_CONST_STRING_METHODS = {
+    "charAt", "length", "substring", "trim", "strip", "toUpperCase",
+    "toLowerCase", "concat", "indexOf", "lastIndexOf", "isEmpty", "isBlank",
+    "equals", "equalsIgnoreCase", "startsWith", "endsWith", "contains",
+    "replace", "hashCode", "compareTo",
+}
+
+
+def _const_method(node: Node, tenv: dict, depth: int):
+    obj, mname, args = ja.mi_parts(node)
+    if mname not in _CONST_STRING_METHODS:
+        return UNKNOWN
+    recv = const_eval(obj, tenv, depth + 1)
+    if not isinstance(recv, str):
+        return UNKNOWN
+    vals = [const_eval(a, tenv, depth + 1) for a in (args or [])]
+    if any(v is UNKNOWN for v in vals):
+        return UNKNOWN
+    try:
+        if mname == "charAt" and len(vals) == 1:
+            return recv[vals[0]]
+        if mname == "length" and not vals:
+            return len(recv)
+        if mname == "substring":
+            return recv[vals[0]:] if len(vals) == 1 else recv[vals[0]:vals[1]]
+        if mname in ("trim", "strip") and not vals:
+            return recv.strip()
+        if mname == "toUpperCase" and not vals:
+            return recv.upper()
+        if mname == "toLowerCase" and not vals:
+            return recv.lower()
+        if mname == "concat" and len(vals) == 1:
+            return recv + str(vals[0])
+        if mname == "indexOf" and len(vals) == 1:
+            return recv.find(str(vals[0]))
+        if mname == "lastIndexOf" and len(vals) == 1:
+            return recv.rfind(str(vals[0]))
+        if mname in ("isEmpty", "isBlank") and not vals:
+            return not recv.strip() if mname == "isBlank" else recv == ""
+        if mname == "equals" and len(vals) == 1:
+            return recv == vals[0]
+        if mname == "equalsIgnoreCase" and len(vals) == 1:
+            return isinstance(vals[0], str) and recv.lower() == vals[0].lower()
+        if mname == "startsWith" and len(vals) == 1:
+            return recv.startswith(str(vals[0]))
+        if mname == "endsWith" and len(vals) == 1:
+            return recv.endswith(str(vals[0]))
+        if mname == "contains" and len(vals) == 1:
+            return str(vals[0]) in recv
+        if mname == "replace" and len(vals) == 2:
+            return recv.replace(str(vals[0]), str(vals[1]))
+        if mname == "compareTo" and len(vals) == 1 and isinstance(vals[0], str):
+            return (recv > vals[0]) - (recv < vals[0])
+    except (IndexError, TypeError, ValueError):
+        return UNKNOWN
+    return UNKNOWN
+
+
+def _const_binary(node: Node, tenv: dict, depth: int):
+    op_node = node.child_by_field_name("operator")
+    if op_node is None:
+        return UNKNOWN
+    op = ja.text(op_node)
+    left = const_eval(node.child_by_field_name("left"), tenv, depth + 1)
+    right = const_eval(node.child_by_field_name("right"), tenv, depth + 1)
+
+    # Short-circuit operators can decide on one side alone.
+    if op == "&&":
+        if left is False or right is False:
+            return False
+        if left is True and right is True:
+            return True
+        return UNKNOWN
+    if op == "||":
+        if left is True or right is True:
+            return True
+        if left is False and right is False:
+            return False
+        return UNKNOWN
+    if left is UNKNOWN or right is UNKNOWN:
+        return UNKNOWN
+
+    if op == "==":
+        return left == right
+    if op == "!=":
+        return left != right
+
+    both_str = isinstance(left, str) and isinstance(right, str)
+    if op == "+" and both_str:
+        return left + right
+    both_int = (isinstance(left, int) and isinstance(right, int)
+                and not isinstance(left, bool) and not isinstance(right, bool))
+    if not both_int:
+        return UNKNOWN
+    if op in ("<", "<=", ">", ">="):
+        return {"<": left < right, "<=": left <= right,
+                ">": left > right, ">=": left >= right}[op]
+    if op == "+":
+        return _wrap_int(left + right)
+    if op == "-":
+        return _wrap_int(left - right)
+    if op == "*":
+        return _wrap_int(left * right)
+    if op in ("/", "%"):
+        if right == 0:
+            return UNKNOWN  # would throw at runtime; decide nothing
+        # Java truncates toward zero; Python floors.
+        q = abs(left) // abs(right)
+        if op == "/":
+            return _wrap_int(q if (left >= 0) == (right >= 0) else -q)
+        return _wrap_int(left - right * (q if (left >= 0) == (right >= 0) else -q))
+    if op in ("&", "|", "^"):
+        return _wrap_int({"&": left & right, "|": left | right,
+                          "^": left ^ right}[op])
+    if op in ("<<", ">>"):
+        if not 0 <= right < 32:
+            return UNKNOWN
+        return _wrap_int(left << right if op == "<<" else left >> right)
+    return UNKNOWN
+
+
 def _constructed_type(value: Node):
     """Class name from `new Foo(...)`, or None."""
     if value is None or value.type != "object_creation_expression":
@@ -181,6 +413,9 @@ class JavaTaintEngine:
                     if value is not None:
                         vt = self.taint_of(value, sf, env, tenv, ctx)
                         self._assign(name, vt, sf, env, d)
+                        const_set(tenv, name, const_eval(value, tenv))
+                    else:
+                        const_set(tenv, name, UNKNOWN)
             return None
         if t == "expression_statement":
             nc = stmt.named_children
@@ -205,6 +440,8 @@ class JavaTaintEngine:
             return self.handle_loop(stmt, sf, env, tenv, ctx)
         if t == "try_statement":
             return self.handle_try(stmt, sf, env, tenv, ctx)
+        if t in ("switch_expression", "switch_statement"):
+            return self.handle_switch(stmt, sf, env, tenv, ctx)
         if t == "block":
             return self.process_block(stmt, sf, env, tenv, ctx)
         # Fallback: evaluate for embedded sinks.
@@ -219,6 +456,13 @@ class JavaTaintEngine:
         if lhs.type == "identifier":
             vt = self.taint_of(rhs, sf, env, tenv, ctx)
             self._assign(ja.text(lhs), vt, sf, env, lhs)
+            # A compound assignment (`x += y`) is not a new constant value
+            # unless both sides are known, which const_eval of the bare rhs
+            # cannot tell us — so clear it rather than guess.
+            op = node.child_by_field_name("operator")
+            simple = op is None or ja.text(op) == "="
+            const_set(tenv, ja.text(lhs),
+                      const_eval(rhs, tenv) if simple else UNKNOWN)
         elif lhs.type in ("field_access",):
             vt = self.taint_of(rhs, sf, env, tenv, ctx)
             self._assign(ja.text(lhs), vt, sf, env, lhs)
@@ -246,6 +490,28 @@ class JavaTaintEngine:
     def handle_if(self, node: Node, sf: SourceFile, env: dict, tenv: dict, ctx: Ctx):
         ret = None
         branch_envs = []
+        # A decidable condition leaves one live arm. Walking the dead one too
+        # and merging its environment is what let a constant assignment be
+        # overwritten by the taint from a branch that never runs.
+        verdict = const_eval(node.child_by_field_name("condition"), tenv)
+        live = None
+        if verdict is True:
+            live = node.child_by_field_name("consequence")
+        elif verdict is False:
+            live = node.child_by_field_name("alternative")
+        if verdict in (True, False):
+            self.taint_of(node.child_by_field_name("condition"), sf, env, tenv, ctx)
+            if live is None:
+                return None  # `if (false) ...` with no else: nothing runs
+            be, bte = dict(env), dict(tenv)
+            ret = self.process_any(live, sf, be, bte, ctx)
+            # The one live arm runs unconditionally, so its environment
+            # replaces the outer one rather than merging with it.
+            env.clear()
+            env.update(be)
+            tenv.clear()
+            tenv.update(bte)
+            return ret
         for c in node.named_children:
             if c.type == "parenthesized_expression":
                 self.taint_of(c, sf, env, tenv, ctx)
@@ -264,6 +530,102 @@ class JavaTaintEngine:
             _merge_env(env, be)
             _merge_tenv(tenv, bte)
         return ret
+
+    def handle_switch(self, node: Node, sf: SourceFile, env: dict, tenv: dict,
+                      ctx: Ctx):
+        """Walk a switch's case bodies as statements.
+
+        Without this a switch fell through to the expression fallback, which
+        reads its children for taint but never writes to the environment — so
+        `case 7: bar = param;` did not taint `bar` and `case 8: bar = "safe";`
+        did not clear it. Both directions were wrong, and the second is why a
+        safe switch still reported.
+
+        A constant selector picks one group, counting fall-through from it.
+        Otherwise every group is a separate branch, as in handle_if.
+        """
+        cond = node.child_by_field_name("condition")
+        self.taint_of(cond, sf, env, tenv, ctx)
+        body = node.child_by_field_name("body")
+        if body is None:
+            return None
+        groups = [c for c in body.named_children
+                  if c.type in ("switch_block_statement_group", "switch_rule")]
+        if not groups:
+            return None
+
+        selector = const_eval(cond, tenv)
+        live = None
+        if selector is not UNKNOWN:
+            live = self._switch_live_groups(groups, selector)
+
+        ret = None
+        if live is not None:
+            # Exactly one path runs, so its environment replaces the outer one.
+            be, bte = dict(env), dict(tenv)
+            for g in live:
+                ret = _merge_taint(ret, self._switch_group(g, sf, be, bte, ctx))
+            env.clear()
+            env.update(be)
+            tenv.clear()
+            tenv.update(bte)
+            return ret
+
+        branch_envs = []
+        for g in groups:
+            be, bte = dict(env), dict(tenv)
+            ret = _merge_taint(ret, self._switch_group(g, sf, be, bte, ctx))
+            branch_envs.append((be, bte))
+        for be, bte in branch_envs:
+            _merge_env(env, be)
+            _merge_tenv(tenv, bte)
+        return ret
+
+    def _switch_group(self, group: Node, sf, env, tenv, ctx):
+        ret = None
+        for c in group.named_children:
+            if c.type in _COMMENTS or c.type == "switch_label":
+                continue
+            ret = _merge_taint(ret, self.process_stmt(c, sf, env, tenv, ctx))
+        return ret
+
+    @staticmethod
+    def _switch_live_groups(groups: list, selector):
+        """The groups that run for a known selector, or None if undecidable.
+
+        Returns the matching group plus everything it falls through into, so
+        a `case` without a `break` is still accounted for. A `default` is used
+        only when no label matches. Any label this cannot evaluate makes the
+        whole switch undecidable rather than guessing.
+        """
+        match_at = None
+        default_at = None
+        for i, g in enumerate(groups):
+            for label in g.named_children:
+                if label.type != "switch_label":
+                    continue
+                values = [c for c in label.named_children
+                          if c.type not in _COMMENTS]
+                if not values:
+                    if default_at is None:
+                        default_at = i
+                    continue
+                for v in values:
+                    cv = const_eval(v, {})
+                    if cv is UNKNOWN:
+                        return None  # an unreadable label: decide nothing
+                    if cv == selector and match_at is None:
+                        match_at = i
+        start = match_at if match_at is not None else default_at
+        if start is None:
+            return []  # nothing matches and there is no default
+        live = []
+        for g in groups[start:]:
+            live.append(g)
+            text = ja.text(g)
+            if "break" in text or "return" in text or "->" in text:
+                break
+        return live
 
     def handle_loop(self, node: Node, sf: SourceFile, env: dict, tenv: dict, ctx: Ctx):
         ret = None
@@ -372,8 +734,20 @@ class JavaTaintEngine:
             nc = node.named_children
             return self.taint_of(nc[0], sf, env, tenv, ctx) if nc else None
         if t == "ternary_expression":
+            cond = node.child_by_field_name("condition")
+            verdict = const_eval(cond, tenv)
+            if verdict in (True, False):
+                # Same reasoning as handle_if: only the live arm contributes.
+                self.taint_of(cond, sf, env, tenv, ctx)
+                arm = node.child_by_field_name(
+                    "consequence" if verdict is True else "alternative")
+                return self.taint_of(arm, sf, env, tenv, ctx)
             merged = None
-            for c in node.named_children[1:]:
+            kids = node.named_children
+            if kids:
+                # Evaluated for its sinks; a condition is not the value.
+                self.taint_of(kids[0], sf, env, tenv, ctx)
+            for c in kids[1:]:
                 tt = self.taint_of(c, sf, env, tenv, ctx)
                 if tt is not None:
                     merged = tt if merged is None else merged.merge(tt)
@@ -588,6 +962,8 @@ class JavaTaintEngine:
                 full = ja.text(node).lower()
                 if src.obj_hint.lower() not in rkey and src.obj_hint.lower() not in full:
                     continue
+            if not src.arg_allows([ja.text(a) for a in (args or [])]):
+                continue
             return Taint(
                 tags=set(src.tags),
                 origins=[make_loc(sf, node)],
@@ -596,6 +972,10 @@ class JavaTaintEngine:
                     description=src.description,
                     code=sf.node_line(node),
                 )],
+                # A source's own confidence was being dropped here, so a
+                # second-order or merely-influenced source reported as though
+                # it were direct request input.
+                confidence=src.confidence,
             )
         return None
 
@@ -815,5 +1195,24 @@ def _merge_env(env: dict, other: dict) -> None:
 
 
 def _merge_tenv(tenv: dict, other: dict) -> None:
+    """Join a conditional branch's type/constant environment into the outer one.
+
+    `other` started as a copy of `tenv`, so the two differ only where the
+    branch changed something. A declared type is the same on every path, so
+    first-one-wins is right for types.
+
+    A constant is different: it survives a join only if it holds on *every*
+    incoming path. The branch may not have run at all, so a value the branch
+    introduced says nothing after the join, and one it changed or discarded
+    says nothing either. Each of those cases has to drop the constant, or
+    folding would prune a live branch and hide a real flow.
+    """
     for k, v in other.items():
-        tenv.setdefault(k, v)
+        if not k.startswith(_CONST_PREFIX):
+            tenv.setdefault(k, v)
+        elif k not in tenv:
+            continue            # introduced by the branch: unknown on the other path
+        elif tenv[k] != v:
+            tenv.pop(k, None)   # changed by the branch: no single value holds
+    for k in [k for k in tenv if k.startswith(_CONST_PREFIX) and k not in other]:
+        tenv.pop(k, None)       # discarded by the branch

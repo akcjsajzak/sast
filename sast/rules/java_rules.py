@@ -21,22 +21,48 @@ def _sources() -> list[TaintSource]:
               # which parameters and headers it sends, and code that echoes a
               # name or stores it under that key is reflecting request data.
               "getParameterNames", "getHeaderNames", "getAttributeNames",
-              "getPathInfo", "getRequestURI", "getRequestURL", "getServletPath",
-              "getPathTranslated", "getRemoteUser", "getRemoteHost",
-              "getRemoteAddr", "getAuthType", "getContentType",
-              "getCharacterEncoding", "getPart", "getParts"):
+              "getPart", "getParts"):
         s.append(TaintSource(
             kind="method", match=m, tags=_ALL,
             description=f"Untrusted data from Servlet request ->{m}()",
+        ))
+    # The request's own address, and the client metadata around it. These are
+    # attacker-influenced — the path and the Host header are whatever was
+    # sent — but they describe *this* server, so they cannot stand in for a
+    # URL an attacker chose: `new URL(request.getRequestURL())` points back
+    # here, and tagging it `ssrf` reported an SSRF on every servlet that
+    # rebuilt its own host. Injection into a query, a command or a
+    # deserializer is still possible, so those tags stay.
+    _SELF_REFERENTIAL = [t for t in _ALL if t not in ("ssrf",)]
+    for m in ("getPathInfo", "getRequestURI", "getRequestURL", "getServletPath",
+              "getPathTranslated", "getRemoteUser", "getRemoteHost",
+              "getRemoteAddr", "getAuthType", "getContentType",
+              "getCharacterEncoding"):
+        s.append(TaintSource(
+            kind="method", match=m, tags=_SELF_REFERENTIAL, confidence="medium",
+            description=f"Attacker-influenced request metadata ->{m}()",
         ))
     # Spring WebUtils / RequestContextHolder / @RequestParam handled at method entry.
     s.append(TaintSource(
         kind="method", match="getenv", tags=_ALL, obj_hint="system",
         description="Untrusted data from System.getenv()",
     ))
+    # A system property can carry attacker data when the deployment lets it,
+    # but the JVM's own properties describe the platform and are not request
+    # input. Excluding them keeps the source without reporting on every
+    # servlet that looks up its working directory or OS name.
     s.append(TaintSource(
         kind="method", match="getProperty", tags=_ALL, obj_hint="system",
-        description="Untrusted data from System.getProperty()",
+        confidence="low",
+        arg_not_literal=(0, (
+            "os.name", "os.arch", "os.version", "user.dir", "user.home",
+            "user.name", "java.home", "java.version", "java.vendor",
+            "java.io.tmpdir", "java.class.path", "java.library.path",
+            "file.separator", "path.separator", "line.separator",
+            "file.encoding", "sun.jnu.encoding",
+        )),
+        description="Data from a JVM system property (attacker-controlled only "
+                    "if the deployment lets the attacker set properties)",
     ))
     s.append(TaintSource(
         kind="method", match="getOriginalFilename", tags=_ALL, obj_hint="multipartfile",
@@ -100,6 +126,10 @@ def _sinks() -> list[SinkRule]:
         severity="critical", cwe="CWE-78", owasp=A03, category="command-injection",
         description="Untrusted data flows into a shell command passed to Runtime.exec().",
         remediation="Avoid shell execution with untrusted input; use ProcessBuilder with an argument array and no shell.",
+        # Any argument counts, not just the command. The overloads also take
+        # an environment array and a working directory, and an attacker who
+        # controls the environment controls execution anyway — LD_PRELOAD,
+        # IFS, PATH and BASH_ENV all turn a tainted envp into code execution.
         tags=["cmd"], obj_hint="Runtime",
     ))
     # A ProcessBuilder is often built empty and filled later, so the command
