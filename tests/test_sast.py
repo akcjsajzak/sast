@@ -2296,6 +2296,165 @@ class TestMemorySafety(unittest.TestCase):
         self.assertEqual({r for r in rules if "free" in r}, set())
 
 
+class TestMemoryLeaks(unittest.TestCase):
+    """Allocations that never come back (CWE-401).
+
+    A leak claim is decided on different evidence from a use-after-free: it
+    needs "freed on no path and escaped on no path", where the free checks
+    need "freed on this path". The negative cases are the whole difficulty —
+    every way a correct function can legitimately hand memory onward has to
+    stay silent, or the check is unusable on real code.
+    """
+
+    def _leaks(self, body):
+        return [f for f in
+                _scan({"m.c": "#include <stdlib.h>\n#include <string.h>\n"
+                              "#include <stdio.h>\n" + body}).findings
+                if f.rule_id == "c-memory-leak"]
+
+    def test_leaks_are_found(self):
+        cases = {
+            "never freed":
+                "void f(void) { char *p = malloc(10);"
+                ' strcpy(p, "x"); printf("%s", p); }',
+            "result discarded outright":
+                "void f(void) { malloc(10); }",
+            "one of two freed":
+                "void f(void) { char *a = malloc(10); char *b = malloc(10);"
+                " free(b); }",
+            "lost on an early return":
+                "int f(int n) { char *p = malloc(10); if (n < 0) return -1;"
+                " free(p); return 0; }",
+        }
+        for label, body in cases.items():
+            self.assertTrue(self._leaks(body), label)
+
+    def test_correct_ownership_is_silent(self):
+        cases = {
+            "returned to the caller":
+                "char *f(void) { char *p = malloc(10); return p; }",
+            "freed before returning":
+                "void f(void) { char *p = malloc(10); free(p); }",
+            "handed to an unknown function":
+                "void f(void) { char *p = malloc(10); consume(p); }",
+            "stored through a pointer":
+                "void f(char **out) { char *p = malloc(10); *out = p; }",
+            "stored in a field":
+                "void f(struct s *h) { char *p = malloc(10); h->buf = p; }",
+            "assigned to a global":
+                "char *g; void f(void) { char *p = malloc(10); g = p; }",
+            "freed through an alias":
+                "void f(void) { char *p = malloc(10); char *q = p;"
+                " free(q); }",
+            "address handed out":
+                'void f(void) { char *p = malloc(10); sscanf("x", "%s", &p); }',
+            "static local outlives the call":
+                "void f(void) { static char *keep; keep = malloc(10); }",
+            "realloc then free":
+                "void f(void) { char *p = malloc(8); p = realloc(p, 64);"
+                " free(p); }",
+            "freed in both arms":
+                "void f(int c) { char *p = malloc(10);"
+                " if (c) { free(p); } else { free(p); } }",
+        }
+        for label, body in cases.items():
+            self.assertEqual(self._leaks(body), [], label)
+
+    def test_allocation_failure_check_is_not_a_leak(self):
+        """`if (!p) return -1;` is the correct idiom, not a lost block.
+
+        The early-return check has to ignore a return guarded by the
+        pointer's own value: there is nothing allocated to leak on the path
+        where the allocation failed, and reporting it would put a finding on
+        the line that makes the code correct.
+        """
+        for body in (
+            "int f(int n) { char *p = malloc(n); if (!p) return -1;"
+            " free(p); return 0; }",
+            "int f(int n) { char *p = malloc(n); if (p == NULL) { return -1; }"
+            " free(p); return 0; }",
+        ):
+            self.assertEqual(self._leaks(body), [], body)
+
+    def test_earlier_allocation_lost_on_a_later_guard(self):
+        """The second allocation's failure path still loses the first block.
+
+        This is the shape the 'patched' Damn Vulnerable C Program introduced
+        while fixing its overflow: each allocation checks itself, and the
+        check's `return` walks past everything allocated before it.
+        """
+        leaks = self._leaks(
+            "int f(int n) { char *a = malloc(n);"
+            " if (a == NULL) return -1;"
+            " char *b = malloc(n);"
+            " if (b == NULL) return -1;"
+            " free(a); free(b); return 0; }")
+        self.assertEqual(len(leaks), 1)
+        self.assertIn("'a'", leaks[0].description)
+
+    def test_a_goto_disables_the_leak_check_too(self):
+        """Centralised cleanup is the correct pattern and uses goto."""
+        self.assertEqual(self._leaks(
+            "int f(int n) { char *p = malloc(n);"
+            " if (n < 0) goto done; done: free(p); return 0; }"), [])
+
+
+class TestDivideByZero(unittest.TestCase):
+    """Division that can trap (CWE-369).
+
+    Two separate claims: a literal zero divisor is proof on its own, and an
+    attacker-controlled divisor is a one-request denial of service. A divisor
+    that is merely unknown is neither, and reporting it would flag most
+    arithmetic in any codebase.
+    """
+
+    def _rules(self, body, name="m.c"):
+        return {f.rule_id for f in
+                _scan({name: "#include <stdlib.h>\n#include <stdio.h>\n"
+                             + body}).findings}
+
+    def test_literal_zero_divisor(self):
+        for body in ("int f(int a) { return a / 0; }",
+                     "int f(int a) { return a % 0; }",
+                     "int f(int a) { return a / 0x0; }",
+                     "int f(int a) { int b = a; b /= 0; return b; }"):
+            self.assertIn("c-divide-by-zero", self._rules(body), body)
+
+    def test_attacker_controlled_divisor(self):
+        cases = {
+            "from argv":
+                "int f(int argc, char **argv) { int d = atoi(argv[1]);"
+                " return 100 / d; }",
+            "modulo":
+                "int f(int argc, char **argv) { int d = atoi(argv[1]);"
+                " return 100 % d; }",
+            "compound assignment":
+                "int f(int argc, char **argv) { int t = 10;"
+                " int d = atoi(argv[1]); t /= d; return t; }",
+            "read from stdin":
+                "int f(void) { char b[8]; fgets(b, 8, stdin);"
+                " return 10 / atoi(b); }",
+        }
+        for label, body in cases.items():
+            self.assertIn("c-divide-by-zero-tainted", self._rules(body), label)
+
+    def test_safe_division_is_silent(self):
+        cases = {
+            "constant divisor": "int f(int a) { return a / 7; }",
+            "non-zero float": "int f(int a) { return (int)(a / 0.5); }",
+            "unknown local": "int f(int a, int b) { return a / b; }",
+            "a macro name": "int f(int a) { return a / LIMIT; }",
+        }
+        for label, body in cases.items():
+            found = {r for r in self._rules(body) if "divide" in r}
+            self.assertEqual(found, set(), label)
+
+    def test_cpp_is_covered_too(self):
+        """C++ shares the rule set, so it must share the behaviour."""
+        self.assertIn("c-divide-by-zero",
+                      self._rules("int f(int a) { return a / 0; }", "m.cpp"))
+
+
 class TestNumericTaintAndIndexing(unittest.TestCase):
     """An attacker-influenced number is not an attacker-controlled string."""
 
@@ -2490,7 +2649,8 @@ class TestRuleSetConsistency(unittest.TestCase):
     # is not here silently does nothing, so the list has to be updated
     # deliberately alongside the engine that handles it.
     SINK_KINDS = {
-        "call", "method", "function", "static", "index", "property_assign",
+        "call", "method", "function", "static", "index", "divisor",
+        "property_assign",
         "object_create", "echo", "print", "include", "shell", "jsx_attribute",
         "dynamic_call", "variable_variable",
     }

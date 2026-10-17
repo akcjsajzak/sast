@@ -1,4 +1,4 @@
-"""Use-after-free and double-free detection for C and C++.
+"""Use-after-free, double-free and memory-leak detection for C and C++.
 
 The taint engines answer "where does attacker data reach a dangerous call".
 That is the whole question in a managed language, but in C the dominant
@@ -26,6 +26,17 @@ struct field or an array element. Each of those needs an alias analysis to
 stay sound, and guessing without one produces false reports on correct code.
 Simple must-aliasing from a direct assignment *is* tracked, since
 ``q = p; free(p); use(q);`` is a common shape and unambiguous.
+
+Leaks (CWE-401) are answered with a second, deliberately different question.
+The states above are path-sensitive, which is what makes a use-after-free
+claim precise; a leak claim needs the opposite, because "freed on one path"
+still means "not leaked on that path" and reporting it would be noise. So a
+leak is decided on function-wide facts instead: a local that was allocated
+here, never freed on *any* path, and never *escaped* this function. Escaping
+covers being returned, stored through a pointer or into a field, assigned to
+anything not declared here, having its address taken, or being handed to a
+function that is not on the borrowing list below. Anything unknown is assumed
+to take ownership, so the default on an unrecognised callee is silence.
 """
 from __future__ import annotations
 
@@ -46,6 +57,40 @@ ALLOCATORS = frozenset({
 DEALLOCATORS = frozenset({"free", "cfree"})
 
 ALLOCATED, FREED, MAYBE = "allocated", "freed", "maybe-freed"
+
+# Standard-library calls that read or write through a pointer without keeping
+# it. Passing a pointer to anything *not* on this list is treated as handing
+# over ownership, because a function that stores it somewhere is
+# indistinguishable from one that does not without looking inside it — and
+# guessing the other way would report a leak every time memory is passed to a
+# helper. The cost of that choice is a missed leak; the cost of the reverse is
+# a false one on correct code, which is worse.
+BORROWING = frozenset({
+    # Copies and comparisons.
+    "strcpy", "strncpy", "strlcpy", "strcat", "strncat", "strlcat",
+    "strcmp", "strncmp", "strcasecmp", "strncasecmp", "strcoll", "strxfrm",
+    "strlen", "strnlen", "strchr", "strrchr", "strstr", "strcasestr",
+    "strspn", "strcspn", "strpbrk", "strtok", "strtok_r",
+    "memcpy", "memmove", "memset", "memcmp", "memchr", "memrchr", "bzero",
+    # Formatted and unformatted I/O.
+    "printf", "fprintf", "sprintf", "snprintf", "dprintf",
+    "vprintf", "vfprintf", "vsprintf", "vsnprintf",
+    "puts", "fputs", "fwrite", "fread", "perror", "write", "read",
+    "send", "recv", "sendto", "recvfrom", "fflush",
+    "scanf", "sscanf", "fscanf", "vsscanf",
+    # Conversions and character classification.
+    "atoi", "atol", "atoll", "atof",
+    "strtol", "strtoul", "strtoll", "strtoull", "strtod", "strtof",
+    "isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower",
+    "toupper", "tolower",
+    # Deallocation is handled on its own, but naming it here keeps a
+    # `free(p)` from being read as an ownership transfer if the order of the
+    # checks below ever changes.
+    "free", "cfree",
+})
+
+# Reported once per function at its end: an allocation that never came back.
+LEAK_RULE = "c-memory-leak"
 
 # Node types whose appearance means the pointer's value is being read.
 _DEREF = ("pointer_expression", "field_expression", "subscript_expression")
@@ -99,6 +144,15 @@ class MemorySafetyChecker:
         self.language = language
         self.findings: list[Finding] = []
         self._seen: set = set()
+        # Function-wide leak bookkeeping, reset per function. These are
+        # deliberately *not* path-sensitive: see the module docstring.
+        self._declared: set = set()
+        self._alloc_sites: dict = {}
+        self._escaped: set = set()
+        self._freed_any: set = set()
+        self._groups: dict = {}
+        self._leaks: dict = {}
+        self._guarded: list = []
 
     # ------------------------------------------------------------------
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
@@ -115,8 +169,105 @@ class MemorySafetyChecker:
                     # may not exist — which is what cJSON's `goto cleanup`
                     # error handling turned into a false use-after-free.
                     continue
+                self._begin_function(body)
                 self._walk_block(body, sf, {})
+                self._report_leaks(sf)
         return self.findings
+
+    # ------------------------------------------------------------------
+    # Leak bookkeeping
+    def _begin_function(self, body: Node) -> None:
+        self._declared = _declared_locals(body)
+        self._alloc_sites = {}
+        self._escaped = set()
+        self._freed_any = set()
+        self._groups = {}
+        self._leaks = {}
+        self._guarded = []
+
+    def _group(self, name: str) -> set:
+        """The must-alias group `name` belongs to, created on first use."""
+        group = self._groups.get(name)
+        if group is None:
+            group = {name}
+            self._groups[name] = group
+        return group
+
+    def _alias(self, a: str, b: str) -> None:
+        """Record that `a` and `b` name the same block from here on."""
+        merged = self._group(a) | self._group(b)
+        for name in merged:
+            self._groups[name] = merged
+
+    def _mark_escaped(self, node: Node) -> None:
+        """Every name appearing in `node` leaves this function's control."""
+        for name in _names_in(node):
+            self._escaped |= self._group(name)
+
+    def _mark_freed(self, name: str) -> None:
+        self._freed_any |= self._group(name)
+
+    def _note_return(self, node: Node, states: dict) -> None:
+        """Record an allocation still held when this `return` is taken.
+
+        This is the error-path leak, and it is the common one: allocate,
+        notice something else went wrong, return early, and the block is
+        gone. It has to be judged where the return is rather than at the end
+        of the function, because a `free` further down does run on the normal
+        path and so says nothing about this one.
+
+        Escapes are read as they stand *at this point* in the walk, which is
+        exactly right: a `store(p)` written below this return did not run on
+        the path that took it.
+        """
+        for name, state in states.items():
+            if state.status != ALLOCATED or name not in self._alloc_sites:
+                continue
+            if self._group(name) & self._escaped:
+                continue
+            if any(name in names for names in self._guarded):
+                # The branch that returns is itself conditional on this
+                # pointer, so this is `if (!p) return -1;` — the allocation
+                # failed and there is nothing to leak. Reporting it would put
+                # a finding on the check that makes the code correct.
+                continue
+            self._leaks.setdefault(name, (
+                self._alloc_sites[name],
+                f"'{name}' is allocated here, and the function returns at "
+                f"line {node.start_point.row + 1} without freeing it. A "
+                "`free` on the normal path does not cover this one, so every "
+                "call that takes the early return loses the block.",
+            ))
+
+    def _report_leaks(self, sf: SourceFile) -> None:
+        # Path-specific leaks first: their message names the return that
+        # loses the block, which is more use to a reviewer than the general
+        # case, and recording one suppresses the general report below.
+        for site, detail in self._leaks.values():
+            self._emit_leak(detail, site, sf)
+        for name, site in self._alloc_sites.items():
+            if name in self._leaks:
+                continue
+            group = self._group(name)
+            if group & self._escaped or group & self._freed_any:
+                continue
+            self._emit_leak(
+                f"'{name}' is allocated here and the block is never freed, "
+                "returned, stored anywhere outside this function, or passed "
+                "to a function that could take ownership of it. Every call "
+                "to this function loses the allocation, so a caller that "
+                "runs it per request grows without bound until the process "
+                "is killed.",
+                site, sf)
+
+    def _emit_leak(self, description: str, site: Node,
+                   sf: SourceFile) -> None:
+        self._report(
+            LEAK_RULE, "Memory leak", "low", "CWE-401", description,
+            "Free the block on every path out of the function, including "
+            "the error paths; or return it and document that the caller "
+            "owns it.",
+            site, sf, None, confidence="medium")
 
     def _functions(self, root: Node):
         stack = [root]
@@ -156,17 +307,22 @@ class MemorySafetyChecker:
             return
 
         if t == "if_statement":
-            self._check_expression(node.child_by_field_name("condition"),
-                                   sf, states)
+            condition = node.child_by_field_name("condition")
+            self._check_expression(condition, sf, states)
             consequence = node.child_by_field_name("consequence")
             alternative = node.child_by_field_name("alternative")
             branches = []
+            # Names the condition mentions are off-limits to the leak check
+            # inside either arm: a branch taken because of the pointer's own
+            # value says nothing about whether a block was lost.
+            self._guarded.append(set(_names_in(condition)))
             for child in (consequence, alternative):
                 if child is None:
                     continue
                 branch = {k: v.copy() for k, v in states.items()}
                 self._walk_stmt(child, sf, branch)
                 branches.append(branch)
+            self._guarded.pop()
             # With no else, one path skips the branch entirely, so nothing a
             # branch did is certain — each merge can only weaken a free to
             # MAYBE. When both arms are present and both free, the join below
@@ -200,6 +356,18 @@ class MemorySafetyChecker:
         if t == "expression_statement":
             inner = [c for c in node.named_children
                      if c.type not in ("comment",)]
+            # `malloc(n);` on its own throws the only reference away as the
+            # statement ends. Nothing needs to be tracked to know that is a
+            # leak, and there is no variable to name in the report.
+            if inner and self._allocation_call(inner[0]) is not None:
+                self._report(
+                    LEAK_RULE, "Memory leak", "low", "CWE-401",
+                    "The allocated block's address is discarded as this "
+                    "statement ends, so the memory can never be freed.",
+                    "Keep the returned pointer and free it, or drop the "
+                    "allocation.",
+                    inner[0], sf, None, confidence="high")
+                return
             if inner and inner[0].type == "assignment_expression":
                 self._handle_assign(inner[0].child_by_field_name("left"),
                                     inner[0].child_by_field_name("right"),
@@ -214,9 +382,11 @@ class MemorySafetyChecker:
                 self._check_expression(c, sf, states)
             # Whatever is returned leaves this function's ownership.
             for c in node.named_children:
+                self._mark_escaped(c)
                 name = self._base_name(c)
                 if name:
                     states.pop(name, None)
+            self._note_return(node, states)
             return
 
         if t == "assignment_expression":
@@ -251,21 +421,32 @@ class MemorySafetyChecker:
         # dropped the state and reported nothing.
         if left is not None and left.type in _DEREF:
             self._check_expression(left, sf, states)
+            # `*out = p` and `s->buf = p` hand the block to whatever owns the
+            # left side, which outlives this function.
+            self._mark_escaped(right)
             return
 
         name = self._base_name(left)
         if not name:
             return
+        # Assigning to anything this function did not declare — a global, a
+        # parameter, a static — publishes the block somewhere another function
+        # can free it, so it is not this function's to leak.
+        if name not in self._declared:
+            self._mark_escaped(right)
 
         allocated_from = self._allocation_call(right)
         if allocated_from is not None:
             states[name] = _State(ALLOCATED)
+            if name in self._declared:
+                self._alloc_sites[name] = allocated_from
             return
         # `q = p` makes q another name for the same memory, so freeing either
         # invalidates both. Only a bare identifier counts: anything computed
         # needs an alias analysis this does not have.
         if right is not None and right.type == "identifier":
             other = _text(right)
+            self._alias(name, other)
             source = states.get(other)
             if source is not None:
                 source.aliases.add(name)
@@ -298,16 +479,7 @@ class MemorySafetyChecker:
     @staticmethod
     def _base_name(node: Node) -> str:
         """The variable a declarator or lvalue ultimately names."""
-        seen = 0
-        while node is not None and seen < 8:
-            if node.type == "identifier":
-                return _text(node)
-            kids = [c for c in node.named_children if c.type != "comment"]
-            if not kids:
-                return ""
-            node = kids[0]
-            seen += 1
-        return ""
+        return _base_name_of(node)
 
     # ------------------------------------------------------------------
     def _check_expression(self, node: Node, sf: SourceFile,
@@ -359,6 +531,7 @@ class MemorySafetyChecker:
                     node, sf, state.free_node,
                     confidence="high" if state.status == FREED else "medium")
             if target:
+                self._mark_freed(target)
                 freed = _State(FREED, node, state.aliases if state else ())
                 states[target] = freed
                 for alias in freed.aliases:
@@ -375,11 +548,23 @@ class MemorySafetyChecker:
             if target:
                 # The old block is gone whether or not realloc moved it, so
                 # the old pointer is freed rather than merely unknown.
+                self._mark_freed(target)
                 states[target] = _State(FREED, node)
             return
 
         for arg in args:
             self._check_expression(arg, sf, states)
+        # A callee that is not known to merely borrow may store the pointer,
+        # free it, or both, so the block stops being this function's to leak.
+        # Taking the address of a local does the same thing: the callee can
+        # reassign it out from under us.
+        if name not in BORROWING:
+            for arg in args:
+                self._mark_escaped(arg)
+        else:
+            for arg in args:
+                for addressed in _address_taken(arg):
+                    self._mark_escaped(addressed)
 
     def _report_use(self, node: Node, name: str, sf: SourceFile,
                     states: dict) -> None:
@@ -423,6 +608,84 @@ class MemorySafetyChecker:
             confidence=confidence, framework="raw", language=self.language,
             location=loc, source=None, trace=trace, tags=["memory-safety"],
         ))
+
+
+def _names_in(node: Node):
+    """Every identifier appearing anywhere in an expression."""
+    if node is None:
+        return
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type == "identifier":
+            yield _text(current)
+            continue
+        stack.extend(current.named_children)
+
+
+def _address_taken(node: Node):
+    """The operands of every `&x` inside an expression.
+
+    `scanf("%s", &p)` and `get_buffer(&p)` both let the callee replace `p`,
+    which means the block it pointed at is no longer this function's to
+    account for even when the callee only borrows what it is given.
+    """
+    if node is None:
+        return
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in ("pointer_expression", "unary_expression"):
+            op = current.child_by_field_name("operator")
+            if op is not None and _text(op) == "&":
+                argument = current.child_by_field_name("argument")
+                if argument is not None:
+                    yield argument
+                    continue
+        stack.extend(current.named_children)
+
+
+def _declared_locals(body: Node) -> set:
+    """Names this function declares, excluding `static` ones.
+
+    A `static` local outlives the call, so its allocation is not lost when
+    the function returns and reporting it would be wrong. Scoping within the
+    function is ignored on purpose: the question a leak asks is whether the
+    block survived the whole call, so an inner block's name is still this
+    function's responsibility.
+    """
+    names: set = set()
+    stack = [body]
+    while stack:
+        node = stack.pop()
+        if node.type == "declaration":
+            if any(c.type == "storage_class_specifier" and _text(c) == "static"
+                   for c in node.named_children):
+                continue
+            for child in node.named_children:
+                target = child
+                if child.type == "init_declarator":
+                    target = child.child_by_field_name("declarator")
+                name = _base_name_of(target)
+                if name:
+                    names.add(name)
+            continue
+        stack.extend(node.named_children)
+    return names
+
+
+def _base_name_of(node: Node) -> str:
+    """The variable a declarator ultimately names."""
+    seen = 0
+    while node is not None and seen < 8:
+        if node.type == "identifier":
+            return _text(node)
+        kids = [c for c in node.named_children if c.type != "comment"]
+        if not kids:
+            return ""
+        node = kids[0]
+        seen += 1
+    return ""
 
 
 def _has_goto(body: Node) -> bool:

@@ -29,6 +29,12 @@ MAX_DEPTH = 8
 MAX_IMPLEMENTATIONS = 6
 MAX_STEPS = 15
 
+# Operators that divide, and so trap on a zero right-hand operand. `%` belongs
+# here with `/`: the remainder of a zero divisor traps identically, and in C it
+# is the same hardware fault.
+DIVISION_OPS = ("/", "%")
+DIVISION_ASSIGN_OPS = ("/=", "%=")
+
 
 def _text(node: Node) -> str:
     if node is None or node.text is None:
@@ -230,6 +236,12 @@ class GenericTaintEngine:
         stripped = self.strip(left)
         if stripped is not None and stripped.type in p.index:
             self.check_index_sink(stripped, sf, env, ctx)
+        # `x /= n` divides exactly as `x = x / n` does, and the compound form
+        # never reaches the binary branch above, so the divisor would not be
+        # checked at all without this.
+        op = stmt.child_by_field_name(p.f_operator)
+        if op is not None and _text(op) in DIVISION_ASSIGN_OPS:
+            self.check_divisor_sink(stmt, right, sf, env, ctx)
         self.assign_to(left, vt, sf, env)
         return None
 
@@ -377,6 +389,9 @@ class GenericTaintEngine:
             merged = None
             for c in node.named_children:
                 merged = _merge_taint(merged, self.taint_of(c, sf, env, ctx))
+            if op is not None and _text(op) in DIVISION_OPS:
+                self.check_divisor_sink(node, self._right_operand(node),
+                                        sf, env, ctx)
             if op is not None and _text(op) not in p.concat_ops:
                 # The operands still had to be evaluated: returning early here
                 # skipped them outright, which hid every sink written inside a
@@ -769,6 +784,51 @@ class GenericTaintEngine:
                               "and nothing here confines the index to them.")
             return
 
+    def _right_operand(self, node: Node):
+        """The right-hand operand of a binary expression."""
+        right = node.child_by_field_name(self.p.f_right)
+        if right is not None:
+            return right
+        kids = [c for c in node.named_children if c.type not in self.p.comment]
+        return kids[-1] if len(kids) >= 2 else None
+
+    def check_divisor_sink(self, node: Node, divisor: Node, sf: SourceFile,
+                           env: dict, ctx: Ctx) -> None:
+        """Report a division whose divisor can be zero (CWE-369).
+
+        Two distinct cases share one check. A literal zero divisor traps on
+        every execution and needs no data flow to prove it. A divisor the
+        attacker influences traps whenever they send zero, which in C is
+        SIGFPE and an immediate crash — a denial of service reachable with a
+        single request.
+
+        Deliberately silent on a divisor that is neither: proving a local
+        variable cannot be zero needs the range analysis this engine does not
+        have, and assuming the worst would report most division in the
+        codebase.
+        """
+        rules = [r for r in self.rules.sinks if r.kind == "divisor"]
+        if not rules or divisor is None:
+            return
+        stripped = self.strip(divisor) or divisor
+        if _is_zero_literal(stripped):
+            for rule in rules:
+                if not rule.tags:
+                    self.report(rule, None, node, sf)
+                    return
+            return
+        # Re-evaluating the divisor costs a small walk and keeps this check
+        # independent of how the caller merged its operands. Repeated findings
+        # from the second walk are collapsed by `report`'s dedup key.
+        taint = self.taint_of(divisor, sf, env, ctx)
+        if taint is None:
+            return
+        for rule in rules:
+            if not rule.tags or not (set(rule.tags) & taint.tags):
+                continue
+            self.report(rule, taint, node, sf)
+            return
+
     def _note_array_sizes(self, stmt: Node, depth: int = 0) -> None:
         """Record `char buf[10]` so an index into it can cite the bound."""
         if depth > 4:
@@ -912,6 +972,29 @@ class GenericTaintEngine:
                              code=sf.node_line(node))],
             tags=[rule.category],
         ))
+
+
+def _is_zero_literal(node: Node) -> bool:
+    """True when the node is a numeric literal equal to zero.
+
+    Covers the decimal, hex and octal spellings along with the integer and
+    float suffixes, so `0`, `0x0`, `0U` and `0.0` are all recognised. An
+    identifier or a macro name never parses, which is what keeps this from
+    firing on `x / N`.
+    """
+    if node is None:
+        return False
+    text = _text(node).strip().rstrip("uUlLfF")
+    if not text:
+        return False
+    try:
+        return int(text, 0) == 0
+    except ValueError:
+        pass
+    try:
+        return float(text) == 0.0
+    except ValueError:
+        return False
 
 
 def _restrict_tags(taint, keep: tuple):

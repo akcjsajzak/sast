@@ -156,6 +156,35 @@ def _sinks() -> list[SinkRule]:
         remediation="Reject the index unless it is within the buffer's length, "
                     "and remember that a signed index can also be negative.",
         tags=["int", "buffer"], confidence="medium"))
+    # Division by zero. `match` is unused for both: the engine matches the
+    # division operator itself, not a callee name. They are split in two
+    # because the evidence differs by a lot — a literal zero is proof, an
+    # attacker-controlled divisor is a reachable crash — and a reviewer
+    # triaging one does not want the other mixed in.
+    k.append(SinkRule(
+        rule_id="c-divide-by-zero", kind="divisor", match="*",
+        title="Division by zero",
+        severity="medium", cwe="CWE-369", owasp=A05,
+        category="divide-by-zero",
+        description="The divisor is the literal zero. Integer division by "
+                    "zero is undefined behaviour and raises SIGFPE on every "
+                    "mainstream platform, so this terminates the process.",
+        remediation="Remove the division, or divide by a value checked to be "
+                    "non-zero.",
+        tags=[], confidence="high"))
+    k.append(SinkRule(
+        rule_id="c-divide-by-zero-tainted", kind="divisor", match="*",
+        title="Division by an attacker-controlled value",
+        severity="medium", cwe="CWE-369", owasp=A05,
+        category="divide-by-zero",
+        description="The divisor is derived from attacker-controlled input "
+                    "and is not checked against zero here. Sending zero "
+                    "raises SIGFPE and kills the process, which is a denial "
+                    "of service that costs the attacker one request.",
+        remediation="Reject a zero divisor before dividing. Note that the "
+                    "check must also cover INT_MIN / -1, which overflows "
+                    "and traps the same way.",
+        tags=["int"], confidence="medium"))
     sink("c-sqli-exec", "sqlite3_exec", "SQL injection via sqlite3_exec()",
          "high", "CWE-89", "sql-injection",
          "The statement is built from attacker-controlled data.",

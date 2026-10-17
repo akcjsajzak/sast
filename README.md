@@ -103,7 +103,9 @@ surfaces:
   crypto.
 - C/C++ memory safety: unsafe APIs (`gets`, `strcpy`, `sprintf`), tainted
   format strings and copy lengths, allocation-size bugs, and a dedicated
-  use-after-free / double-free checker.
+  checker for use-after-free, double-free and memory leaks.
+- Division by zero, both the literal case and a divisor an attacker
+  controls — one request is enough to crash the process.
 
 ### Dependencies
 
@@ -290,6 +292,29 @@ The limits are documented rather than hidden:
 - Container images are not unpacked: only the Dockerfile and any SBOM are read.
 - Reachability reads first-party code only: it is import and call-site
   evidence, not an exploitability claim.
+- Memory leaks are reported only where ownership is unambiguous. A pointer
+  handed to a function that is not a known-borrowing one is assumed to be
+  owned by it, so a leak behind a project's own wrapper is missed on purpose:
+  the alternative reports one on correct code.
+- The memory checker understands `malloc`/`free`, not `new`/`delete` or
+  smart pointers, so it says nothing about C++ allocation. Covering it needs
+  a correct-C++ corpus to measure false positives against first; guessing
+  without one is how a checker becomes noise.
+
+### Maybe in the future
+
+Neither of these is implemented, and both are worth knowing about before
+putting this in a pipeline:
+
+- **Suppression and a baseline.** There is no way to accept a finding — no
+  inline `sast:ignore` comment and no baseline file — so `--fail-on` gates on
+  everything, triaged or not. On an existing codebase that makes the gate
+  hard to adopt.
+- **SARIF fidelity.** Locations are absolute paths rather than
+  repository-relative, there are no `partialFingerprints`, and dependency
+  findings are left out of the SARIF entirely. GitHub code scanning accepts
+  the file but will not attach annotations to source, and dismissals do not
+  survive a line shifting.
 
 ## Tests
 
@@ -297,5 +322,5 @@ The limits are documented rather than hidden:
 python -m unittest tests.test_sast -v
 ```
 
-243 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+252 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.
