@@ -254,9 +254,12 @@ sast server --port 9000 --data-dir /var/lib/sast
 
 Every code reference in a report served this way (a finding's sink, each
 step of its trace, a route's declaration) opens the file in a built-in code
-browser at that line. The page shows line numbers, marks each line where a
-finding sinks (by severity) or a trace passes through, and lists the scanned
-files beside it. A source or step note links to its sink, so a cross-file
+browser at that line. The page shows line numbers and syntax highlighting,
+marks each line where a finding sinks (by severity) or a trace passes
+through, and lists the scanned files beside it. Highlighting comes from the
+same tree-sitter parse the analysis uses, so it needs nothing extra and
+works offline. Templates and config files get a lighter pass that marks
+comments, strings and template expressions. A source or step note links to its sink, so a cross-file
 trace can be followed by clicking. The **Code** button opens the file list
 for a scan.
 
@@ -439,5 +442,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-375 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+382 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.

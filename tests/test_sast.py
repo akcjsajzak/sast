@@ -4491,3 +4491,78 @@ class TestSourceSnapshotLimits(unittest.TestCase):
         html_out = render_html(_scan({"a.php": '<?php system($_GET["c"]);'}))
         self.assertIn('class="coderef"', html_out)
         self.assertNotIn('<a class="coderef"', html_out)
+
+
+class TestSyntaxHighlighting(unittest.TestCase):
+    """The code browser colours code from the tree-sitter parse."""
+
+    def _hl(self, name, src):
+        from sast.web.highlight import highlight_lines
+        return highlight_lines(name, src.encode())
+
+    def test_tokens_in_each_language(self):
+        cases = {
+            "a.py": ("def run(cmd):  # c\n    return 'x'\n",
+                     ['<span class="hl-k">def</span>', '<span class="hl-f">run</span>',
+                      '<span class="hl-c"># c</span>', '<span class="hl-s">&#x27;x&#x27;</span>']),
+            "a.js": ("const n = 42; foo('s');\n",
+                     ['<span class="hl-k">const</span>', '<span class="hl-n">42</span>',
+                      '<span class="hl-f">foo</span>']),
+            "A.java": ("@Deprecated\nclass A { String m() { return null; } }\n",
+                       ['<span class="hl-a">@Deprecated</span>', '<span class="hl-t">String</span>',
+                        '<span class="hl-f">m</span>']),
+            "a.php": ("<?php\n$id = $_GET['id'];\necho \"x\";\n",
+                      ['<span class="hl-v">$id</span>', '<span class="hl-k">echo</span>']),
+            "a.go": ("package main\nfunc h() { x := 1 }\n",
+                     ['<span class="hl-k">func</span>', '<span class="hl-f">h</span>']),
+            "C.cs": ("class C { [HttpGet] void M() {} }\n",
+                     ['<span class="hl-a">[HttpGet]</span>', '<span class="hl-f">M</span>']),
+            "a.c": ("int main(void) { return 0; }\n",
+                    ['<span class="hl-t">int</span>', '<span class="hl-f">main</span>']),
+            "a.ts": ("let x: number = 1;\n", ['<span class="hl-k">let</span>']),
+        }
+        for name, (src, expected) in cases.items():
+            joined = "\n".join(self._hl(name, src))
+            for frag in expected:
+                self.assertIn(frag, joined, name)
+
+    def test_member_access_is_not_an_annotation(self):
+        self.assertEqual(self._hl("a.py", "x = os.path.sep\n"), ["x = os.path.sep"])
+
+    def test_line_count_survives_multiline_tokens_and_crlf(self):
+        src = 'x = """a\nb\nc"""\n/* not python */\r\ny = 1\r\n'
+        out = self._hl("a.py", src)
+        self.assertEqual(len(out), 5)
+        self.assertNotIn("\r", "".join(out))
+        js = self._hl("a.js", "/* one\ntwo */\nconst s = `a\n${b}\nc`;\n")
+        self.assertEqual(len(js), 5)
+        self.assertIn('<span class="hl-c">two */</span>', js[1])
+
+    def test_code_is_escaped(self):
+        out = "".join(self._hl("a.js", "const s = '<script>alert(1)</script>';\n"))
+        self.assertIn("&lt;script&gt;", out)
+        self.assertNotIn("<script>", out)
+
+    def test_templates_and_config_use_the_regex_fallback(self):
+        html_out = self._hl("t.html", "<p>{{ post.text | safe }}</p>\n<!-- n -->\n")
+        self.assertIn('<span class="hl-a">{{ post.text | safe }}</span>', html_out[0])
+        self.assertIn('<span class="hl-c">&lt;!-- n --&gt;</span>', html_out[1])
+        docker = self._hl("Dockerfile", "# base\nFROM node:18\n")
+        self.assertEqual(docker[0], '<span class="hl-c"># base</span>')
+        self.assertIn('<span class="hl-k">FROM</span>', docker[1])
+        self.assertIsNone(self._hl("notes.md", "# Title\n"))
+
+    def test_large_files_are_shown_plain(self):
+        from sast.web.highlight import MAX_HIGHLIGHT_BYTES
+        self.assertIsNone(self._hl("a.py", "x = 1\n" * (MAX_HIGHLIGHT_BYTES // 6 + 1)))
+
+    def test_viewer_rows_keep_their_line_numbers(self):
+        from sast.web.codeview import render_file
+        src = b'x = """a\nb"""\nimport os\nos.system(input())\n'
+        notes = {"a.py": {4: [{"kind": "sink", "severity": "high",
+                               "title": "Command injection", "rule_id": "r",
+                               "index": 0}]}}
+        page = render_file("ab12", "proj", "a.py", src, ["a.py"], notes)
+        self.assertIn('<tr id="L4" class="has-sink">', page)
+        row = page.split('<tr id="L4"')[1].split("</tr>")[0]
+        self.assertIn('<span class="hl-f">system</span>', row)

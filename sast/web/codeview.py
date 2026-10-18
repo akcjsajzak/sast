@@ -155,8 +155,17 @@ def render_file(scan_id: str, label: str, rel: str, content: bytes,
     A source or step note links to its finding's sink, which is often in
     another file: following a trace is a matter of clicking through it.
     """
+    from .highlight import highlight_lines
     text = content.decode("utf-8", "replace")
-    lines = text.splitlines() or [""]
+    # Rows split on newline alone, as tree-sitter counts them, so a
+    # finding's line number lands on the row it names.
+    lines = text.split("\n")
+    if len(lines) > 1 and lines[-1] == "":
+        lines.pop()
+    lines = [line.rstrip("\r") for line in lines] or [""]
+    highlighted = highlight_lines(rel, content)
+    if highlighted is not None and len(highlighted) != len(lines):
+        highlighted = None  # never let colouring shift a line number
     file_notes = notes.get(rel, {})
     rows = []
     for n, line in enumerate(lines, 1):
@@ -175,7 +184,9 @@ def render_file(scan_id: str, label: str, rel: str, content: bytes,
         rows.append(
             f'<tr id="L{n}"{cls}><td class="ln"><a href="#L{n}">{n}</a></td>'
             f'<td class="gm">{mark}</td>'
-            f'<td class="src"><code>{_esc(line) or " "}</code></td></tr>')
+            f'<td class="src"><code>'
+            f'{(highlighted[n - 1] if highlighted is not None else _esc(line)) or " "}'
+            f'</code></td></tr>')
         if anns:
             rows.append('<tr class="note"><td></td><td></td><td>'
                         + "".join(_note(a, scan_id, rel, set(files)) for a in anns)
@@ -321,4 +332,15 @@ tr.note div { margin:2px 0; }
 .dim a { color:var(--accent); text-decoration:none; }
 .dim a:hover { text-decoration:underline; }
 .empty { padding:80px 20px; text-align:center; color:var(--muted); }
+/* Syntax colours (GitHub-like), light then dark. */
+.hl-k { color:#cf222e; } .hl-s { color:#0a3069; } .hl-c { color:#6e7781; font-style:italic; }
+.hl-n { color:#0550ae; } .hl-t { color:#953800; } .hl-f { color:#8250df; }
+.hl-o { color:#0550ae; } .hl-a { color:#116329; } .hl-v { color:#953800; }
+.hl-g { color:#116329; }
+@media (prefers-color-scheme: dark) {
+  .hl-k { color:#ff7b72; } .hl-s { color:#a5d6ff; } .hl-c { color:#8b949e; }
+  .hl-n { color:#79c0ff; } .hl-t { color:#ffa657; } .hl-f { color:#d2a8ff; }
+  .hl-o { color:#79c0ff; } .hl-a { color:#7ee787; } .hl-v { color:#ffa657; }
+  .hl-g { color:#7ee787; }
+}
 """
