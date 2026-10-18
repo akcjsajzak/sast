@@ -218,6 +218,61 @@ def _is_property_key(key: str) -> bool:
     return key.startswith("$this->") or key.startswith("self::") or "::$" in key
 
 
+_SQL_ESCAPED = "sql_escaped"
+_COMPOSITE_STRINGS = ("binary_expression", "encapsed_string", "string",
+                      "parenthesized_expression", "heredoc")
+
+
+def _literal_text(node: Node) -> str:
+    """The literal text a PHP string expression contributes, values blank.
+
+    Enough to tell whether a later value lands inside quotes: the quotes
+    are in the literals, never in the interpolated variables.
+    """
+    if node.type == "string":
+        raw = au.text(node)
+        return raw[1:-1] if len(raw) >= 2 else ""
+    if node.type == "encapsed_string":
+        return "".join(au.text(c) for c in node.named_children
+                       if c.type == "string_content")
+    if node.type == "binary_expression":
+        return "".join(_literal_text(c) for c in node.named_children)
+    if node.type == "parenthesized_expression" and node.named_children:
+        return _literal_text(node.named_children[0])
+    return ""
+
+
+def _inside_quotes(prefix: str) -> bool:
+    """Whether the end of `prefix` sits inside a '...' or "..." literal."""
+    quote = ""
+    escaped = False
+    for ch in prefix:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+    return bool(quote)
+
+
+def _restore_unquoted(t, prefix: str, node: Node, sf: SourceFile):
+    """Put SQL taint back on a quote-escaped value used outside quotes."""
+    if t is None or _SQL_ESCAPED not in t.tags or _inside_quotes(prefix):
+        return t
+    return Taint(
+        tags=t.tags | {"sql"}, origins=list(t.origins),
+        steps=t.steps + [TaintStep(
+            location=make_loc(sf, node),
+            description="quote-escaped value used outside quotes, where the "
+                        "escaping does not apply (e.g. `WHERE id = $id`)",
+            code=sf.node_line(node))],
+        confidence=t.confidence)
+
+
 def _dedup(items: list):
     seen = set()
     out = []
@@ -381,6 +436,12 @@ class TaintEngine:
         if t == "expression_statement":
             nc = stmt.named_children
             if nc:
+                # A case body hands over its statements wrapped, unlike a
+                # block, so an assignment arrives here and must still be
+                # recorded: `case MYSQL: $q = "...$id"; mysqli_query($c, $q);`
+                if nc[0].type in ("assignment_expression",
+                                  "augmented_assignment_expression"):
+                    return self.process_stmt(nc[0], sf, env, ctx)
                 self.taint_of(nc[0], sf, env, ctx)
             return None
         # Fallback: evaluate expression for embedded sinks.
@@ -669,6 +730,15 @@ class TaintEngine:
             return self.taint_of(nc[0], sf, env, ctx) if nc else None
         if t == "binary_expression":
             return self.binary_taint(node, sf, env, ctx)
+        # An assignment inside an expression still assigns, and evaluates to
+        # the value assigned. `or` binds looser than `=`, so the ubiquitous
+        # `$r = mysqli_query($c, $q) or die(...)` is an assignment inside a
+        # binary expression; reading it as a plain value skipped the call and
+        # its sink. The same shape covers `while ($row = fetch($r))`.
+        if t in ("assignment_expression", "augmented_assignment_expression"):
+            self.process_stmt(node, sf, env, ctx)
+            nc = node.named_children
+            return self.taint_of(nc[0], sf, env, ctx) if nc else None
         if t == "conditional_expression":
             merged = None
             for c in node.named_children[1:]:
@@ -745,9 +815,13 @@ class TaintEngine:
             return None
         # Interpolated string: propagate taint of embedded variables.
         merged = None
+        prefix = ""
         for c in node.named_children:
-            if c.type in ("variable_name", "string_interpolation", "member_access_expression"):
-                tt = self.taint_of(c, sf, env, ctx)
+            if c.type == "string_content":
+                prefix += au.text(c)
+            elif c.type in ("variable_name", "string_interpolation", "member_access_expression"):
+                tt = _restore_unquoted(self.taint_of(c, sf, env, ctx), prefix,
+                                       c, sf)
                 if tt is not None:
                     merged = tt if merged is None else merged.merge(tt)
         return merged
@@ -758,14 +832,27 @@ class TaintEngine:
             if not c.is_named and c.text and c.text.strip():
                 op = c.text.decode("utf-8", "replace").strip()
                 break
-        if op not in (".", "??"):
-            return None
         merged = None
+        prefix = ""
         for c in node.named_children:
+            # Every operand is evaluated, for the sinks and assignments it
+            # holds: `$r = mysqli_query($c, $q) or die()` and
+            # `if (system($cmd) == 0)` hide their sink inside a logical or
+            # comparison operator, which was skipped outright.
             tt = self.taint_of(c, sf, env, ctx)
+            if op == ".":
+                # Only a value operand is judged here. A string or a nested
+                # concatenation already decided for the values inside it,
+                # against its own literals; judging the composite again with
+                # an empty prefix put the taint back on `"id='" . $v . "'"`.
+                if c.type not in _COMPOSITE_STRINGS:
+                    tt = _restore_unquoted(tt, prefix, c, sf)
+                prefix += _literal_text(c)
             if tt is not None:
                 merged = tt if merged is None else merged.merge(tt)
-        return merged
+        # Only concatenation and null-coalescing pass the operands' value
+        # on; a comparison or a boolean is not attacker-controlled text.
+        return merged if op in (".", "??") else None
 
     def cast_taint(self, node: Node, sf: SourceFile, env: dict, ctx: Ctx):
         # Determine cast type token.
@@ -1012,6 +1099,8 @@ class TaintEngine:
 
     def sanitized_taint(self, san: SanitizerRule, args, sf, env, ctx):
         idx = san.arg_index
+        if idx == -1 and args:
+            idx = len(args) - 1
         if idx < 0 or idx >= len(args):
             return None
         t = self.taint_of(args[idx], sf, env, ctx)
@@ -1033,6 +1122,14 @@ class TaintEngine:
             )
         if "*" in san.neutralize:
             return None
+        if san.quote_only and "sql" in t.tags:
+            # Escaped for a quoted context: keep a marker so an unquoted use
+            # can restore the SQL taint (see _restore_unquoted).
+            t = Taint(tags=(t.tags - {"sql"}) | {_SQL_ESCAPED},
+                      origins=list(t.origins), steps=list(t.steps),
+                      confidence=t.confidence)
+            remaining = [n for n in san.neutralize if n != "sql"]
+            return self._neutralize(t, remaining) if remaining else t
         return self._neutralize(t, san.neutralize)
 
     def _neutralize(self, t: Taint, tags: list) -> Taint:

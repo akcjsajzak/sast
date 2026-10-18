@@ -188,7 +188,7 @@ class SanitizerRule:
     neutralize: list[str]     # tags to remove, or ['*'] for all
     frameworks: tuple = ALL
     cls: Optional[str] = None
-    arg_index: int = 0        # which argument is sanitized
+    arg_index: int = 0        # which argument is sanitized; -1 = the last
     # Escapes, but with a documented bypass or a context caveat. The finding
     # survives at reduced confidence instead of disappearing.
     weak: bool = False
@@ -200,6 +200,12 @@ class SanitizerRule:
     required_arg: Optional[tuple] = None
     # Explains the caveat; surfaced in the trace of a weak-sanitizer finding.
     note: str = ""
+    # Escapes quote characters and nothing else, so it protects a value only
+    # inside a quoted SQL string. Instead of clearing the SQL taint, the
+    # value is marked escaped, and the taint comes back if it is
+    # interpolated outside quotes: `WHERE id = $id` takes `1 OR 1=1` with
+    # no quote to escape. PHP engine.
+    quote_only: bool = False
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)

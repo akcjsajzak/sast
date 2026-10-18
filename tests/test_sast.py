@@ -688,7 +688,8 @@ class TestSanitizerSoundness(unittest.TestCase):
 
     def test_sound_sanitizers_still_clear_taint(self):
         for code in ("echo htmlspecialchars($_GET['u']);",
-                     "mysqli_query($c, 'SELECT '.mysqli_real_escape_string($c,$_GET['n']));",
+                     "mysqli_query($c, \"SELECT a FROM t WHERE n = '\"."
+                     "mysqli_real_escape_string($c,$_GET['n']).\"'\");",
                      "system('ls '.escapeshellarg($_GET['d']));",
                      "system(filter_var($_GET['c'], FILTER_SANITIZE_STRING));",
                      "mysqli_query($c, 'SELECT '.intval($_GET['i']));"):
@@ -3908,3 +3909,78 @@ class TestAiohttpAndClassResolution(unittest.TestCase):
                  for f in _scan(self.FILES).findings
                  if f.rule_id == "py-sqli-execute"]
         self.assertEqual(found, [("student.py", 6)])
+
+
+class TestPhpStatementShapes(unittest.TestCase):
+    """Shapes that hid DVWA's SQL injection from the PHP engine."""
+
+    def _rules(self, code):
+        return sorted((f.rule_id, f.location.line)
+                      for f in _scan({"a.php": "<?php\n" + code}).findings)
+
+    def test_assignment_inside_or_die(self):
+        """`or` binds looser than `=`: the assignment sits in a binary."""
+        self.assertEqual(self._rules(
+            "$q = \"SELECT a FROM u WHERE id = '\" . $_GET['id'] . \"'\";\n"
+            "$r = mysqli_query($c, $q) or die(mysqli_error($c));\n"),
+            [("php-sqli-mysqli_query", 3)])
+
+    def test_assignment_in_a_switch_case(self):
+        self.assertEqual(self._rules(
+            "$id = $_REQUEST['id'];\n"
+            "switch ($db) {\n"
+            "    case MYSQL:\n"
+            "        $q = \"SELECT a FROM u WHERE id = '$id'\";\n"
+            "        mysqli_query($c, $q);\n"
+            "        break;\n"
+            "}\n"), [("php-sqli-mysqli_query", 6)])
+
+    def test_sink_inside_a_comparison(self):
+        found = self._rules(
+            "if (system($_GET['c']) == 0) { }\n"
+            "$ok = strlen($_GET['x']) > 3;\n"
+            "mysqli_query($c, 'SELECT ' . $ok);\n")
+        self.assertEqual(found, [("php-cmdi-system", 2)])
+
+    def test_assignment_in_a_loop_condition(self):
+        self.assertIn(("php-xss-echo", 4), self._rules(
+            "$r = mysqli_query($c, 'SELECT name FROM u');\n"
+            "while ($row = mysqli_fetch_assoc($r)) {\n"
+            "    echo $row['name'];\n"
+            "}\n"))
+
+
+class TestPhpQuoteEscapingContext(unittest.TestCase):
+    """mysqli_real_escape_string() escapes quotes, so it protects a value
+    only inside a quoted literal. DVWA's sqli/medium escapes the id and
+    then writes `WHERE user_id = $id`, where `1 OR 1=1` needs no quote."""
+
+    def _lines(self, code):
+        return sorted(f.location.line for f in _scan({"a.php": "<?php\n" + code}).findings
+                      if f.rule_id == "php-sqli-mysqli_query")
+
+    def test_escaped_value_is_judged_by_where_it_lands(self):
+        self.assertEqual(self._lines(
+            "$id = mysqli_real_escape_string($c, $_POST['id']);\n"
+            "mysqli_query($c, \"SELECT a FROM u WHERE id = $id;\");\n"
+            "mysqli_query($c, \"SELECT a FROM u WHERE id = '$id';\");\n"
+            "mysqli_query($c, \"SELECT a FROM u WHERE n LIKE '%$id%'\");\n"
+            "mysqli_query($c, \"SELECT a FROM u WHERE id = \" . $id);\n"
+            "mysqli_query($c, \"SELECT a FROM u WHERE id = '\" . $id . \"'\");\n"
+            "mysqli_query($c, 'SELECT a FROM u WHERE id = \"' . $id . '\"');\n"
+            "mysqli_query($c, \"SELECT a FROM u WHERE id = {$id} LIMIT 1\");\n"
+            "mysqli_query($c, \"SELECT a FROM u WHERE n = 'it\\'s' AND id = $id\");\n"),
+            [3, 6, 9, 10])
+
+    def test_the_connection_argument_is_not_the_value(self):
+        """The rule sanitized argument 0, the link, which is never tainted,
+        so mysqli_real_escape_string($link, $v) declared every result clean
+        wherever it was used."""
+        self.assertEqual(self._lines(
+            "mysqli_query($c, 'SELECT a FROM t WHERE id = ' ."
+            " mysqli_real_escape_string($c, $_GET['n']));\n"), [2])
+
+    def test_pg_escape_literal_quotes_for_itself(self):
+        self.assertEqual(self._lines(
+            "$v = pg_escape_literal($c, $_GET['n']);\n"
+            "mysqli_query($c, \"SELECT a FROM t WHERE n = $v\");\n"), [])

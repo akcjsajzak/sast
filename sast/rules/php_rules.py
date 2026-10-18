@@ -689,9 +689,20 @@ def _sanitizers() -> list[SanitizerRule]:
                            frameworks=("Laravel",)))
 
     # SQL escaping. The driver-aware functions are sound; addslashes is not.
-    for fn in ("mysqli_real_escape_string", "mysql_real_escape_string",
-               "pg_escape_string", "pg_escape_literal", "sqlite_escape_string"):
-        s.append(SanitizerRule(kind="function", match=fn, neutralize=["sql"]))
+    # These escape quotes, so they are sound only inside a quoted literal;
+    # pg_escape_literal adds the quotes itself and is sound anywhere. The
+    # value is not always the first argument: mysqli_real_escape_string
+    # takes the connection first, and the pg_ functions take an optional
+    # one, so their value is the last argument (-1). Sanitizing argument 0
+    # of mysqli_real_escape_string($link, $v) looked at the connection,
+    # which is never tainted, and so declared every result clean.
+    for fn, idx in (("mysqli_real_escape_string", 1),
+                    ("mysql_real_escape_string", 0),
+                    ("pg_escape_string", -1), ("sqlite_escape_string", 0)):
+        s.append(SanitizerRule(kind="function", match=fn, neutralize=["sql"],
+                               quote_only=True, arg_index=idx))
+    s.append(SanitizerRule(kind="function", match="pg_escape_literal",
+                           neutralize=["sql"], arg_index=-1))
     s.append(SanitizerRule(
         kind="function", match="addslashes", neutralize=["sql"], weak=True,
         note="addslashes() is not connection-charset aware and is bypassable "
