@@ -1093,6 +1093,8 @@ class JavaTaintEngine:
                 continue
             if sink.obj_hint and sink.obj_hint.lower() not in rkey and sink.obj_hint.lower() not in full:
                 continue
+            if sink.type_arg and not _declares_type_arg(node, sink.type_arg):
+                continue
             indices = range(len(args)) if sink.arg_index < 0 else [sink.arg_index]
             for i in indices:
                 if i >= len(args):
@@ -1115,7 +1117,10 @@ class JavaTaintEngine:
                 continue
             if not match_callee(cls, sink.match):
                 continue
-            for i, a in enumerate(args):
+            if sink.type_arg and not _declares_type_arg(node, sink.type_arg):
+                continue
+            indices = range(len(args)) if sink.arg_index < 0 else [sink.arg_index]
+            for i, a in ((i, args[i]) for i in indices if i < len(args)):
                 t = self.taint_of(a, sf, env, tenv, ctx)
                 if t is not None and (t.tags & set(sink.tags)):
                     self.emit_finding(sink, t, node, sf)
@@ -1131,6 +1136,12 @@ class JavaTaintEngine:
 
     def _resolve_receiver_class(self, obj, tenv, ctx):
         if obj is None:
+            return ctx.current_class
+        # tree-sitter-java gives `this` and `super` node types of their own,
+        # so the identifier branch below never saw them and every
+        # `this.helper(x)` call went unresolved. lookup_method walks up to
+        # the parent class, which covers `super.m()` too.
+        if obj.type in ("this", "super"):
             return ctx.current_class
         if obj.type == "identifier":
             name = ja.text(obj)
@@ -1341,3 +1352,49 @@ def _merge_tenv(tenv: dict, other: dict) -> None:
             tenv.pop(k, None)   # changed by the branch: no single value holds
     for k in [k for k in tenv if k.startswith(_CONST_PREFIX) and k not in other]:
         tenv.pop(k, None)       # discarded by the branch
+
+
+def _first_type_arg(text: str):
+    """The outermost generic argument of `X<A<B>, C>`: `A<B>`. None for <>."""
+    i = text.find("<")
+    if i < 0:
+        return None
+    depth, buf = 0, []
+    for ch in text[i:]:
+        if ch == "<":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                break
+        elif ch == "," and depth == 1:
+            break
+        buf.append(ch)
+    arg = "".join(buf).strip()
+    return arg or None
+
+
+def _declares_type_arg(node, wanted: str) -> bool:
+    """Whether a generic construction or builder call is typed `<wanted>`.
+
+    `new ResponseEntity<String>(...)` states it; `new ResponseEntity<>(...)`
+    and `ResponseEntity.ok(...)` take it from the enclosing method's
+    declared return type. Only the outermost argument counts:
+    `ResponseEntity<Bean<String>>` is a bean, whatever it holds.
+    """
+    if node.type == "object_creation_expression":
+        for c in node.named_children:
+            if c.type == "generic_type":
+                arg = _first_type_arg(ja.text(c))
+                if arg is not None:
+                    return arg == wanted
+    parent = node.parent
+    while parent is not None and parent.type not in (
+            "method_declaration", "lambda_expression", "class_body"):
+        parent = parent.parent
+    if parent is None or parent.type != "method_declaration":
+        return False
+    rtype = parent.child_by_field_name("type")
+    return rtype is not None and _first_type_arg(ja.text(rtype)) == wanted

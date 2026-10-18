@@ -144,6 +144,12 @@ class SinkRule:
     # pollution, but Express's `app.set('port', n)` is configuration. JS
     # engine; obj_hint, a substring test, cannot tell `_` from `app_cfg`.
     receivers: Optional[tuple] = None
+    # Generic type argument the sink requires: `ResponseEntity<String>` puts
+    # its body in the response as text a browser renders, while
+    # `ResponseEntity<SomeBean>` is serialised to JSON. Read from the
+    # constructor's type arguments, or for `<>` and static builders from the
+    # enclosing method's declared return type. Java engine.
+    type_arg: Optional[str] = None
     # Regex over the call's argument text that makes it safe: an explicit
     # `Loader=yaml.SafeLoader` turns yaml.load() into safe_load(). Matched
     # against every argument, keyword arguments included. Generic engine.

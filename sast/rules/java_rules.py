@@ -209,7 +209,47 @@ def _sinks() -> list[SinkRule]:
             tags=["xss"], obj_hint="response",
         ))
 
+    # --- Spring: a String body returned as the response ---
+    # Spring writes a ResponseEntity<String> body out as text, and with a
+    # browser's Accept header that is text/html, so request data in it is
+    # reflected XSS. A bean body is JSON and is left alone (type_arg).
+    k.append(SinkRule(
+        rule_id="java-xss-responseentity", kind="object_create",
+        match="ResponseEntity",
+        title="XSS via a ResponseEntity<String> body",
+        severity="medium", cwe="CWE-79", owasp=A03, category="xss",
+        description="Untrusted data is returned as the body of a "
+                    "ResponseEntity<String>, which browsers render as HTML.",
+        remediation="Encode for HTML (e.g. HtmlUtils.htmlEscape), or return "
+                    "JSON with an explicit application/json content type.",
+        tags=["xss"], arg_index=0, type_arg="String", confidence="medium",
+    ))
+    for m in ("ok", "body"):
+        k.append(SinkRule(
+            rule_id=f"java-xss-responseentity-{m}", kind="method", match=m,
+            obj_hint="ResponseEntity",
+            title=f"XSS via ResponseEntity.{m}() with a String body",
+            severity="medium", cwe="CWE-79", owasp=A03, category="xss",
+            description="Untrusted data is returned as the body of a "
+                        "ResponseEntity<String>, which browsers render as HTML.",
+            remediation="Encode for HTML (e.g. HtmlUtils.htmlEscape), or return "
+                        "JSON with an explicit application/json content type.",
+            tags=["xss"], arg_index=0, type_arg="String", confidence="medium",
+        ))
+
     # --- Path traversal / arbitrary file access ---
+    # Classpath resources: a `../` in the name walks out of the intended
+    # resource folder (VulnerableApp's path traversal levels read this way).
+    for m in ("getResourceAsStream", "getResource"):
+        k.append(SinkRule(
+            rule_id=f"java-path-{m.lower()}", kind="method", match=m,
+            title=f"Path traversal via {m}()",
+            severity="high", cwe="CWE-22", owasp="A01:2021 — Broken Access Control",
+            category="path-traversal",
+            description="Untrusted data chooses which classpath resource is read.",
+            remediation="Map the input to a fixed allow-list of resource names.",
+            tags=["path", "lfi"], arg_index=0,
+        ))
     k.append(SinkRule(
         rule_id="java-path-file", kind="object_create", match="File",
         title="Path traversal via new File()",
@@ -289,6 +329,32 @@ def _sinks() -> list[SinkRule]:
         ))
 
     # --- LDAP injection (search only: `lookup` is JNDI, handled separately) ---
+    # UnboundID's LDAPConnection and Spring's LdapTemplate take the filter
+    # as a later argument; matched on the receiver's declared type.
+    for hint, methods in (("ldapconnection", ("search", "searchForEntry")),
+                          ("ldaptemplate", ("search", "searchForObject",
+                                            "authenticate"))):
+        for m in methods:
+            k.append(SinkRule(
+                rule_id=f"java-ldap-{hint}-{m.lower()}", kind="method", match=m,
+                title=f"LDAP injection via {m}()",
+                severity="high", cwe="CWE-90", owasp=A03,
+                category="ldap-injection",
+                description="Untrusted data is concatenated into an LDAP filter.",
+                remediation="Build filters with Filter.createEqualityFilter() / "
+                            "LdapQueryBuilder, or escape with Filter.encodeValue().",
+                tags=["ldap"], obj_hint=hint))
+    # A redirect target set through Spring's typed APIs.
+    for m, hint in (("setLocation", "headers"), ("location", "responseentity")):
+        k.append(SinkRule(
+            rule_id=f"java-redirect-{m.lower()}", kind="method", match=m,
+            title=f"Open redirect via {m}()",
+            severity="medium", cwe="CWE-601", owasp="A01:2021 — Broken Access Control",
+            category="open-redirect",
+            description="The redirect target comes from user input, so the "
+                        "response can send the browser to any site.",
+            remediation="Redirect only to relative paths or an allow-listed host.",
+            tags=["redirect"], arg_index=0, obj_hint=hint))
     k.append(SinkRule(
         rule_id="java-ldap-search", kind="method", match="search",
         title="LDAP injection via DirContext.search()",
@@ -536,10 +602,18 @@ def _trustbound_sinks() -> list[SinkRule]:
 
 def _sanitizers() -> list[SanitizerRule]:
     s = []
+    # Spring's hex/decimal variants and the OWASP Java Encoder's
+    # context-specific methods escape at least as much as htmlEscape.
     for m in ("htmlEscape", "escapeHtml", "escapeHtml4", "forHtml", "encodeForHTML",
-              "escapeHtml3"):
+              "escapeHtml3", "htmlEscapeHex", "htmlEscapeDecimal", "forHtmlContent",
+              "forHtmlAttribute", "forHtmlUnquotedAttribute", "encodeForHTMLAttribute",
+              "escapeXml", "escapeXml10", "escapeXml11", "forXml", "forXmlContent",
+              "forXmlAttribute"):
         s.append(SanitizerRule(kind="method", match=m, neutralize=["xss"]))
     s.append(SanitizerRule(kind="method", match="encodeForURL", neutralize=["redirect"]))
+    # LDAP filter escaping: UnboundID, Spring LDAP, OWASP ESAPI.
+    for m in ("encodeValue", "filterEncode", "encodeForLDAP"):
+        s.append(SanitizerRule(kind="method", match=m, neutralize=["ldap"]))
     return s
 
 

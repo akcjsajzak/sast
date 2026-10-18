@@ -4290,3 +4290,69 @@ class TestPhpExpressionsAreEvaluated(unittest.TestCase):
             "mysql_query('x' . $y);\n")}).findings)
         self.assertEqual(found, [("php-cmdi-system", 2),
                                  ("php-sqli-mysql_query", 3)])
+
+
+SPRING_POM = ('<project><dependencies><dependency><groupId>org.springframework.boot'
+              '</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>'
+              '</dependencies></project>')
+
+
+def _java(body: str) -> list:
+    """(rule_id, line) for findings in one Spring controller."""
+    return sorted((f.rule_id, f.location.line) for f in _scan({
+        "pom.xml": SPRING_POM, "src/main/java/a/C.java": body}).findings
+        if f.language == "java")
+
+
+class TestJavaVulnerableAppShapes(unittest.TestCase):
+    """SasanLabs VulnerableApp: levels per vulnerability, most of them
+    calling a shared helper through `this.`, which was never resolved."""
+
+    def test_this_qualified_helper_call(self):
+        """tree-sitter-java gives `this` its own node type; the receiver
+        check looked for an identifier named "this"."""
+        self.assertIn(("java-cmdi-exec", 4), _java(
+            "package a;\npublic class C {\n"
+            "  String ping(String ip) throws Exception {\n"
+            "    Runtime.getRuntime().exec(\"ping \" + ip); return \"\"; }\n"
+            "  @GetMapping(\"/x\")\n"
+            "  public String m(@RequestParam(\"ip\") String ip) throws Exception {\n"
+            "    return this.ping(ip).toString(); }\n}\n"))
+
+    def test_string_response_entity_is_html(self):
+        found = _java(
+            "package a;\npublic class C {\n"
+            "  @GetMapping(\"/a\")\n"
+            "  public ResponseEntity<String> a(@RequestParam(\"q\") String q) {\n"
+            "    return new ResponseEntity<>(String.format(\"<img src=%s>\", q), HttpStatus.OK); }\n"
+            "  @GetMapping(\"/b\")\n"
+            "  public ResponseEntity<Bean<String>> b(@RequestParam(\"q\") String q) {\n"
+            "    return new ResponseEntity<>(new Bean<>(q), HttpStatus.OK); }\n"
+            "  @GetMapping(\"/c\")\n"
+            "  public ResponseEntity<String> c(@RequestParam(\"q\") String q) {\n"
+            "    return ResponseEntity.ok(HtmlUtils.htmlEscapeHex(q)); }\n"
+            "  @GetMapping(\"/d\")\n"
+            "  public ResponseEntity<String> d(@RequestParam(\"q\") String q) {\n"
+            "    return ResponseEntity.ok().body(\"<p>\" + q); }\n}\n")
+        self.assertEqual([r for r in found if "xss" in r[0]],
+                         [("java-xss-responseentity", 5),
+                          ("java-xss-responseentity-body", 14)])
+
+    def test_classpath_resource_and_ldap_and_location(self):
+        found = _java(
+            "package a;\npublic class C {\n"
+            "  @GetMapping(\"/a\")\n"
+            "  public String a(@RequestParam(\"f\") String f, @RequestParam(\"u\") String u) throws Exception {\n"
+            "    this.getClass().getResourceAsStream(\"/static/\" + f);\n"
+            "    LDAPConnection connection = server.getConnection();\n"
+            "    connection.search(\"dc=x\", SearchScope.SUB, \"(uid=\" + u + \")\");\n"
+            "    connection.search(\"dc=x\", SearchScope.SUB, \"(uid=\" + Filter.encodeValue(u) + \")\");\n"
+            "    HttpHeaders headers = new HttpHeaders();\n"
+            "    headers.setLocation(URI.create(u));\n"
+            "    return \"\"; }\n}\n")
+        for expected in (("java-ldap-ldapconnection-search", 7),
+                         ("java-path-getresourceasstream", 5),
+                         ("java-redirect-setlocation", 10)):
+            self.assertIn(expected, found)
+        # Filter.encodeValue() escapes the filter value (line 8).
+        self.assertNotIn(("java-ldap-ldapconnection-search", 8), found)
