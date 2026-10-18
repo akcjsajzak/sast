@@ -275,17 +275,33 @@ _GO_FRAMEWORKS = [
     (re.compile(r"\bnet/http\b"), "net/http"),
 ]
 _CS_FRAMEWORKS = [
-    (re.compile(r"Microsoft\.AspNetCore|using\s+Microsoft\.AspNetCore"), "ASP.NET Core"),
+    # The Web SDK is how a project file says ASP.NET Core; a minimal one
+    # names no AspNetCore package at all.
+    (re.compile(r"Microsoft\.AspNetCore|using\s+Microsoft\.AspNetCore"
+                r"|Sdk\s*=\s*\"Microsoft\.NET\.Sdk\.Web\""), "ASP.NET Core"),
     (re.compile(r"System\.Web\.Mvc|using\s+System\.Web"), "ASP.NET"),
 ]
 
 
 def _detect_by_markers(root: str, source_files: list[str], markers: list,
-                       manifests: tuple, default: str = "raw") -> tuple:
-    """Detect a framework from manifest text first, then source markers."""
+                       manifests: tuple, default: str = "raw",
+                       extra_manifests: tuple = ()) -> tuple:
+    """Detect a framework from manifest text first, then source markers.
+
+    `extra_manifests` are suffixes for manifests whose name varies per
+    project (`MyApp.csproj`), found under the scan root.
+    """
     manifest_files: list[str] = []
     module_dirs = find_manifest_dirs(root, manifests) if manifests else [root]
     blob = ""
+    if extra_manifests:
+        for path in _files_with_suffix(root, extra_manifests):
+            manifest_files.append(path)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    blob += fh.read(200000)
+            except OSError:
+                continue
     for mod in module_dirs:
         for name in manifests:
             path = os.path.join(mod, name)
@@ -313,6 +329,21 @@ def _detect_by_markers(root: str, source_files: list[str], markers: list,
     return default, None, manifest_files, [], module_dirs or [root]
 
 
+def _files_with_suffix(root: str, suffixes: tuple, limit: int = 50) -> list:
+    """Up to `limit` files under root ending in one of `suffixes`."""
+    from .language import IGNORED_DIRS
+    out: list = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in IGNORED_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if name.lower().endswith(suffixes):
+                out.append(os.path.join(dirpath, name))
+                if len(out) >= limit:
+                    return sorted(out)
+    return sorted(out)
+
+
 def detect_framework(root: str, language: str, source_files: list[str]) -> ProjectProfile:
     """Auto-detect the framework (if any) for a project."""
     if language == "php":
@@ -330,7 +361,8 @@ def detect_framework(root: str, language: str, source_files: list[str]) -> Proje
             root, source_files, _GO_FRAMEWORKS, ("go.mod",))
     elif language == "csharp":
         framework, version, manifests, notes, modules = _detect_by_markers(
-            root, source_files, _CS_FRAMEWORKS, ("packages.config",))
+            root, source_files, _CS_FRAMEWORKS, ("packages.config",),
+            extra_manifests=(".csproj", ".fsproj", ".vbproj"))
     elif language in ("c", "cpp"):
         framework, version, manifests, notes, modules = _detect_by_markers(
             root, source_files, [],

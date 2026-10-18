@@ -310,20 +310,25 @@ class ScanEngine:
                 return [], 0, 0, []
             parsed, unreadable = self._parse_all(parser, source_files)
             symbols = build_symbols(parsed, profile)
+            # Routes first: their handlers' parameters are request data.
+            routes = scan_routes(parsed, language, framework, root)
             engine = GenericTaintEngine(profile, rules, framework, language,
-                                        symbols)
+                                        symbols,
+                                        entry_points=_entry_params(
+                                            routes, language, framework))
             findings = engine.analyze(parsed)
             # C and C++ carry a vulnerability class the taint engines cannot
             # express: a pointer freed and then used, or freed twice, is a bug
             # wherever its value came from.
             if language in ("c", "cpp"):
                 findings.extend(scan_memory_safety(parsed, language))
-            routes, extra = self._surface(parsed, language, framework, root)
+            routes, extra = self._surface(parsed, language, framework, root,
+                                          routes=routes)
             return findings + extra, len(parsed), unreadable, routes
 
         return [], 0, 0, []
 
-    def _surface(self, parsed, language, framework, root):
+    def _surface(self, parsed, language, framework, root, routes=None):
         """Routes for one language, plus the access-control candidates.
 
         Both read the same trees the taint engine just built. The authz pass
@@ -331,7 +336,8 @@ class ScanEngine:
         unguarded route is anomalous means knowing whether its neighbours
         are guarded.
         """
-        routes = scan_routes(parsed, language, framework, root)
+        if routes is None:
+            routes = scan_routes(parsed, language, framework, root)
         extra: list = []
         if self.options.audit:
             extra = scan_authz(parsed, routes, language, framework)
@@ -365,6 +371,35 @@ class ScanEngine:
         import glob
         paths = sorted(glob.glob(os.path.join(base, "*.json")))
         return [p for p in paths if os.path.isfile(p)]
+
+
+# Frameworks that bind request data into every handler parameter (model
+# binding), as opposed to only the parameters named in the URL pattern.
+_BINDS_ALL_PARAMS = {("python", "FastAPI"), ("csharp", "ASP.NET Core"),
+                     ("csharp", "ASP.NET")}
+
+
+def _entry_params(routes: list, language: str, framework: str) -> dict:
+    """(file, handler start line) -> (mode, names) for the generic engine.
+
+    "all": every parameter the framework does not inject itself (FastAPI,
+    ASP.NET model binding). "named": only the URL's named segments (Flask
+    view args, Django URL kwargs). A route without a resolved handler body
+    contributes nothing.
+    """
+    binds_all = (language, framework) in _BINDS_ALL_PARAMS
+    out: dict = {}
+    for r in routes:
+        if not r.body or len(r.body) < 2:
+            continue
+        key = (r.body[0], r.body[1])
+        if binds_all:
+            out[key] = ("all", ())
+        elif r.params:
+            prev = out.get(key)
+            names = set(prev[1]) if prev else set()
+            out[key] = ("named", tuple(names | set(r.params)))
+    return out
 
 
 def _sev_enum(s: str):

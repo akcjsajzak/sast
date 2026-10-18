@@ -4160,3 +4160,77 @@ class TestDockerRootAnchor(unittest.TestCase):
             "FROM node:18-alpine\nCMD [\"node\", \"a.js\"]\n")}).findings
             if f.rule_id == "container-runs-as-root"]
         self.assertEqual(found, [("container-runs-as-root", 4)])
+
+
+class TestRouteParametersAreSources(unittest.TestCase):
+    """Frameworks bind request data into handler parameters; none of it
+    reached the engine as `request.x`. Found with dvcsharp-api's
+    `Search(string keyword)` into FromSql, and true of Flask view args,
+    FastAPI query parameters and Django URL kwargs alike."""
+
+    def _cmdi(self, files):
+        return sorted((os.path.basename(f.location.file), f.location.line)
+                      for f in _scan(files).findings if "cmdi" in f.rule_id)
+
+    def test_flask_view_arguments(self):
+        self.assertEqual(self._cmdi({"requirements.txt": "flask\n", "app.py": (
+            "import os\nfrom flask import Flask\napp = Flask(__name__)\n"
+            "@app.route('/u/<name>')\ndef u(name):\n    os.system('echo ' + name)\n"
+            "@app.route('/v/<int:n>')\ndef v(n, other='x'):\n    os.system(other)\n")}),
+            [("app.py", 6)])
+
+    def test_fastapi_parameters_minus_injected_and_numeric(self):
+        self.assertEqual(self._cmdi({"requirements.txt": "fastapi\n", "app.py": (
+            "import os\nfrom fastapi import FastAPI, Depends, Request\n"
+            "app = FastAPI()\n@app.get('/run')\n"
+            "def run(cmd: str, n: int, request: Request, db = Depends(get_db)):\n"
+            "    os.system(cmd)\n    os.system(str(n))\n    os.system(db.x)\n")}),
+            [("app.py", 6)])
+
+    def test_django_url_kwargs(self):
+        self.assertEqual(self._cmdi({"requirements.txt": "django\n", "app.py": (
+            "import os\nfrom django.urls import path\n"
+            "def v(request, name):\n    os.system(name)\n"
+            "urlpatterns = [path('u/<str:name>/', v)]\n")}), [("app.py", 4)])
+
+    def test_aspnet_action_parameters(self):
+        found = [(f.rule_id, f.location.line) for f in _scan({
+            "App.csproj": '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>',
+            "ProductsController.cs": (
+                "public class ProductsController : Controller {\n"
+                "  [HttpGet(\"search\")]\n"
+                "  public IActionResult Search(string keyword, int page,\n"
+                "      CancellationToken ct, [FromServices] Db db) {\n"
+                "    var query = $\"SELECT * FROM P WHERE n LIKE '%{keyword}%'\";\n"
+                "    var a = _context.Products.FromSql(query).ToList();\n"
+                "    var b = _context.Products.FromSql($\"SELECT * FROM P WHERE n = {keyword}\").ToList();\n"
+                "    _context.Products.FromSqlRaw(\"SELECT \" + page);\n"
+                "    _context.Products.FromSqlRaw(\"SELECT \" + db.Name);\n"
+                "    return Ok(a);\n"
+                "  }\n"
+                "}\n")}).findings if "sqli" in f.rule_id]
+        # Line 7 is EF Core's parameterised form: the interpolated literal
+        # in the call binds its holes. Lines 8-9: an int and an injected
+        # service are not request text.
+        self.assertEqual(found, [("cs-sqli-fromsql", 6)])
+
+
+class TestCSharpDetails(unittest.TestCase):
+    def test_interpolation_holes_carry_taint(self):
+        """C# exposes `{` and `}` as named nodes; the hole's first child
+        was the brace, so $"...{id}..." was always clean."""
+        found = {f.rule_id for f in _scan({"a.cs": (
+            'class C { void M() { var id = Request.Query["id"];'
+            ' var q = $"SELECT {id}"; cmd.ExecuteReader(q); } }')}).findings}
+        self.assertIn("cs-sqli-executereader", found)
+
+    def test_web_sdk_project_is_aspnet_core(self):
+        from sast.detection.framework import detect_framework
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "Shop.csproj"), "w") as fh:
+            fh.write('<Project Sdk="Microsoft.NET.Sdk.Web"></Project>')
+        with open(os.path.join(tmp, "A.cs"), "w") as fh:
+            fh.write("class A {}")
+        self.assertEqual(detect_framework(tmp, "csharp",
+                                          [os.path.join(tmp, "A.cs")]).framework,
+                         "ASP.NET Core")

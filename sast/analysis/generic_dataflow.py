@@ -12,6 +12,7 @@ language are directly comparable in a report.
 from __future__ import annotations
 
 import os
+import re
 
 from tree_sitter import Node
 
@@ -48,8 +49,13 @@ class GenericTaintEngine:
     """Source-to-sink taint analysis driven by a language profile."""
 
     def __init__(self, profile: LangProfile, rules: RuleSet, framework: str,
-                 language: str, symbols: dict = None) -> None:
+                 language: str, symbols: dict = None,
+                 entry_points: dict = None) -> None:
         self.p = profile
+        # (file, first line of the handler) -> (mode, names): which of a
+        # route handler's parameters the framework fills from the request.
+        # See engine._entry_params.
+        self.entry_points = entry_points or {}
         self.rules = rules
         self.framework = framework
         self.language = language
@@ -89,10 +95,69 @@ class GenericTaintEngine:
             for fn in self._definitions(sf.root):
                 body = self._body(fn)
                 if body is not None:
-                    self.walk_block(body, sf, {}, Ctx())
+                    self.walk_block(body, sf, self._entry_env(fn, sf), Ctx())
         for sf in files:
             self.run_patterns(sf)
         return self.findings
+
+    def _entry_env(self, fn: Node, sf: SourceFile) -> dict:
+        """Taint for the parameters a route handler receives from the request.
+
+        Frameworks bind request data straight into handler parameters: a
+        Flask view gets its URL segments, a FastAPI or ASP.NET Core action
+        its query and body fields by model binding. None of that reaches the
+        engine as `request.x`, so every parameter-borne flow was invisible —
+        dvcsharp-api's `Search(string keyword)` into FromSql among them.
+        """
+        spec = self.entry_points.get((sf.path, fn.start_point.row + 1))
+        if spec is None:
+            return {}
+        mode, names = spec
+        env: dict = {}
+        tags = set()
+        for src in self.rules.sources:
+            tags |= set(src.tags)
+        for name, text in self._param_specs(fn):
+            if name in self.p.self_names:
+                continue
+            if mode == "named":
+                if name not in names:
+                    continue
+            elif _framework_injected(name, text):
+                continue
+            loc = make_loc(sf, fn)
+            env[name] = Taint(
+                tags=set(tags), origins=[loc],
+                steps=[TaintStep(location=loc,
+                                 description=f"Untrusted data bound from the "
+                                             f"request into parameter {name}",
+                                 code=sf.node_line(fn))],
+                confidence="high")
+        return env
+
+    def _param_specs(self, fn: Node) -> list:
+        """(name, declaration text) for each formal parameter of `fn`."""
+        container = fn.child_by_field_name(self.p.f_parameters)
+        if container is None:
+            for c in fn.named_children:
+                if c.type in self.p.params:
+                    container = c
+                    break
+        if container is None:
+            return []
+        out = []
+        for param in container.named_children:
+            if param.type in self.p.comment:
+                continue
+            ident = param if param.type in self.p.identifier else (
+                param.child_by_field_name(self.p.f_name))
+            if ident is None:
+                idents = [c for c in param.named_children
+                          if c.type in self.p.identifier]
+                ident = idents[-1] if idents else None
+            if ident is not None:
+                out.append((_text(ident), _text(param)))
+        return out
 
     def _definitions(self, root: Node):
         """Every function and method definition in one file."""
@@ -385,7 +450,7 @@ class GenericTaintEngine:
                 for c in node.named_children:
                     if c.type in p.interpolation_hole:
                         kids = [k for k in c.named_children
-                                if k.type not in p.comment]
+                                if k.type not in p.comment and not _delimiter(k)]
                         if kids:
                             merged = _merge_taint(
                                 merged, self.taint_of(kids[0], sf, env, ctx))
@@ -396,7 +461,10 @@ class GenericTaintEngine:
             merged = None
             for c in node.named_children:
                 if c.type in p.interpolation_hole:
-                    kids = [k for k in c.named_children if k.type not in p.comment]
+                    # C# writes the braces as named nodes, so the expression
+                    # is not the first child: `{id}` is brace, id, brace.
+                    kids = [k for k in c.named_children
+                            if k.type not in p.comment and not _delimiter(k)]
                     if kids:
                         merged = _merge_taint(
                             merged, self.taint_of(kids[0], sf, env, ctx))
@@ -1139,6 +1207,33 @@ def _restrict_tags(taint, keep: tuple):
         return None
     return Taint(tags=tags, origins=list(taint.origins),
                  steps=list(taint.steps), confidence=taint.confidence)
+
+
+def _delimiter(node: Node) -> bool:
+    """Punctuation a grammar exposes as a named node inside a hole."""
+    return node.type.endswith("_brace") or node.type in (
+        "interpolation_start", "interpolation_format_clause",
+        "interpolation_alignment_clause")
+
+
+# Parameters a framework fills itself rather than from the request, and
+# types that cannot carry an injection payload. Matched against the
+# parameter's declaration text.
+_INJECTED_NAMES = {"request", "req", "response", "res", "background_tasks",
+                   "websocket", "db", "session", "ct", "cancellationtoken",
+                   "logger", "context", "httpcontext"}
+_INJECTED_TYPE = re.compile(
+    r"\bDepends\s*\(|\bSecurity\s*\(|\[\s*FromServices\b"
+    r"|\b(?:CancellationToken|HttpContext|HttpRequest|HttpResponse|ILogger\w*"
+    r"|Request|Response|BackgroundTasks|WebSocket|Session)\b"
+    r"|(?::\s*|^\s*|\]\s*)(?:int|long|short|byte|float|double|decimal|bool"
+    r"|Guid|DateTime|DateTimeOffset|uint|ulong)\??\b")
+
+
+def _framework_injected(name: str, text: str) -> bool:
+    if name.lower() in _INJECTED_NAMES:
+        return True
+    return bool(_INJECTED_TYPE.search(text))
 
 
 class _Gate:

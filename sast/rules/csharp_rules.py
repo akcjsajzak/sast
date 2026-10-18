@@ -70,24 +70,31 @@ def _sinks() -> list[SinkRule]:
 
     def sink(rid, match, title, severity, cwe, owasp, category, desc, fix, tags,
              arg_index=-1, obj_hint=None, confidence="high", kind="call",
-             receiver_tainted=False):
+             receiver_tainted=False, safe_args=None):
         k.append(SinkRule(rule_id=rid, kind=kind, match=match, title=title,
                           severity=severity, cwe=cwe, owasp=owasp,
                           category=category, description=desc, remediation=fix,
                           tags=tags, arg_index=arg_index, obj_hint=obj_hint,
                           confidence=confidence,
-                          receiver_tainted=receiver_tainted))
+                          receiver_tainted=receiver_tainted,
+                          safe_args=safe_args))
 
     # SQL
+    # FromSql/ExecuteSqlCommand are EF Core 2's names. Given a string they
+    # run it raw; given an interpolated string literal written in the call
+    # they bind the holes as parameters, so the literal form is excluded
+    # by argument shape.
     for m in ("ExecuteReader", "ExecuteNonQuery", "ExecuteScalar",
               "ExecuteSqlRaw", "ExecuteSqlRawAsync", "FromSqlRaw", "SqlQuery",
-              "ExecuteSqlCommand"):
+              "ExecuteSqlCommand", "FromSql", "ExecuteSqlCommandAsync"):
         sink(f"cs-sqli-{m.lower()}", m, f"SQL injection via {m}()", "high",
              "CWE-89", A03, "sql-injection",
              "Untrusted data is concatenated into a SQL statement rather than "
              "passed as a parameter.",
              "Use SqlParameter / FromSqlInterpolated with bound values.",
-             ["sql"], arg_index=0)
+             ["sql"], arg_index=0,
+             safe_args=r'^(?:\$@?|@\$)"' if m in ("FromSql", "ExecuteSqlCommand",
+                                                 "ExecuteSqlCommandAsync") else None)
     # Every ADO.NET provider ships its own command and adapter class, and the
     # name is the only thing that differs. Matching `SqlCommand` alone meant a
     # MySQL or Postgres application — WebGoat.NET included — had none of its
