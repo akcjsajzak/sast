@@ -174,9 +174,11 @@ def scan_dockerfiles(paths: list[str]) -> list[Finding]:
         users = _USER_RE.findall(text)
         if not users or users[-1].strip().lower() in ("root", "0"):
             line_no = 1
-            if users:
-                for m in _USER_RE.finditer(text):
-                    line_no = text.count("\n", 0, m.start()) + 1
+            # Point at the instruction that decides it: the last USER, or
+            # with none, the last FROM (the stage that runs). Line 1 may be
+            # a comment, as in `# FROM node:6` above the real one.
+            for m in (_USER_RE if users else _FROM_RE).finditer(text):
+                line_no = text.count("\n", 0, m.start()) + 1
             code = lines[line_no - 1].strip() if 0 < line_no <= len(lines) else ""
             findings.append(_finding(_Rule(
                 "container-runs-as-root", r"x",

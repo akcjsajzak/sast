@@ -5,6 +5,8 @@ Java engines, so findings from every language look the same in a report.
 """
 from __future__ import annotations
 
+import os
+
 from tree_sitter import Node
 
 from ..models import Finding, Severity, TaintStep
@@ -68,6 +70,10 @@ class JsTaintEngine:
         self.findings: list[Finding] = []
         self._seen: set = set()
         self._call_memo: dict = {}
+        # Per file: local name -> resolved path of a relative require/import.
+        self._modules: dict = {}
+        # (path, function name) -> JsFunction, built on first use.
+        self._by_file: dict = None
 
     # ------------------------------------------------------------------
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
@@ -160,6 +166,9 @@ class JsTaintEngine:
                     be = dict(env)
                     ret = _merge_taint(ret, self.process_any(branch, sf, be, ctx))
                     _merge_env(env, be)
+            if (cond is not None and stmt.child_by_field_name("alternative") is None
+                    and _always_exits(stmt.child_by_field_name("consequence"))):
+                self._apply_exit_guard(ja.text(cond), env)
             return ret
 
         if t in ("for_statement", "for_in_statement", "while_statement",
@@ -418,7 +427,8 @@ class JsTaintEngine:
 
         # Sink before source: a call can be both.
         if san is None:
-            self.check_call_sink(callee, recv_root, recv_path, args, node, sf, env, ctx)
+            self.check_call_sink(callee, recv_root, recv_path, args, node, sf,
+                                 env, ctx, recv_taint=recv_taint)
 
         st = self.source_taint("call", callee, node, sf, obj_name=recv_root,
                                path=recv_path, args=args)
@@ -494,6 +504,8 @@ class JsTaintEngine:
             fsym = self.symbols.lookup_method(ctx.current_class, callee)
         if fsym is None and not recv_root:
             fsym = self.symbols.lookup_function(callee)
+        if fsym is None and recv_root and recv_root != "this":
+            fsym = self._module_function(sf, recv_root, callee, node)
         if fsym is None:
             return None
 
@@ -522,6 +534,122 @@ class JsTaintEngine:
                                           current_class=fsym.class_name))
         self._call_memo[key] = result
         return result
+
+    def _apply_exit_guard(self, cond: str, env: dict) -> None:
+        """Code after `if (<reject x>) return;` runs only for an accepted x.
+
+        Narrowly: a redirect target that must start with "/" and must not
+        start with "//" is a same-origin relative path, so it can no longer
+        send the browser off-site. Checking only the first lets `//evil.com`
+        through, so both are required.
+        """
+        for name in _relative_path_guarded(cond):
+            t = env.get(name)
+            if t is None or "redirect" not in t.tags:
+                continue
+            remaining = t.tags - {"redirect"}
+            env[name] = Taint(tags=remaining, origins=list(t.origins),
+                              steps=list(t.steps),
+                              confidence=t.confidence) if remaining else None
+            if env[name] is None:
+                del env[name]
+
+    def _check_computed_assign(self, left, vt, node, sf, env, ctx):
+        """`target[key] = value` with both key and value attacker-controlled.
+
+        This is what every hand-written deep merge does, and why it pollutes
+        Object.prototype: a `__proto__` key in the input names the prototype.
+        Library merges are matched by name; a merge the application wrote
+        itself — vulnerable-node's `deepMerge` — has no name to match.
+        """
+        idx = left.child_by_field_name("index")
+        if idx is None or ja.strip(idx).type in ("string", "number",
+                                                 "template_string"):
+            return
+        kt = self.taint_of(idx, sf, env, ctx)
+        if kt is None or "proto" not in kt.tags or "proto" not in vt.tags:
+            return
+        for sink in self.rules.sinks:
+            if sink.kind == "computed_assign":
+                self.report(sink, kt, node, sf)
+                return
+
+    def _module_function(self, sf, recv_root: str, callee: str, node: Node):
+        """`db.login(...)` where `db = require("../model/db")`.
+
+        Only bare calls were resolved, so a route reaching its data layer
+        through a module object — the usual Express layout — was never
+        followed, and the SQL built in model/db.js went unreported. The
+        receiver must be bound to a relative require or import in this file
+        and the function defined in that file; a package is not followed.
+        """
+        callee_node = node.child_by_field_name("function")
+        obj = callee_node.child_by_field_name("object") \
+            if callee_node is not None else None
+        if obj is None or obj.type != "identifier":
+            return None
+        target = self._imports(sf).get(recv_root)
+        if not target:
+            return None
+        if self._by_file is None:
+            self._by_file = {}
+            for fsym in self.symbols.all_functions:
+                self._by_file.setdefault(
+                    (os.path.normpath(fsym.source.path), fsym.name), fsym)
+        return self._by_file.get((target, callee))
+
+    def _imports(self, sf) -> dict:
+        """Local names bound to a relative module in one file, resolved."""
+        cached = self._modules.get(sf.path)
+        if cached is not None:
+            return cached
+        known = {os.path.normpath(f.source.path)
+                 for f in self.symbols.all_functions}
+        here = os.path.dirname(sf.path)
+        out: dict = {}
+
+        def resolve(spec: str) -> str:
+            if not spec.startswith("."):
+                return ""
+            base = os.path.normpath(os.path.join(here, spec))
+            for cand in (base, *(base + e for e in _JS_EXTS),
+                         *(os.path.join(base, "index" + e) for e in _JS_EXTS)):
+                if cand in known:
+                    return cand
+            return ""
+
+        stack = [sf.root]
+        while stack:
+            n = stack.pop()
+            if n.type == "variable_declarator":
+                name, value = n.child_by_field_name("name"), \
+                    n.child_by_field_name("value")
+                value = ja.strip(value) if value is not None else None
+                if (name is not None and name.type == "identifier"
+                        and value is not None and value.type == "call_expression"):
+                    fn = value.child_by_field_name("function")
+                    if fn is not None and ja.text(fn) == "require":
+                        spec = _first_string_arg(value)
+                        target = resolve(spec) if spec else ""
+                        if target:
+                            out[ja.text(name)] = target
+            elif n.type == "import_statement":
+                src = n.child_by_field_name("source")
+                target = resolve(_string_text(src)) if src is not None else ""
+                if target:
+                    for clause in n.named_children:
+                        if clause.type != "import_clause":
+                            continue
+                        for c in clause.named_children:
+                            if c.type == "identifier":
+                                out[ja.text(c)] = target  # default import
+                            elif c.type == "namespace_import":
+                                for i in c.named_children:
+                                    if i.type == "identifier":
+                                        out[ja.text(i)] = target
+            stack.extend(n.named_children)
+        self._modules[sf.path] = out
+        return out
 
     # ------------------------------------------------------------------
     # Rule matching
@@ -587,13 +715,22 @@ class JsTaintEngine:
         return Taint(tags=remaining, origins=list(t.origins), steps=list(t.steps),
                      confidence=t.confidence)
 
-    def check_call_sink(self, callee, recv_root, recv_path, args, node, sf, env, ctx):
+    def check_call_sink(self, callee, recv_root, recv_path, args, node, sf, env,
+                        ctx, recv_taint=None):
         for sink in self.rules.sinks:
             if sink.kind != "call":
                 continue
             if not match_callee(callee, sink.match):
                 continue
             if sink.obj_hint and not _hint_matches(sink.obj_hint, recv_root, recv_path):
+                continue
+            if sink.receivers and recv_root not in sink.receivers:
+                continue
+            if sink.receiver_tainted:
+                # Dangerous for what it is called on: `zip.extractAllTo(dir)`
+                # writes wherever the archive's own entry names point.
+                if recv_taint is not None and set(sink.tags) & recv_taint.tags:
+                    self.report(sink, recv_taint, node, sf)
                 continue
             indices = range(len(args)) if sink.arg_index < 0 else [sink.arg_index]
             for i in indices:
@@ -614,6 +751,8 @@ class JsTaintEngine:
         if vt is None:
             return
         left = ja.strip(left)
+        if left is not None and left.type == "subscript_expression":
+            self._check_computed_assign(left, vt, node, sf, env, ctx)
         if left is None or left.type not in ("member_expression", "subscript_expression"):
             return
         _, prop = ja.member_parts(left)
@@ -687,6 +826,9 @@ class JsTaintEngine:
         # innermost node, otherwise one occurrence becomes a dozen findings.
         matches: dict = {}
         for node in sf.walk():
+            # Commented-out code is not code; see the generic engine.
+            if node.type == "comment":
+                continue
             for rule in self.rules.patterns:
                 if rule.node_type != "*" and node.type != rule.node_type:
                     continue
@@ -731,6 +873,10 @@ class JsTaintEngine:
         key = (rule.rule_id, loc.file, loc.line, loc.column)
         if key in self._seen:
             return
+        if getattr(rule, "taint_backstop", False) and any(
+                f.category == rule.category and f.location.file == loc.file
+                and f.location.line == loc.line for f in self.findings):
+            return
         self._seen.add(key)
         self.findings.append(Finding(
             rule_id=rule.rule_id,
@@ -750,6 +896,52 @@ class JsTaintEngine:
                              code=sf.node_line(node))],
             tags=[rule.category],
         ))
+
+
+def _always_exits(node) -> bool:
+    """True when a branch ends by leaving the function."""
+    if node is None:
+        return False
+    node = ja.strip(node) if node.type != "statement_block" else node
+    if node.type in ("return_statement", "throw_statement"):
+        return True
+    if node.type == "statement_block":
+        stmts = [c for c in node.named_children if c.type != "comment"]
+        return bool(stmts) and stmts[-1].type in ("return_statement",
+                                                  "throw_statement")
+    return False
+
+
+def _relative_path_guarded(cond: str) -> list:
+    """Names the condition rejects unless they start with '/' but not '//'."""
+    import re
+    out = []
+    for m in re.finditer(r"!\s*([A-Za-z_$][\w$]*)\.startsWith\(\s*([\"'`])/\2\s*\)",
+                         cond):
+        name = m.group(1)
+        if re.search(re.escape(name) + r"\.startsWith\(\s*([\"'`])//\1\s*\)", cond):
+            out.append(name)
+    return out
+
+
+_JS_EXTS = (".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".mts", ".cts")
+
+
+def _string_text(node) -> str:
+    if node is None or node.type not in ("string", "template_string"):
+        return ""
+    return "".join(ja.text(c) for c in node.named_children
+                   if c.type == "string_fragment")
+
+
+def _first_string_arg(call) -> str:
+    args = call.child_by_field_name("arguments")
+    if args is None:
+        return ""
+    for a in args.named_children:
+        if a.type == "string":
+            return _string_text(a)
+    return ""
 
 
 def _hint_matches(hint: str, obj_name: str, path: str) -> bool:

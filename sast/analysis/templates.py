@@ -22,6 +22,12 @@ TEMPLATE_EXTENSIONS = {
     ".jinja": "jinja",
     ".jinja2": "jinja",
     ".j2": "jinja",
+    ".njk": "nunjucks",
+    ".ejs": "ejs",
+    ".hbs": "handlebars",
+    ".handlebars": "handlebars",
+    ".pug": "pug",
+    ".jade": "pug",
 }
 
 # Thymeleaf lives in .html, so it is only scanned when the markers appear.
@@ -40,7 +46,7 @@ class _Rule:
                  severity=Severity.MEDIUM, cwe="CWE-79", owasp=_A03,
                  category="xss", confidence="medium", tags=("xss",)):
         self.rule_id = rule_id
-        self.regex = re.compile(pattern, re.IGNORECASE)
+        self.regex = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
         self.title = title
         self.description = description
         self.remediation = remediation
@@ -184,9 +190,47 @@ _JINJA_RULES = [
     ),
 ]
 
+# Node view engines. Each escapes by default and has one syntax that does
+# not; a layout's `body` slot and an include insert server-rendered markup,
+# so they are left out.
+_EJS_RULES = [
+    _Rule(
+        "ejs-xss-unescaped-output",
+        r"<%-(?!\s*(?:include\b|body\s*-?%>))\s*[^%]+?-?%>",
+        "Unescaped EJS output (<%- %>)",
+        "<%- %> writes the value as raw HTML. If it carries user-controlled "
+        "data — a query parameter, a stored comment — this is XSS.",
+        "Use <%= %>, which escapes, or sanitize the value first.",
+    ),
+]
+_HANDLEBARS_RULES = [
+    _Rule(
+        "handlebars-xss-triple-stash",
+        r"\{\{\{(?!\s*(?:body|>)\s*)[^}]+\}\}\}",
+        "Unescaped Handlebars output ({{{ }}})",
+        "A triple-stash writes the value as raw HTML. If it carries "
+        "user-controlled data this is XSS.",
+        "Use {{ }}, which escapes, or sanitize the value first.",
+    ),
+]
+_PUG_RULES = [
+    _Rule(
+        "pug-xss-unescaped-output",
+        r"!\{[^}]+\}|^[ \t]*[\w.#-]+(?:\([^)\n]*\))?!=",
+        "Unescaped Pug output (!{} / !=)",
+        "Pug's !{} interpolation and != buffered code write the value as raw "
+        "HTML. If it carries user-controlled data this is XSS.",
+        "Use #{} or =, which escape, or sanitize the value first.",
+    ),
+]
+
 _RULES_BY_KIND = {
     "twig": _TWIG_RULES,
     "jinja": _JINJA_RULES,
+    "nunjucks": _JINJA_RULES,
+    "ejs": _EJS_RULES,
+    "handlebars": _HANDLEBARS_RULES,
+    "pug": _PUG_RULES,
     "jsp": _JSP_RULES,
     "thymeleaf": _THYMELEAF_RULES,
     "freemarker": _FREEMARKER_RULES,
@@ -198,6 +242,10 @@ _FRAMEWORK_BY_KIND = {
     "thymeleaf": ("Spring", "java"),
     "freemarker": ("Spring", "java"),
     "jinja": ("raw", "python"),
+    "nunjucks": ("Express", "javascript"),
+    "ejs": ("Express", "javascript"),
+    "handlebars": ("Express", "javascript"),
+    "pug": ("Express", "javascript"),
 }
 
 

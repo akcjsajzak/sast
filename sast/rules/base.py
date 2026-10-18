@@ -139,6 +139,11 @@ class SinkRule:
     # `text()` helper. Honoured by the generic engine, like the same field
     # on TaintSource.
     file_requires: Optional[str] = None
+    # Receiver names the call must be made on, matched exactly against the
+    # receiver's root: `set` is lodash's `_.set(obj, path, v)` and prototype
+    # pollution, but Express's `app.set('port', n)` is configuration. JS
+    # engine; obj_hint, a substring test, cannot tell `_` from `app_cfg`.
+    receivers: Optional[tuple] = None
     # Regex over the call's argument text that makes it safe: an explicit
     # `Loader=yaml.SafeLoader` turns yaml.load() into safe_load(). Matched
     # against every argument, keyword arguments included. Generic engine.
@@ -252,6 +257,11 @@ class PatternRule:
     # `md5(...)` is hashlib's only after `from hashlib import md5`.
     # Generic engine only, like `absent`'s file-level counterpart below.
     requires: Optional[str] = None
+    # A structural backstop for a taint rule of the same category: skipped
+    # on any line where a taint finding of that category was already made,
+    # so it only speaks where the flow could not be traced (a library
+    # function with no caller in the repository). JS engine.
+    taint_backstop: bool = False
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)

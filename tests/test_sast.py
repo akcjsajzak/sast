@@ -3076,6 +3076,8 @@ class TestRuleSetConsistency(unittest.TestCase):
         "property_assign",
         "object_create", "echo", "print", "include", "shell", "jsx_attribute",
         "dynamic_call", "variable_variable",
+        # JS: `target[key] = value` with both from input (hand-written merge).
+        "computed_assign",
     }
     SOURCE_KINDS = {"call", "method", "function", "static", "member",
                     "identifier", "superglobal"}
@@ -3984,3 +3986,177 @@ class TestPhpQuoteEscapingContext(unittest.TestCase):
         self.assertEqual(self._lines(
             "$v = pg_escape_literal($c, $_GET['n']);\n"
             "mysqli_query($c, \"SELECT a FROM t WHERE n = $v\");\n"), [])
+
+
+EXPRESS_APP_PKG = {"package.json": '{"dependencies":{"express":"4"}}'}
+
+
+def _js(files: dict) -> list:
+    """(rule_id, basename, line) for JS findings, helmet noise left out."""
+    merged = dict(EXPRESS_APP_PKG)
+    merged.update(files)
+    return sorted((f.rule_id, os.path.basename(f.location.file), f.location.line)
+                  for f in _scan(merged).findings
+                  if f.language == "javascript" and "helmet" not in f.rule_id)
+
+
+class TestNodeViewTemplates(unittest.TestCase):
+    """EJS, Handlebars and Pug were never scanned (nodejs-goof's
+    `<%- redirectPage %>` reflected XSS and `<%- marked(...) %>` stored XSS)."""
+
+    def test_unescaped_output_in_each_engine(self):
+        found = _js({
+            "views/a.ejs": "<input value=\"<%- q %>\">\n<p><%= safe %></p>\n"
+                           "<%- include('header') %>\n",
+            "views/layout.ejs": "<body><%- body %></body>\n",
+            "views/b.hbs": "<p>{{{ comment }}}</p>\n<p>{{ title }}</p>\n{{{body}}}\n",
+            "views/c.pug": "p!= user.bio\np= user.name\ndiv !{raw}\nif a != b\n  p ok\n",
+            "views/d.njk": "<p>{{ msg | safe }}</p>\n",
+        })
+        self.assertEqual(found, [
+            ("ejs-xss-unescaped-output", "a.ejs", 1),
+            ("handlebars-xss-triple-stash", "b.hbs", 1),
+            ("jinja-xss-safe-filter", "d.njk", 1),
+            ("pug-xss-unescaped-output", "c.pug", 1),
+            ("pug-xss-unescaped-output", "c.pug", 3),
+        ])
+
+
+class TestJsGoofShapes(unittest.TestCase):
+    """nodejs-goof: zip slip, request-as-locals, and an app.set FP."""
+
+    def test_uploaded_archive_extracted(self):
+        self.assertIn(("js-zipslip-extractallto", "a.js", 5), _js({"a.js": (
+            "const AdmZip = require('adm-zip');\n"
+            "const app = require('express')();\n"
+            "app.post('/import', (req, res) => {\n"
+            "  const zip = AdmZip(req.files.importFile.data);\n"
+            "  zip.extractAllTo('/tmp/out', true);\n"
+            "});\n")}))
+
+    def test_render_with_the_request_as_locals(self):
+        found = _js({"a.js": (
+            "const app = require('express')();\n"
+            "app.post('/a', (req, res) => { res.render('account.hbs', req.body); });\n"
+            "app.post('/b', (req, res) => { const p = req.body; res.render('x', p); });\n"
+            "app.get('/c', (req, res) => { res.render('x', { q: req.query.q }); });\n")})
+        self.assertEqual([r for r in found if r[0] == "js-render-locals-from-request"],
+                         [("js-render-locals-from-request", "a.js", 2),
+                          ("js-render-locals-from-request", "a.js", 3)])
+
+    def test_path_setter_needs_a_lodash_receiver(self):
+        found = _js({"a.js": (
+            "const _ = require('lodash');\n"
+            "const app = require('express')();\n"
+            "app.set('port', process.env.PORT || 3000);\n"
+            "app.post('/p', (req, res) => { _.set({}, req.body.path, req.body.v); });\n")})
+        self.assertEqual([r for r in found if r[0].startswith("js-proto")],
+                         [("js-proto-set", "a.js", 4)])
+
+
+class TestJsModuleCalls(unittest.TestCase):
+    """vulnerable-node: routes call `db.login(user, pw)` on
+    `const db = require("../model/db")`; only bare calls were followed."""
+
+    DB = ("const { Pool } = require('pg');\n"
+          "const pool = new Pool();\n"
+          "function login(u) {\n"
+          "  return pool.query(\"SELECT * FROM users WHERE name = '\" + u + \"'\");\n"
+          "}\n"
+          "module.exports = { login };\n")
+
+    def _sqli(self, route):
+        return [r for r in _js({"model/db.js": self.DB, "routes/auth.js": route})
+                if r[0].startswith("js-sqli")]
+
+    def test_required_module(self):
+        self.assertEqual(self._sqli(
+            "const db = require('../model/db');\n"
+            "const router = require('express').Router();\n"
+            "router.post('/login', async (req, res) => {\n"
+            "  const { rows } = await db.login(req.body.username);\n"
+            "});\n"), [("js-sqli-query", "db.js", 4)])
+
+    def test_namespace_import(self):
+        self.assertEqual(self._sqli(
+            "import * as db from '../model/db.js';\n"
+            "import express from 'express';\n"
+            "const router = express.Router();\n"
+            "router.post('/login', (req, res) => { db.login(req.body.u); });\n"),
+            [("js-sqli-query", "db.js", 4)])
+
+    def test_a_package_is_not_followed(self):
+        """`require('db')` is not the project's model/db.js. The function is
+        still reported by the string-building backstop, at low confidence."""
+        self.assertEqual(self._sqli(
+            "const db = require('db');\n"
+            "const router = require('express').Router();\n"
+            "router.post('/login', (req, res) => { db.login(req.body.u); });\n"),
+            [("js-sqli-string-built", "db.js", 4)])
+
+
+class TestJsSeedShapes(unittest.TestCase):
+    """vulnerable-node's sast/seeds and its ground-truth.yaml."""
+
+    def test_sql_built_from_strings_where_taint_cannot_reach(self):
+        found = _js({"q.js": (
+            "const pool = require('pg').Pool();\n"
+            "function byName(n) { return pool.query(\"SELECT * FROM u WHERE n = '\" + n + \"'\"); }\n"
+            "function byId(id) { return pool.query(`SELECT * FROM o WHERE id = ${id}`); }\n"
+            "function safe(id) { return pool.query('SELECT * FROM o WHERE id = ' + parseInt(id)); }\n"
+            "function bound(id) { return pool.query('SELECT * FROM o WHERE id = $1', [id]); }\n")})
+        self.assertEqual(found, [("js-sqli-string-built", "q.js", 2),
+                                 ("js-sqli-string-built", "q.js", 3)])
+
+    def test_backstop_is_silent_where_taint_reported(self):
+        found = _js({"a.js": (
+            "const app = require('express')(); const pool = require('pg').Pool();\n"
+            "app.get('/s', (req, res) => { pool.query('SELECT ' + req.query.q); });\n")})
+        self.assertEqual(found, [("js-sqli-query", "a.js", 2)])
+
+    def test_regex_from_input_and_nested_quantifiers(self):
+        found = _js({"a.js": (
+            "const app = require('express')();\n"
+            "const EMAIL = /^([a-z0-9])(([\\-.]|[_]+)?([a-z0-9]+))*@x\\.com$/;\n"
+            "const FINE = /^[a-z]+(\\.[a-z]+)?$/;\n"
+            "const ESCAPED = /a\\+)*/;\n"
+            "app.get('/t', (req, res) => { new RegExp(req.query.p).test('x'); });\n")})
+        self.assertEqual(found, [("js-redos-nested-quantifier", "a.js", 2),
+                                 ("js-redos-regexp-from-input", "a.js", 5)])
+
+    def test_hand_written_deep_merge(self):
+        found = _js({"m.js": (
+            "function deepMerge(target, source) {\n"
+            "  for (const key of Object.keys(source)) {\n"
+            "    if (typeof source[key] === 'object') deepMerge(target[key], source[key]);\n"
+            "    else target[key] = source[key];\n"
+            "  }\n"
+            "}\n"
+            "function applyPrefs(req) { return deepMerge({}, req.body.prefs); }\n"
+            "function fixed(req) { const o = {}; o['name'] = req.body.name; }\n")})
+        self.assertEqual(found, [("js-proto-computed-assign", "m.js", 4)])
+
+    def test_relative_path_guard_before_redirect(self):
+        found = _js({"a.js": (
+            "const app = require('express')();\n"
+            "app.get('/a', (req, res) => {\n"
+            "  const next = req.query.r || '/';\n"
+            "  if (!next.startsWith('/') || next.startsWith('//')) return res.redirect('/');\n"
+            "  res.redirect(next);\n"
+            "});\n"
+            "app.get('/b', (req, res) => {\n"
+            "  const next = req.query.r;\n"
+            "  if (!next.startsWith('/')) return res.redirect('/');\n"
+            "  res.redirect(next);\n"
+            "});\n")})
+        # /b admits //evil.example, a protocol-relative off-site URL.
+        self.assertEqual(found, [("js-redirect-res", "a.js", 10)])
+
+
+class TestDockerRootAnchor(unittest.TestCase):
+    def test_points_at_the_last_from_not_a_comment(self):
+        found = [(f.rule_id, f.location.line) for f in _scan({"Dockerfile": (
+            "# FROM node:6\nFROM node:18-alpine AS build\nRUN true\n"
+            "FROM node:18-alpine\nCMD [\"node\", \"a.js\"]\n")}).findings
+            if f.rule_id == "container-runs-as-root"]
+        self.assertEqual(found, [("container-runs-as-root", 4)])

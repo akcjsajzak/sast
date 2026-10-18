@@ -43,8 +43,10 @@ def _sources() -> list[TaintSource]:
     s: list[TaintSource] = []
 
     # --- Server-side request data (Express / Node / NestJS) ---
+    # files/file: uploads via express-fileupload and multer.
     for prop in ("query", "body", "params", "headers", "cookies", "rawHeaders",
-                 "originalUrl", "url", "path", "hostname", "signedCookies"):
+                 "originalUrl", "url", "path", "hostname", "signedCookies",
+                 "files", "file"):
         s.append(TaintSource(
             kind="member", match=prop, tags=_ALL, obj_hint="req",
             description=f"Untrusted data from the HTTP request (req.{prop})",
@@ -133,13 +135,15 @@ def _sinks() -> list[SinkRule]:
 
     def sink(rule_id, kind, match, title, severity, cwe, owasp, category,
              description, remediation, tags, arg_index=-1, obj_hint=None,
-             frameworks=("*",), confidence="high", arg_shape=()):
+             frameworks=("*",), confidence="high", arg_shape=(),
+             receivers=None, receiver_tainted=False):
         k.append(SinkRule(
             rule_id=rule_id, kind=kind, match=match, title=title,
             severity=severity, cwe=cwe, owasp=owasp, category=category,
             description=description, remediation=remediation, tags=tags,
             arg_index=arg_index, obj_hint=obj_hint, frameworks=frameworks,
-            confidence=confidence, arg_shape=arg_shape,
+            confidence=confidence, arg_shape=arg_shape, receivers=receivers,
+            receiver_tainted=receiver_tainted,
         ))
 
     # --- Code injection ---
@@ -267,7 +271,7 @@ def _sinks() -> list[SinkRule]:
          "attacker-controlled content in it runs in their page — and the "
          "callback name is reflected into the response unescaped.",
          "Prefer CORS with res.json(); if JSONP is required, allow-list the "
-         "callback name against /^[A-Za-z_$][\w$]*$/.",
+         "callback name against /^[A-Za-z_$][\\w$]*$/.",
          _XSS, obj_hint="res", confidence="medium",
          arg_shape=_HTML_SHAPE)
     sink("js-ssti-res-render", "call", "render",
@@ -389,6 +393,10 @@ def _sinks() -> list[SinkRule]:
          "Use JSON.parse for data interchange.",
          ["deser", "code"], arg_index=0)
     for m in ("merge", "mergeWith", "defaultsDeep", "set", "setWith"):
+        # A path-setter is only lodash's on a lodash-like receiver: Express's
+        # `app.set('port', process.env.PORT)` is configuration, and was
+        # reported as prototype pollution.
+        path_setter = m in ("set", "setWith")
         sink(f"js-proto-{m.lower()}", "call", m,
              f"Prototype pollution via {m}()", "high", "CWE-1321", A08,
              "prototype-pollution",
@@ -396,7 +404,57 @@ def _sinks() -> list[SinkRule]:
              "constructor.prototype, changing behaviour application-wide.",
              "Use a merge that rejects __proto__/constructor keys, or validate the "
              "object's shape first.",
-             _PROTO + ["nosql"], confidence="medium")
+             _PROTO + ["nosql"], confidence="medium",
+             receivers=("_", "lodash", "dotProp", "objectPath", "dottie")
+             if path_setter else None)
+
+    # --- Regular expression built from input ---
+    sink("js-redos-regexp-from-input", "call", "RegExp",
+         "Regular expression built from user input (ReDoS)", "medium",
+         "CWE-1333", A05, "redos",
+         "The pattern itself is attacker-controlled, so it can be one that "
+         "backtracks catastrophically, and a single request blocks the event "
+         "loop.",
+         "Do not compile user input as a regex; escape it (e.g. lodash "
+         "escapeRegExp) when it is meant literally, or use re2.",
+         ["redos"], arg_index=0)
+    # --- Hand-written merges: target[key] = value from the input ---
+    sink("js-proto-computed-assign", "computed_assign", "*",
+         "Prototype pollution via computed property assignment", "high",
+         "CWE-1321", A08, "prototype-pollution",
+         "Both the property name and the value come from user input, so a "
+         "`__proto__` or `constructor` key writes onto Object.prototype — "
+         "the bug behind every unguarded hand-written deep merge.",
+         "Skip __proto__, constructor and prototype keys, or build the result "
+         "with Object.create(null) / a Map.",
+         _PROTO, confidence="medium")
+
+    # --- Archive extraction (zip slip) ---
+    # The archive's entry names choose where each file is written, so an
+    # uploaded archive with `../../app.js` overwrites application code.
+    for m in ("extractAllTo", "extractEntryTo", "extractAllToAsync"):
+        sink(f"js-zipslip-{m.lower()}", "call", m,
+             f"Zip slip via {m}()", "high", "CWE-22", A01, "path-traversal",
+             "An attacker-supplied archive is extracted with its own entry "
+             "names, so an entry such as ../../app.js is written outside the "
+             "target directory.",
+             "Check each entry's resolved path stays inside the target before "
+             "writing it, or use a library version that rejects traversal.",
+             ["path", "lfi"], receiver_tainted=True)
+
+    # --- Template options taken from the request ---
+    # `res.render('page', req.body)` hands the caller every view option, and
+    # hbs, ejs and pug read some of them as settings: a `layout` key renders
+    # an arbitrary file, an ejs `settings` object sets engine options.
+    sink("js-render-locals-from-request", "call", "render",
+         "Template options taken from the request", "medium", "CWE-73", A03,
+         "path-traversal",
+         "The whole request object is passed as the view's locals, so the "
+         "caller can set engine options such as `layout`, which reads and "
+         "renders an arbitrary file.",
+         "Pass an object built from the specific fields the view needs.",
+         ["lfi", "path"], arg_index=1, obj_hint="res", confidence="medium",
+         arg_shape=("identifier", "member_expression"), frameworks=EXPRESS)
 
     # --- Template injection / dynamic require ---
     sink("js-ssti-template", "call", "compile",
@@ -459,14 +517,44 @@ def _patterns() -> list[PatternRule]:
     def pat(rule_id, match, title, description, remediation, severity="medium",
             cwe="", owasp=A05, category="security-misconfiguration",
             node_type="*", match_field="text", regex=True, frameworks=("*",),
-            confidence="high", ignore_case=False):
+            confidence="high", ignore_case=False, taint_backstop=False):
         p.append(PatternRule(
             rule_id=rule_id, node_type=node_type, match=match,
             match_field=match_field, title=title, severity=severity, cwe=cwe,
             owasp=owasp, category=category, description=description,
             remediation=remediation, frameworks=frameworks, regex=regex,
             confidence=confidence, ignore_case=ignore_case,
+            taint_backstop=taint_backstop,
         ))
+
+    # SQL assembled by concatenation or a template literal, whatever the
+    # value's origin. Taint analysis reports the flows it can trace; this
+    # reports the shape where it cannot — a data-access function no route in
+    # the repository calls — and stays silent on any line already reported.
+    pat("js-sqli-string-built",
+        r"^[\w$.]*\b(?:query|raw|execute|\$queryRawUnsafe|\$executeRawUnsafe)"
+        # A numeric conversion is not injectable: `'... id = ' + parseInt(x)`.
+        r"\s*\(\s*(?:`[^`]*\$\{(?!\s*(?:parseInt|parseFloat|Number|Math\.))"
+        r"|(?:'[^'\n]*'|\"[^\"\n]*\")\s*\+\s*"
+        r"(?!(?:parseInt|parseFloat|Number|Math\.)\b)[\w$(])",
+        "SQL statement built from a string",
+        "The statement is assembled from string pieces rather than passed with "
+        "bound parameters. Wherever a piece comes from user input, this is SQL "
+        "injection; the analysis could not trace where these values come from.",
+        "Use placeholders ($1 / ?) and pass the values separately.",
+        severity="medium", cwe="CWE-89", owasp=A03, category="sql-injection",
+        node_type="call_expression", confidence="low", taint_backstop=True)
+    # Nested quantifiers backtrack exponentially on a near-miss input: one
+    # request with a long `aaaa...!` pins the event loop.
+    pat("js-redos-nested-quantifier", r"(?<!\\)[+*]\)+[+*{]",
+        "Regular expression with nested quantifiers (ReDoS)",
+        "A quantified group that itself ends in a quantifier, such as (a+)+ or "
+        "([a-z]+)*, backtracks exponentially when the input almost matches, so "
+        "one crafted string blocks the event loop.",
+        "Rewrite without nested quantifiers, bound the input length, or use a "
+        "linear-time engine such as re2.",
+        severity="medium", cwe="CWE-1333", owasp=A05, category="redos",
+        node_type="regex_pattern", confidence="medium")
 
     pat("js-weak-random", r"\bMath\.random\s*\(", "Predictable random number generator",
         "Math.random() is not cryptographically secure; tokens, session IDs and "
