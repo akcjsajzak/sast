@@ -114,14 +114,15 @@ def _sinks() -> list[SinkRule]:
     def sink(rid, match, title, severity, cwe, owasp, category, desc, fix, tags,
              arg_index=-1, obj_hint=None, frameworks=("*",), confidence="high",
              kind="call", receiver_tainted=False, file_requires=None,
-             safe_args=None):
+             safe_args=None, max_args=None):
         k.append(SinkRule(rule_id=rid, kind=kind, match=match, title=title,
                           severity=severity, cwe=cwe, owasp=owasp,
                           category=category, description=desc, remediation=fix,
                           tags=tags, arg_index=arg_index, obj_hint=obj_hint,
                           frameworks=frameworks, confidence=confidence,
                           receiver_tainted=receiver_tainted,
-                          file_requires=file_requires, safe_args=safe_args))
+                          file_requires=file_requires, safe_args=safe_args,
+                          max_args=max_args))
 
     # Code execution
     for fn in ("eval", "exec", "compile"):
@@ -218,7 +219,9 @@ def _sinks() -> list[SinkRule]:
              "intended directory.",
              "Resolve the path and check it is_relative_to() an allow-listed "
              "root before using it.",
-             _PATH, receiver_tainted=True)
+             # str.replace(old, new) shares the name; Path's takes one target.
+             _PATH, receiver_tainted=True,
+             max_args=1 if fn == "replace" else None)
     # A glob pattern is a path with wildcards: `*` in an attacker-supplied
     # fragment matches every file. vulpy authenticates an API key with
     # `Path('/tmp/').glob('vulpy.apikey.*.' + key)`, so the key `*` matches

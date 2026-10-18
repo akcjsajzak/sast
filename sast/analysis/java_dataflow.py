@@ -43,6 +43,9 @@ MUTATING_WRITES = frozenset({
     "offer", "offerFirst", "offerLast", "merge", "replace",
 })
 
+# MUTATING_WRITES that are also String methods returning a derived string.
+_STRING_TRANSFORMS = frozenset({"replace", "concat"})
+
 # Static/utility calls whose result carries their arguments' taint, used when
 # the receiver itself is a class rather than a tainted value
 # (Base64.getDecoder().decode(x), URLDecoder.decode(x), String.join(...)).
@@ -500,7 +503,7 @@ class JavaTaintEngine:
             return self.handle_if(stmt, sf, env, tenv, ctx)
         if t in ("for_statement", "enhanced_for_statement", "while_statement"):
             return self.handle_loop(stmt, sf, env, tenv, ctx)
-        if t == "try_statement":
+        if t in ("try_statement", "try_with_resources_statement"):
             return self.handle_try(stmt, sf, env, tenv, ctx)
         if t in ("switch_expression", "switch_statement"):
             return self.handle_switch(stmt, sf, env, tenv, ctx)
@@ -748,6 +751,23 @@ class JavaTaintEngine:
     def handle_try(self, node: Node, sf: SourceFile, env: dict, tenv: dict, ctx: Ctx):
         ret = None
         branch_envs = []
+        # `try (var c = ds.getConnection(); Statement st = ...)`: the
+        # resources are declarations the body uses, and JDBC code is mostly
+        # written this way, so skipping them hid the whole body's flows.
+        resources = node.child_by_field_name("resources")
+        for res in (resources.named_children if resources is not None else []):
+            if res.type != "resource":
+                continue
+            name = res.child_by_field_name("name")
+            value = res.child_by_field_name("value")
+            if name is None or value is None:
+                self.taint_of(res, sf, env, tenv, ctx)
+                continue
+            typ = res.child_by_field_name("type")
+            if typ is not None and ja.text(typ) != "var":
+                tenv[ja.text(name)] = ja.text(typ)
+            self._assign(ja.text(name), self.taint_of(value, sf, env, tenv, ctx),
+                         sf, env, name)
         for c in node.named_children:
             if c.type in ("block", "catch_clause", "finally_clause"):
                 be, bte = dict(env), dict(tenv)
@@ -938,7 +958,12 @@ class JavaTaintEngine:
             root = self._root_receiver(obj)
             if root and merged is not None:
                 self._assign(root, merged, sf, env, node)
-            return merged
+            # `replace` and `concat` are also String methods returning a new
+            # string, which carries the receiver's taint: without it
+            # `token.replace('-', '+')` came back clean.
+            recv = (self.taint_of(obj, sf, env, tenv, ctx)
+                    if obj is not None and mname in _STRING_TRANSFORMS else None)
+            return _merge_taint(merged, recv)
 
         if mname == "format" and obj is not None and ja.text(obj) == "String":
             merged = None
@@ -1094,6 +1119,11 @@ class JavaTaintEngine:
             if sink.obj_hint and sink.obj_hint.lower() not in rkey and sink.obj_hint.lower() not in full:
                 continue
             if sink.type_arg and not _declares_type_arg(node, sink.type_arg):
+                continue
+            if sink.receiver_tainted:
+                t = self.taint_of(obj, sf, env, tenv, ctx) if obj is not None else None
+                if t is not None and (t.tags & set(sink.tags)):
+                    self.emit_finding(sink, t, node, sf)
                 continue
             indices = range(len(args)) if sink.arg_index < 0 else [sink.arg_index]
             for i in indices:

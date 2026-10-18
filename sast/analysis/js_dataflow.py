@@ -53,6 +53,9 @@ NON_PROPAGATING = frozenset({
 
 _SKIP_TOP = {"comment", "import_statement", "export_statement_header"}
 
+# Second handler parameter names that mark the first one as the request.
+_RESPONSE_PARAMS = frozenset({"res", "response", "resp", "reply", "h"})
+
 
 def _loc(sf: SourceFile, node: Node):
     return make_loc(sf, node)
@@ -89,7 +92,9 @@ class JsTaintEngine:
         for fsym in self.symbols.all_functions:
             body = ja.body_of(fsym.node)
             if body is not None:
-                self.process_block(body, fsym.source, {}, Ctx())
+                self.process_block(body, fsym.source,
+                                   self.request_params(fsym.node, fsym.source),
+                                   Ctx())
         for cls in self.symbols.all_classes:
             fields: dict = {}
             for _ in range(2):
@@ -349,7 +354,8 @@ class JsTaintEngine:
             # sinks inside it are reported even with untainted parameters.
             body = ja.body_of(node)
             if body is not None and ctx.depth < MAX_DEPTH:
-                self.process_any(body, sf, dict(env),
+                self.process_any(body, sf,
+                                 {**env, **self.request_params(node, sf)},
                                  Ctx(depth=ctx.depth + 1,
                                      current_class=ctx.current_class))
             return None
@@ -481,7 +487,7 @@ class JsTaintEngine:
             body = ja.body_of(fn)
             if body is None:
                 continue
-            new_env = dict(env)
+            new_env = {**env, **self.request_params(fn, sf)}
             params = ja.param_names(fn)
             # An iteration/promise callback receives elements of the receiver.
             if recv_taint is not None and params:
@@ -496,6 +502,51 @@ class JsTaintEngine:
             merged = _merge_taint(merged, self.process_any(body, sf, new_env, sub))
         return merged
 
+    def request_params(self, fn: Node, sf: SourceFile) -> dict:
+        """Bindings for a handler that destructures the request object.
+
+        `({ query, params }: Request, res) => ...` names no `req`, so the
+        receiver hints never fire; each destructured key is matched as if it
+        were read from `req.<key>`. The first parameter counts as the request
+        when it is typed `Request` or a response parameter follows it.
+        """
+        params = fn.child_by_field_name("parameters")
+        if params is None:
+            return {}
+        formals = [p for p in params.named_children if p.type != "comment"]
+        if not formals:
+            return {}
+        first = formals[0]
+        pattern = first.child_by_field_name("pattern") or first
+        if pattern.type != "object_pattern":
+            return {}
+        annot = first.child_by_field_name("type")
+        typed = annot is not None and "Request" in ja.text(annot)
+        follows = (len(formals) > 1
+                   and (ja.binding_names(formals[1]) or [""])[0] in _RESPONSE_PARAMS)
+        if not (typed or follows):
+            return {}
+        env: dict = {}
+        for c in pattern.named_children:
+            if c.type == "shorthand_property_identifier_pattern":
+                key, targets = ja.text(c), [ja.text(c)]
+            elif c.type == "pair_pattern":
+                k = c.child_by_field_name("key")
+                key = ja.text(k) if k is not None else ""
+                targets = ja.binding_names(c.child_by_field_name("value"))
+            elif c.type == "object_assignment_pattern":
+                left = c.child_by_field_name("left")
+                key = ja.text(left) if left is not None else ""
+                targets = ja.binding_names(left)
+            else:
+                continue
+            st = self.source_taint("member", key, c, sf, obj_name="req",
+                                   path="req." + key)
+            if st is not None:
+                for name in targets:
+                    env[name] = st
+        return env
+
     def user_call_taint(self, callee, recv_root, args, node, sf, env, ctx):
         if ctx.depth >= MAX_DEPTH or not callee:
             return None
@@ -503,7 +554,11 @@ class JsTaintEngine:
         if recv_root and ctx.current_class and recv_root == "this":
             fsym = self.symbols.lookup_method(ctx.current_class, callee)
         if fsym is None and not recv_root:
-            fsym = self.symbols.lookup_function(callee)
+            # The same module's own function first: names like `verify` or
+            # `handler` are defined in many files, and the global table keeps
+            # only one of them.
+            fsym = (self._function_in(os.path.normpath(sf.path), callee)
+                    or self.symbols.lookup_function(callee))
         if fsym is None and recv_root and recv_root != "this":
             fsym = self._module_function(sf, recv_root, callee, node)
         if fsym is None:
@@ -591,12 +646,16 @@ class JsTaintEngine:
         target = self._imports(sf).get(recv_root)
         if not target:
             return None
+        return self._function_in(target, callee)
+
+    def _function_in(self, path: str, name: str):
+        """The function `name` declared in the file at normalised `path`."""
         if self._by_file is None:
             self._by_file = {}
             for fsym in self.symbols.all_functions:
                 self._by_file.setdefault(
                     (os.path.normpath(fsym.source.path), fsym.name), fsym)
-        return self._by_file.get((target, callee))
+        return self._by_file.get((path, name))
 
     def _imports(self, sf) -> dict:
         """Local names bound to a relative module in one file, resolved."""
@@ -813,8 +872,7 @@ class JsTaintEngine:
             cache = self._absent_cache = {}
         key = (id(sf), rule.absent)
         if key not in cache:
-            text = sf.content.decode("utf-8", "replace")
-            cache[key] = _re.search(rule.absent, text) is None
+            cache[key] = _re.search(rule.absent, _code_text(sf)) is None
         return cache[key]
 
     def run_patterns(self, sf: SourceFile) -> None:
@@ -898,6 +956,20 @@ class JsTaintEngine:
         ))
 
 
+def _code_text(sf: SourceFile) -> str:
+    """The file's text with comments blanked: commented-out middleware such
+    as `// app.use(helmet())` must not count as present."""
+    content = bytearray(sf.content)
+    stack = [sf.root]
+    while stack:
+        n = stack.pop()
+        if n.type == "comment":
+            content[n.start_byte:n.end_byte] = b" " * (n.end_byte - n.start_byte)
+            continue
+        stack.extend(n.children)
+    return content.decode("utf-8", "replace")
+
+
 def _always_exits(node) -> bool:
     """True when a branch ends by leaving the function."""
     if node is None:
@@ -949,12 +1021,11 @@ def _hint_matches(hint: str, obj_name: str, path: str) -> bool:
 
     `req`/`request` style hints are matched case-insensitively against the
     root object and the full dotted path, so `req.query`, `request.query` and
-    `this.req.query` all resolve.
+    `this.req.query` all resolve. `a|b` accepts either fragment.
     """
-    hint = hint.lower()
-    if obj_name and hint in obj_name.lower():
-        return True
-    return bool(path) and hint in path.lower()
+    alternatives = hint.lower().split("|")
+    obj_name, path = (obj_name or "").lower(), (path or "").lower()
+    return any(h in obj_name or h in path for h in alternatives)
 
 
 def _merge_env(env: dict, other: dict) -> None:

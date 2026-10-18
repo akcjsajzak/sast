@@ -279,7 +279,8 @@ def _sinks() -> list[SinkRule]:
             severity="high", cwe="CWE-502", owasp=A08, category="insecure-deserialization",
             description=f"Untrusted data is deserialized via {m}().",
             remediation="Use an allow-list ObjectInputFilter; avoid deserializing untrusted data.",
-            tags=["deser"], obj_hint="ObjectInputStream",
+            # No arguments: the stream it reads from is what is untrusted.
+            tags=["deser"], obj_hint="ObjectInputStream", receiver_tainted=True,
         ))
     k.append(SinkRule(
         rule_id="java-deser-readValue", kind="method", match="readValue",

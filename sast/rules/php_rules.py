@@ -221,6 +221,16 @@ def _sinks() -> list[SinkRule]:
             remediation="Use PDO::prepare() with bound parameters.",
             tags=_SQL, arg_index=idx,
         ))
+    # SQLite3 and object-style mysqli methods with no PDO counterpart.
+    for m in ("querySingle", "multi_query", "real_query"):
+        k.append(SinkRule(
+            rule_id=f"php-sqli-{m}", kind="method", match=m,
+            title=f"SQL injection via ->{m}()",
+            severity="high", cwe="CWE-89", owasp=A03, category="sql-injection",
+            description=f"Untrusted data flows into the SQL passed to ->{m}() without parameterization.",
+            remediation="Use a prepared statement with bound parameters.",
+            tags=_SQL, arg_index=0,
+        ))
 
     # --- SQL injection (Laravel) ---
     laravel = ("Laravel",)

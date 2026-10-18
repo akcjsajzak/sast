@@ -47,11 +47,18 @@ NPM_FRAMEWORKS = [
     ("@sveltejs/kit", "SvelteKit"),
 ]
 
+_JS_SERVER_FRAMEWORKS = {"NestJS", "Next.js", "Express", "Koa", "Fastify"}
+
+# Joins the frameworks of a repository whose modules use different ones.
+COMBINED_SEP = " + "
+
 # Source markers, used when package.json is absent or uninformative.
 _ANGULAR_RE = re.compile(r"@(?:Component|NgModule|Injectable)\s*\(|@angular/core")
 _REACT_RE = re.compile(r"from\s+['\"]react['\"]|require\(['\"]react['\"]\)|"
                        r"React\.(?:createElement|Component)|useState\s*\(")
 _EXPRESS_RE = re.compile(r"require\(['\"]express['\"]\)|from\s+['\"]express['\"]")
+_KOA_RE = re.compile(r"require\(['\"]koa['\"]\)|from\s+['\"]koa['\"]")
+_FASTIFY_RE = re.compile(r"require\(['\"]fastify['\"]\)|from\s+['\"]fastify['\"]")
 _NODE_RE = re.compile(r"require\(['\"](?:fs|path|child_process|http|crypto)['\"]\)|"
                       r"from\s+['\"]node:|module\.exports|process\.env")
 
@@ -218,8 +225,11 @@ def _detect_js_framework(root: str, source_files: list[str]) -> tuple:
     module_dirs = find_manifest_dirs(root, ("package.json",))
     manifests: list[str] = []
     notes: list[str] = []
-    best: tuple = ()
 
+    # module framework -> (priority, version); a full-stack repository keeps
+    # one per module, so an Express API beside an Angular client gets both
+    # rule sets instead of only the client's.
+    found_by_module: dict = {}
     for mod in module_dirs:
         pkg_path = os.path.join(mod, "package.json")
         manifests.append(pkg_path)
@@ -232,13 +242,17 @@ def _detect_js_framework(root: str, source_files: list[str]) -> tuple:
             deps.update(data.get(section, {}) or {})
         for index, (pkg, framework) in enumerate(NPM_FRAMEWORKS):
             if pkg in deps:
-                # Keep the earliest (most specific) match across all modules.
-                if not best or index < best[0]:
-                    best = (index, framework, deps[pkg])
+                # The earliest (most specific) match within a module.
+                if framework not in found_by_module or index < found_by_module[framework][0]:
+                    found_by_module[framework] = (index, deps[pkg])
                 break
 
-    if best:
-        return best[1], best[2], manifests, notes, module_dirs
+    if found_by_module:
+        # Servers first: they own the routes and the request sources.
+        ordered = sorted(found_by_module, key=lambda fw: (
+            fw not in _JS_SERVER_FRAMEWORKS, found_by_module[fw][0]))
+        version = found_by_module[ordered[0]][1]
+        return COMBINED_SEP.join(ordered), version, manifests, notes, module_dirs
 
     # No manifest match — fall back to markers in the source itself.
     found = None
@@ -254,6 +268,10 @@ def _detect_js_framework(root: str, source_files: list[str]) -> tuple:
             return "React", None, manifests, notes, module_dirs
         if _EXPRESS_RE.search(text):
             return "Express", None, manifests, notes, module_dirs
+        if _KOA_RE.search(text):
+            return "Koa", None, manifests, notes, module_dirs
+        if _FASTIFY_RE.search(text):
+            return "Fastify", None, manifests, notes, module_dirs
         if found is None and _NODE_RE.search(text):
             found = "Node.js"
     return found or "raw", None, manifests, notes, module_dirs

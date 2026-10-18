@@ -34,7 +34,10 @@ _PROTO = ["proto"]
 
 NODE = ("Node.js", "Express", "NestJS")
 EXPRESS = ("Express", "NestJS")
+SERVERS = EXPRESS + ("Koa", "Fastify")
 REACT = ("React", "Next.js")
+# Receiver-name fragments of HTTP clients, matched as `_hint_matches` does.
+HTTP_CLIENTS = "axios|got|request|superagent|needle|http|fetch|undici|wreck|bent|phin|api"
 ANGULAR = ("Angular",)
 
 
@@ -55,6 +58,19 @@ def _sources() -> list[TaintSource]:
         s.append(TaintSource(
             kind="member", match=prop, tags=_ALL, obj_hint="request",
             description=f"Untrusted data from the HTTP request (request.{prop})",
+        ))
+    # Koa: the context carries the request; `ctx.body` is the response, so
+    # the body is only read through `ctx.request.body`.
+    for prop in ("query", "params", "headers", "querystring", "cookies", "href",
+                 "originalUrl", "url", "path"):
+        s.append(TaintSource(
+            kind="member", match=prop, tags=_ALL, obj_hint="ctx",
+            description=f"Untrusted data from the HTTP request (ctx.{prop})",
+        ))
+    for prop in ("body", "files", "file"):
+        s.append(TaintSource(
+            kind="member", match=prop, tags=_ALL, obj_hint="ctx.request",
+            description=f"Untrusted data from the HTTP request (ctx.request.{prop})",
         ))
     for m in ("param", "get", "header"):
         s.append(TaintSource(
@@ -116,7 +132,9 @@ def _sources() -> list[TaintSource]:
         description="Untrusted data from process arguments (process.argv)",
     ))
     s.append(TaintSource(
-        kind="member", match="env", tags=_ALL, obj_hint="process", confidence="low",
+        # A redirect to a configured base path is the normal use of it.
+        kind="member", match="env", tags=[t for t in _ALL if t != "redirect"],
+        obj_hint="process", confidence="low",
         description="Environment data (process.env) — attacker-controlled only "
                     "if the environment is",
     ))
@@ -349,13 +367,16 @@ def _sinks() -> list[SinkRule]:
 
     # --- SSRF ---
     for fn in ("fetch", "request", "get", "post", "put", "patch", "head"):
+        # `get`/`put` are also every Map's and cache's API, so those need an
+        # HTTP client receiver: `axios.get`, `this.http.get`, `got.post`.
+        hint = HTTP_CLIENTS if fn not in ("fetch", "request") else None
         sink(f"js-ssrf-{fn}", "call", fn,
              f"Server-side request forgery via {fn}()", "high", "CWE-918", A10,
              "ssrf",
              "The request target is attacker-controlled, so the server can be made "
              "to reach internal hosts or cloud metadata endpoints.",
              "Validate the URL against an allow-list of hosts and block internal ranges.",
-             _SSRF, arg_index=0, confidence="medium")
+             _SSRF, arg_index=0, confidence="medium", obj_hint=hint)
 
     # --- Path traversal / file access ---
     for m in ("readFile", "readFileSync", "writeFile", "writeFileSync",
@@ -382,7 +403,7 @@ def _sinks() -> list[SinkRule]:
          "The redirect target comes from attacker-controlled input, enabling "
          "phishing against your origin.",
          "Redirect only to validated relative paths or an allow-listed origin.",
-         _REDIR, arg_index=-1, frameworks=EXPRESS)
+         _REDIR, arg_index=-1, frameworks=SERVERS)
 
     # --- Deserialization / prototype pollution ---
     sink("js-deser-unserialize", "call", "unserialize",
@@ -517,14 +538,15 @@ def _patterns() -> list[PatternRule]:
     def pat(rule_id, match, title, description, remediation, severity="medium",
             cwe="", owasp=A05, category="security-misconfiguration",
             node_type="*", match_field="text", regex=True, frameworks=("*",),
-            confidence="high", ignore_case=False, taint_backstop=False):
+            confidence="high", ignore_case=False, taint_backstop=False,
+            absent=None):
         p.append(PatternRule(
             rule_id=rule_id, node_type=node_type, match=match,
             match_field=match_field, title=title, severity=severity, cwe=cwe,
             owasp=owasp, category=category, description=description,
             remediation=remediation, frameworks=frameworks, regex=regex,
             confidence=confidence, ignore_case=ignore_case,
-            taint_backstop=taint_backstop,
+            taint_backstop=taint_backstop, absent=absent,
         ))
 
     # SQL assembled by concatenation or a template literal, whatever the
@@ -611,6 +633,13 @@ def _patterns() -> list[PatternRule]:
         "are accepted.",
         "Validate signature and expiry on every request.",
         severity="high", cwe="CWE-347", owasp=A07, category="broken-authentication")
+    pat("js-xxe-libxml-noent", r"\bparseXml(?:String)?\s*\([\s\S]*\bnoent\s*:\s*true",
+        "XML external entities enabled (libxmljs noent)",
+        "noent: true makes libxmljs substitute entities, so a DOCTYPE in the "
+        "document can read local files or reach internal hosts (XXE).",
+        "Parse without noent (the default), and reject documents with a DOCTYPE.",
+        severity="high", cwe="CWE-611", owasp=A05, category="xxe",
+        node_type="call_expression")
     pat("js-express-no-helmet", r"\bexpress\s*\(\s*\)",
         "Express app without security headers",
         "No helmet() middleware was detected on this app, so responses ship "
@@ -618,7 +647,7 @@ def _patterns() -> list[PatternRule]:
         "Add app.use(helmet()) early in the middleware chain.",
         severity="info", cwe="CWE-693", owasp=A05,
         category="security-misconfiguration", frameworks=EXPRESS,
-        confidence="low", node_type="call_expression")
+        confidence="low", node_type="call_expression", absent=r"\bhelmet\b")
     pat("angular-xss-bypass-import", r"DomSanitizer",
         "Angular DomSanitizer in use",
         "DomSanitizer exists to bypass Angular's escaping. Every bypassSecurityTrust* "

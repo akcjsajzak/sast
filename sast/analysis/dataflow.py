@@ -1,6 +1,7 @@
 """Source-to-sink taint analysis engine for PHP."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from tree_sitter import Node
@@ -88,6 +89,35 @@ def match_callee(actual, wanted) -> bool:
     if not actual or not wanted:
         return False
     return actual == wanted or _short(actual) == wanted
+
+
+_SOAP_FILE = re.compile(r"nusoap|soap_server|SoapServer", re.IGNORECASE)
+_SOAP_REGISTER = re.compile(
+    r"->\s*(register|addFunction|setClass)\s*\(\s*(array\s*\(|\[)?([^;]*?)\)\s*[;,]",
+    re.IGNORECASE | re.DOTALL)
+_QUOTED = re.compile(r"""['"]([A-Za-z_\\][\w\\]*)['"]""")
+
+
+def _soap_services(files) -> tuple:
+    """Functions and classes a SOAP server exposes: (function names, class names).
+
+    NuSOAP's `$server->register("get_tickets_stock", ...)` and SoapServer's
+    `addFunction("f")` / `setClass("C")` publish code whose arguments are
+    the request, with no route and no superglobal in sight; bWAPP's movie
+    service builds SQL from its `$title` argument that way.
+    """
+    functions, classes = set(), set()
+    for sf in files:
+        text = sf.content.decode("utf-8", "replace")
+        if not _SOAP_FILE.search(text):
+            continue
+        for m in _SOAP_REGISTER.finditer(text):
+            method, is_list, args = m.group(1).lower(), m.group(2), m.group(3)
+            # register()'s later arguments are type maps and namespaces.
+            names = _QUOTED.findall(args if is_list else args.split(",", 1)[0])
+            target = classes if method == "setclass" else functions
+            target.update(n.rsplit("\\", 1)[-1].lower() for n in names)
+    return functions, classes
 
 
 def make_loc(sf: SourceFile, node: Node) -> Location:
@@ -325,10 +355,22 @@ class TaintEngine:
         # Every declaration, not one per name: the symbol dicts are keyed for
         # resolution, so a second `function handle()` in another file was
         # never analysed at all.
+        soap_functions, soap_classes = _soap_services(files)
         for fsym in self.symbols.all_functions:
             body = au.body_of(fsym.node)
             if body is not None:
-                self.process_block(body, fsym.source, {}, Ctx(namespace=fsym.namespace))
+                env = (self._service_params(fsym)
+                       if fsym.short.lower() in soap_functions else {})
+                self.process_block(body, fsym.source, env, Ctx(namespace=fsym.namespace))
+        for cls in self.symbols.all_classes:
+            if cls.name.lower() not in soap_classes:
+                continue
+            for msym in cls.all_methods or cls.methods.values():
+                body = au.body_of(msym.node)
+                if body is not None and msym.visibility == "public":
+                    self.process_block(body, msym.source, self._service_params(msym),
+                                       Ctx(current_class=cls.name,
+                                           namespace=msym.namespace))
         seen_classes = set()
         for cls in self.symbols.all_classes:
             if id(cls) in seen_classes:
@@ -338,6 +380,18 @@ class TaintEngine:
         for sf in files:
             self.run_patterns(sf)
         return self.findings
+
+    def _service_params(self, sym) -> dict:
+        """Every parameter of a function a SOAP server exposes is request data."""
+        tags = set()
+        for src in self.rules.sources:
+            tags |= set(src.tags)
+        loc = make_loc(sym.source, sym.node)
+        return {p: Taint(tags=set(tags), origins=[loc], steps=[TaintStep(
+                    location=loc, code=sym.source.node_line(sym.node),
+                    description=f"Untrusted SOAP request argument {p} of the "
+                                f"service operation {sym.name}()")])
+                for p in sym.params}
 
     def analyze_class(self, cls) -> None:
         """Analyse a class's methods, carrying property taint between them.
@@ -1195,10 +1249,13 @@ class TaintEngine:
                 return None
             return self.analyze_method_call(msym, args, node, sf, env, ctx)
         if kind == "method":
+            msym = None
             if ctx.current_class:
                 msym = self.symbols.lookup_method(ctx.current_class, callee, ctx.namespace)
-                if msym is not None:
-                    return self.analyze_method_call(msym, args, node, sf, env, ctx)
+            if msym is None and not cls:
+                msym = self.symbols.unique_method(callee)
+            if msym is not None:
+                return self.analyze_method_call(msym, args, node, sf, env, ctx)
         return None
 
     def analyze_function_call(self, fsym, args, call_node, sf, env, ctx):

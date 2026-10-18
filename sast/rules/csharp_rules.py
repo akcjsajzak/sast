@@ -136,6 +136,17 @@ def _sinks() -> list[SinkRule]:
              "Pass a fixed FileName with an argument list, and keep "
              "UseShellExecute false.",
              ["cmd"], obj_hint="process")
+    # `p.StartInfo.FileName = input; p.Start()`: the command is set as a
+    # property, so the Start() call itself carries no tainted argument.
+    for prop in ("FileName", "Arguments"):
+        sink(f"cs-cmdi-startinfo-{prop.lower()}", prop,
+             f"Command injection via ProcessStartInfo.{prop}",
+             "critical", "CWE-78", A03, "command-injection",
+             f"The process {prop.lower()} is set from attacker-controlled data, "
+             "so the attacker chooses what runs or the arguments it gets.",
+             "Run a fixed executable and validate each argument against an "
+             "allow-list; keep UseShellExecute false.",
+             ["cmd"], kind="property_assign", obj_hint="startinfo")
 
     # Deserialization
     for m in ("Deserialize", "BinaryFormatter", "ReadObject", "FromJson"):

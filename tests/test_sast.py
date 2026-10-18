@@ -2654,7 +2654,6 @@ class TestJsResponseSinks(unittest.TestCase):
 
 
 
-
 # Route extraction is exercised directly against parsed trees so a test can
 # pin one framework's shape without standing up a whole project layout.
 _ROUTE_PARSERS = {}
@@ -2805,7 +2804,6 @@ class TestEntryPointBinding(unittest.TestCase):
         reqs = [f.request for f in res.findings if f.request]
         self.assertTrue(reqs)
         self.assertTrue(any("<command-injection payload>" in r for r in reqs))
-
 
 
 class TestBrokenAccessControl(unittest.TestCase):
@@ -3148,10 +3146,6 @@ class TestFindingDeduplication(unittest.TestCase):
             "run($b);\n"})
         at_sink = [f for f in result.findings if f.rule_id == "php-cmdi-system"]
         self.assertEqual(len(at_sink), 1, [f.location.line for f in at_sink])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestScanCaches(unittest.TestCase):
@@ -4566,3 +4560,192 @@ class TestSyntaxHighlighting(unittest.TestCase):
         self.assertIn('<tr id="L4" class="has-sink">', page)
         row = page.split('<tr id="L4"')[1].split("</tr>")[0]
         self.assertIn('<span class="hl-f">system</span>', row)
+
+
+class TestRoundThreeCoverage(unittest.TestCase):
+    """False negatives and false positives found on Juice Shop, WebGoat,
+    Mutillidae, bWAPP, DVGA and Vulnerable-Code-Snippets."""
+
+    EXPRESS_PKG = '{"dependencies": {"express": "4.18.0"}}'
+
+    def _rules(self, files):
+        return {f.rule_id for f in _scan(files).findings}
+
+    def _findings(self, files):
+        return _scan(files).findings
+
+    # --- JavaScript -----------------------------------------------------
+    def test_destructured_express_request(self):
+        typed = ("export function go () {\n"
+                 "  return ({ query }: Request, res: Response) => {\n"
+                 "    res.redirect(query.to as string)\n  }\n}\n")
+        self.assertIn("js-redirect-res", self._rules(
+            {"package.json": self.EXPRESS_PKG, "r.ts": typed}))
+        untyped = ("app.get('/f', ({ params: { file } }, res) => {\n"
+                   "  res.sendFile(path.resolve('ftp/', file))\n});\n")
+        self.assertIn("js-path-sendfile", self._rules(
+            {"package.json": self.EXPRESS_PKG, "r.js": untyped}))
+        # A destructured object that is not a request handler stays clean.
+        plain = "function f ({ query }) { res.sendFile(query) }\n"
+        self.assertNotIn("js-path-sendfile", self._rules(
+            {"package.json": self.EXPRESS_PKG, "r.js": plain}))
+
+    def test_fullstack_repo_gets_server_and_client_rules(self):
+        files = {
+            "package.json": self.EXPRESS_PKG,
+            "frontend/package.json": '{"dependencies": {"@angular/core": "17.0.0"}}',
+            "routes/r.js": "app.get('/r', (req, res) => { res.redirect(req.query.to) })\n",
+            "frontend/src/c.ts": ("class C { constructor(private s: DomSanitizer) {}\n"
+                                  "  f () { this.s.bypassSecurityTrustHtml(location.hash) } }\n"),
+        }
+        result = _scan(files)
+        self.assertEqual(result.frameworks["javascript"], "Express + Angular")
+        rules = {f.rule_id for f in result.findings}
+        self.assertIn("js-redirect-res", rules)
+        self.assertIn("angular-xss-bypasssecuritytrusthtml", rules)
+
+    def test_same_module_function_wins_over_a_namesake(self):
+        files = {
+            "package.json": self.EXPRESS_PKG,
+            "a.js": "function verify (token) { return token.length > 3 }\n",
+            "b.js": ("app.get('/a', (req, res) => { verify(req.params.f, res) })\n"
+                     "function verify (file, res) { res.sendFile(file) }\n"),
+            "c.js": "function verify (token) { return token.length > 3 }\n",
+        }
+        self.assertIn("js-path-sendfile", self._rules(files))
+
+    def test_ssrf_get_needs_an_http_client(self):
+        files = lambda body: {"package.json": self.EXPRESS_PKG, "a.js":
+                              "app.get('/a', (req, res) => { %s })\n" % body}
+        self.assertNotIn("js-ssrf-get", self._rules(files("cache.get(req.query.k)")))
+        self.assertNotIn("js-ssrf-put", self._rules(files("users.put(req.body.t, 1)")))
+        self.assertIn("js-ssrf-get", self._rules(files("axios.get(req.query.u)")))
+        self.assertIn("js-ssrf-post", self._rules(files("this.http.post(req.query.u)")))
+
+    def test_helmet_absence_ignores_comments(self):
+        base = "const express = require('express')\nconst app = express()\n"
+        self.assertIn("js-express-no-helmet", self._rules(
+            {"package.json": self.EXPRESS_PKG,
+             "s.js": base + "/*\napp.use(helmet.hsts())\n*/\n"}))
+        self.assertNotIn("js-express-no-helmet", self._rules(
+            {"package.json": self.EXPRESS_PKG,
+             "s.js": base + "app.use(helmet.frameguard())\n"}))
+
+    def test_redirect_to_configured_base_path(self):
+        self.assertNotIn("js-redirect-res", self._rules(
+            {"package.json": self.EXPRESS_PKG,
+             "a.js": "app.get('/p', (req, res) => { res.redirect(process.env.BASE + '/p') })\n"}))
+
+    def test_koa_context_sources(self):
+        code = ("const Koa = require('koa')\nconst app = new Koa()\n"
+                "app.use(async ctx => { ctx.redirect(ctx.query.target) })\n")
+        self.assertIn("js-redirect-res", self._rules({"a.js": code}))
+
+    def test_libxmljs_noent(self):
+        code = ("router.post('/x', (req, res) => {\n"
+                "  libxmljs.parseXmlString(req.body, { noent: true }) })\n")
+        self.assertIn("js-xxe-libxml-noent", self._rules(
+            {"package.json": self.EXPRESS_PKG, "a.js": code}))
+        self.assertNotIn("js-xxe-libxml-noent", self._rules(
+            {"package.json": self.EXPRESS_PKG,
+             "a.js": "libxmljs.parseXmlString(req.body, { noblanks: true })\n"}))
+
+    # --- Python -----------------------------------------------------------
+    def test_graphene_resolver_arguments(self):
+        code = ("import graphene, os\n"
+                "class Query(graphene.ObjectType):\n"
+                "    def resolve_debug(self, info, arg=None):\n"
+                "        return os.popen('ps ' + arg).read()\n"
+                "    def helper(self, info, arg):\n"
+                "        return os.popen(arg).read()\n"
+                "class Paste(graphene.Mutation):\n"
+                "    def mutate(self, info, filename):\n"
+                "        open('/up/' + filename, 'w')\n")
+        found = self._findings({"schema.py": code})
+        lines = {(f.rule_id, f.location.line) for f in found}
+        self.assertIn(("py-cmdi-os-popen", 4), lines)
+        self.assertIn(("py-path-open", 9), lines)
+        # Not a resolver: a method merely taking `info` is not an entry point.
+        self.assertNotIn(("py-cmdi-os-popen", 6), lines)
+
+    def test_str_replace_is_not_path_replace(self):
+        code = ("from flask import request\n@app.route('/a')\ndef a():\n"
+                "    s = request.args['s']\n    return s.replace(';', '')\n")
+        self.assertNotIn("py-path-pathlib-replace", self._rules({"a.py": code}))
+        code = ("from pathlib import Path\nfrom flask import request\n"
+                "@app.route('/a')\ndef a():\n"
+                "    Path(request.args['s']).replace('/tmp/x')\n")
+        self.assertIn("py-path-pathlib-replace", self._rules({"a.py": code}))
+
+    # --- PHP ----------------------------------------------------------------
+    def test_method_on_object_built_elsewhere(self):
+        files = {
+            "classes/Q.php": ("<?php class SQLQueryHandler {\n"
+                              "  public function getUserAccount($u) {\n"
+                              "    $q = \"SELECT * FROM accounts WHERE u='\" . $u . \"'\";\n"
+                              "    return $this->db->executeQuery($q); } }\n"),
+            "classes/M.php": ("<?php class MySQLHandler {\n"
+                              "  public function executeQuery($s) { return $this->conn->query($s); } }\n"),
+            "user-info.php": "<?php $SQLQueryHandler->getUserAccount($_POST['username']);\n",
+        }
+        self.assertIn("php-sqli-pdo-query", self._rules(files))
+
+    def test_soap_registered_function_arguments(self):
+        code = ("<?php function get_stock($title) {\n"
+                "  mysql_query(\"SELECT n FROM m WHERE t = '\" . $title . \"'\"); }\n"
+                "$server = new nusoap_server();\n"
+                "$server->register(\"get_stock\", array(\"title\" => \"xsd:string\"));\n")
+        self.assertIn("php-sqli-mysql_query", self._rules({"ws.php": code}))
+        unregistered = code.replace('register("get_stock"', 'register("other"')
+        self.assertNotIn("php-sqli-mysql_query", self._rules({"ws.php": unregistered}))
+
+    def test_sqlite3_query_single(self):
+        code = ("<?php $db = new SQLite3('t.db');\n"
+                "$db->querySingle('select 1 from s where id = ' . $_GET['id']);\n")
+        self.assertIn("php-sqli-querySingle", self._rules({"a.php": code}))
+
+    # --- Java -----------------------------------------------------------------
+    def _java(self, body):
+        return TestPropagation._java(self, body)
+
+    def test_try_with_resources_body(self):
+        found = {f.rule_id for f in self._java(
+            '@PostMapping("/a") public String a(@RequestParam String query) throws Exception {\n'
+            '  try (var connection = dataSource.getConnection()) {\n'
+            '    java.sql.Statement st = connection.createStatement();\n'
+            '    st.executeQuery(query);\n  }\n  return ""; }')}
+        self.assertIn("java-sqli-executeQuery", found)
+
+    def test_object_input_stream_read_object(self):
+        found = {f.rule_id for f in self._java(
+            '@PostMapping("/a") public String a(@RequestParam String token) throws Exception {\n'
+            '  String b64 = token.replace(\'-\', \'+\');\n'
+            '  try (java.io.ObjectInputStream ois = new java.io.ObjectInputStream(\n'
+            '      new java.io.ByteArrayInputStream(Base64.getDecoder().decode(b64)))) {\n'
+            '    Object o = ois.readObject();\n  }\n  return ""; }')}
+        self.assertIn("java-deser-readObject", found)
+        clean = {f.rule_id for f in self._java(
+            '@PostMapping("/a") public String a() throws Exception {\n'
+            '  java.io.ObjectInputStream ois = new java.io.ObjectInputStream(\n'
+            '      new java.io.FileInputStream("/etc/app/state.bin"));\n'
+            '  ois.readObject(); return ""; }')}
+        self.assertNotIn("java-deser-readObject", clean)
+
+    def test_string_concat_keeps_receiver_taint(self):
+        found = {f.rule_id for f in self._java(
+            '@GetMapping("/a") public void a(@RequestParam String c) throws Exception {\n'
+            '  Runtime.getRuntime().exec(c.concat(" -v")); }')}
+        self.assertIn("java-cmdi-exec", found)
+
+    # --- C# -------------------------------------------------------------------
+    def test_process_start_info_file_name(self):
+        code = ('[ApiController] public class C : ControllerBase {\n'
+                '  [HttpGet("{bin}")] public string Os(string bin) {\n'
+                '    Process p = new Process();\n'
+                '    p.StartInfo.FileName = bin;\n'
+                '    p.Start(); return ""; } }\n')
+        self.assertIn("cs-cmdi-startinfo-filename", self._rules({"a.cs": code}))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -11,7 +11,8 @@ def _framework_applies(rule_frameworks, detected):
     """True if a rule (with given frameworks tuple) applies to `detected`."""
     if not rule_frameworks or rule_frameworks == ALL or "*" in rule_frameworks:
         return True
-    return detected in rule_frameworks
+    # "Express + Angular": a repository whose modules use different ones.
+    return any(fw in rule_frameworks for fw in (detected or "").split(" + "))
 
 
 @dataclass
@@ -133,6 +134,10 @@ class SinkRule:
     # `"literal {}".format(untrusted)` is ordinary formatting. Checking the
     # arguments for these would invert the rule.
     receiver_tainted: bool = False
+    # Calls with more arguments than this are a different API of the same
+    # name: `Path.replace(target)` renames a file, `str.replace(old, new)`
+    # does not. None for no limit.
+    max_args: Optional[int] = None
     # Regex that must appear somewhere in the file for this sink to apply,
     # for a library function whose name is too common to claim on its own:
     # SQLAlchemy's `text()` is one import away from any project's own

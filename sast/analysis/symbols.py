@@ -125,6 +125,25 @@ class SymbolTable:
         candidates = self.short_functions.get(c, [])
         return candidates[0] if len(candidates) == 1 else None
 
+    def unique_method(self, method_name: str):
+        """The one method of this name in the project, if only one class has it.
+
+        A receiver whose class the engine cannot see — a global built in an
+        included file, a property assigned in a constructor — still resolves
+        when the name leaves no choice: Mutillidae's pages call
+        `$SQLQueryHandler->getUserAccount()` on an object made elsewhere.
+        """
+        index = getattr(self, "_methods_by_name", None)
+        if index is None:
+            index = self._methods_by_name = {}
+            for cls in self.classes.values():
+                for name, m in cls.methods.items():
+                    index.setdefault(name.lower(), []).append(m)
+        if method_name.startswith("__"):
+            return None
+        found = index.get(method_name.lower(), [])
+        return found[0] if len(found) == 1 else None
+
     def resolve_class(self, name: str, namespace: str = ""):
         c = _norm(name)
         if "\\" in c:

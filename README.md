@@ -336,7 +336,14 @@ sast fetch-feeds --ecosystems Packagist Maven npm PyPI Go NuGet
 Polyglot projects are handled in one pass: every language present is scanned,
 and frameworks are detected from module manifests anywhere in the tree, so a
 monorepo resolves Laravel and Spring Boot per module rather than reporting
-everything as raw.
+everything as raw. A full-stack JavaScript repository whose modules use
+different frameworks (an Express API beside an Angular client, say) is
+reported as `Express + Angular` and gets both rule sets.
+
+Entry points without a route of their own are seeded as request data too:
+GraphQL resolvers (graphene's `resolve_*`/`mutate`, ariadne and strawberry
+fields) and the functions a PHP SOAP server publishes with `register()`,
+`addFunction()` or `setClass()`.
 
 ## How it works
 
@@ -442,5 +449,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-382 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+399 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.

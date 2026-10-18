@@ -110,6 +110,8 @@ class GenericTaintEngine:
         dvcsharp-api's `Search(string keyword)` into FromSql among them.
         """
         spec = self.entry_points.get((sf.path, fn.start_point.row + 1))
+        if spec is None and self.language == "python":
+            spec = self._graphql_spec(fn, sf)
         if spec is None:
             return {}
         mode, names = spec
@@ -134,6 +136,35 @@ class GenericTaintEngine:
                                  code=sf.node_line(fn))],
                 confidence="high")
         return env
+
+    def _graphql_spec(self, fn: Node, sf: SourceFile):
+        """A GraphQL resolver's arguments are the query's arguments.
+
+        graphene's `resolve_<field>(self, info, id)` and `mutate(self, info,
+        **fields)`, ariadne's `@query.field("x")` functions and strawberry's
+        `@strawberry.field` methods are served at /graphql with no route of
+        their own, so every argument after `info` (or, for strawberry, every
+        one not typed Info) comes from the client.
+        """
+        if not _GRAPHQL_FILE.search(self._file_text(sf)):
+            return None
+        name_node = fn.child_by_field_name(self.p.f_name)
+        name = _text(name_node) if name_node is not None else ""
+        parent = fn.parent
+        decorators = ""
+        if parent is not None and parent.type == "decorated_definition":
+            decorators = " ".join(_text(c) for c in parent.named_children
+                                  if c.type == "decorator")
+        specs = self._param_specs(fn)
+        names = [n for n, _ in specs]
+        if "info" in names and (name.startswith("resolve") or name == "mutate"
+                                or ".field" in decorators):
+            return ("named", tuple(names[names.index("info") + 1:]))
+        if "strawberry" in decorators:
+            return ("named", tuple(n for n, text in specs
+                                   if not re.search(r":\s*Info\b", text)
+                                   and n not in self.p.self_names))
+        return None
 
     def _param_specs(self, fn: Node) -> list:
         """(name, declaration text) for each formal parameter of `fn`."""
@@ -914,6 +945,8 @@ class GenericTaintEngine:
                 continue
             if sink.safe_args and sink.args_safe([_text(a) for a in args]):
                 continue
+            if sink.max_args is not None and len(args) > sink.max_args:
+                continue
             # A sink that needs no tainted argument (an inherently unsafe API
             # such as gets() or strcpy()) is reported on sight.
             if not sink.tags:
@@ -1228,6 +1261,10 @@ _INJECTED_TYPE = re.compile(
     r"|Request|Response|BackgroundTasks|WebSocket|Session)\b"
     r"|(?::\s*|^\s*|\]\s*)(?:int|long|short|byte|float|double|decimal|bool"
     r"|Guid|DateTime|DateTimeOffset|uint|ulong)\??\b")
+
+
+_GRAPHQL_FILE = re.compile(r"^\s*(?:from|import)\s+(?:graphene|strawberry|ariadne)\b",
+                           re.MULTILINE)
 
 
 def _framework_injected(name: str, text: str) -> bool:
