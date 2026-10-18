@@ -998,7 +998,11 @@ class GenericTaintEngine:
         ))
 
     def _absent_ok(self, rule, sf: SourceFile) -> bool:
-        """True unless the rule's `absent` regex appears in the file."""
+        """True unless the rule's `absent` regex appears in the file, and
+        its `requires` regex, if any, does."""
+        if getattr(rule, "requires", None) and not self._file_allows(
+                _Gate(rule.requires), sf):
+            return False
         if not getattr(rule, "absent", None):
             return True
         import re as _re
@@ -1016,6 +1020,10 @@ class GenericTaintEngine:
             return
         matches: dict = {}
         for node in sf.walk():
+            # Commented-out code is not configuration: a wildcard rule
+            # otherwise reports `# app.run(debug=True)` as debug mode on.
+            if node.type in self.p.comment:
+                continue
             for rule in self.rules.patterns:
                 if rule.node_type != "*" and node.type != rule.node_type:
                     continue
@@ -1104,6 +1112,26 @@ def _restrict_tags(taint, keep: tuple):
         return None
     return Taint(tags=tags, origins=list(taint.origins),
                  steps=list(taint.steps), confidence=taint.confidence)
+
+
+class _Gate:
+    """A bare file_requires holder, so a pattern's `requires` regex shares
+    the per-file verdict cache with gated sources and sinks."""
+
+    _instances: dict = {}
+
+    def __new__(cls, regex: str):
+        # One object per regex: the cache is keyed on identity.
+        inst = cls._instances.get(regex)
+        if inst is None:
+            inst = super().__new__(cls)
+            inst.file_requires = regex
+            cls._instances[regex] = inst
+        return inst
+
+    def file_allows(self, text: str) -> bool:
+        from ..rules.base import _file_gate_allows
+        return _file_gate_allows(self, text)
 
 
 def _receiver_named(names: tuple, path: str) -> bool:

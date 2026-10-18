@@ -203,6 +203,34 @@ def _sinks() -> list[SinkRule]:
              "outside the intended directory.",
              "Resolve the path and verify it stays inside an allow-listed root.",
              _PATH, arg_index=0)
+    # pathlib: the path is the object the method is called on, so it is the
+    # receiver that must be tainted — `Path(user).read_text()`. Without these
+    # a pathlib-based file API was invisible; vulpy builds API-key files with
+    # `Path(f"/tmp/vulpy.apikey.{username}.{key}").touch()`.
+    for fn in ("read_text", "read_bytes", "write_text", "write_bytes", "touch",
+               "unlink", "rmdir", "mkdir", "open", "rename", "replace",
+               "symlink_to", "iterdir"):
+        sink(f"py-path-pathlib-{fn.replace('_', '-')}", fn,
+             f"Path traversal via Path.{fn}()", "high", "CWE-22", A01,
+             "path-traversal",
+             "The path this pathlib method acts on is built from "
+             "attacker-controlled input, so it can name a file outside the "
+             "intended directory.",
+             "Resolve the path and check it is_relative_to() an allow-listed "
+             "root before using it.",
+             _PATH, receiver_tainted=True)
+    # A glob pattern is a path with wildcards: `*` in an attacker-supplied
+    # fragment matches every file. vulpy authenticates an API key with
+    # `Path('/tmp/').glob('vulpy.apikey.*.' + key)`, so the key `*` matches
+    # any user's key file.
+    for fn in ("glob", "iglob", "rglob"):
+        sink(f"py-path-{fn}", fn, f"Path or wildcard injection via {fn}()",
+             "high", "CWE-22", A01, "path-traversal",
+             "The glob pattern includes attacker-controlled input, which can "
+             "add wildcards or '..' segments and match files it should not.",
+             "Validate the fragment against a strict pattern (e.g. "
+             "^[A-Za-z0-9]+$) or glob.escape() it before building the pattern.",
+             _PATH, arg_index=0)
     sink("py-path-send-file", "send_file", "Path traversal via send_file()",
          "high", "CWE-22", A01, "path-traversal",
          "The file served is chosen by attacker-controlled input.",
@@ -310,6 +338,15 @@ def _sanitizers() -> list[SanitizerRule]:
     s.append(SanitizerRule(kind="call", match="quote", neutralize=["cmd"],
                            cls="shlex"))
     s.append(SanitizerRule(kind="call", match="basename", neutralize=["path", "lfi"]))
+    # Werkzeug's secure_filename() reduces a name to safe ASCII with no path
+    # separators; it is the documented way to accept an upload's filename.
+    s.append(SanitizerRule(kind="call", match="secure_filename",
+                           neutralize=["path", "lfi"]))
+    # Rendering a template file escapes every variable it interpolates, so
+    # what comes back is markup the template author wrote. A template that
+    # opts out with |safe is reported by the template scanner instead.
+    for fn in ("render_to_string", "render_template"):
+        s.append(SanitizerRule(kind="call", match=fn, neutralize=["xss"]))
     s.append(SanitizerRule(kind="call", match="safe_load", neutralize=["deser"]))
     # Escaping that does not do what it is often assumed to.
     s.append(SanitizerRule(
@@ -328,13 +365,13 @@ def _patterns() -> list[PatternRule]:
     def pat(rid, match, title, desc, fix, severity="medium", cwe="", owasp=A05,
             category="security-misconfiguration", node_type="*",
             match_field="text", confidence="high", frameworks=("*",),
-            ignore_case=False):
+            ignore_case=False, requires=None):
         p.append(PatternRule(
             rule_id=rid, node_type=node_type, match=match,
             match_field=match_field, title=title, severity=severity, cwe=cwe,
             owasp=owasp, category=category, description=desc, remediation=fix,
             frameworks=frameworks, regex=True, confidence=confidence,
-            ignore_case=ignore_case))
+            ignore_case=ignore_case, requires=requires))
 
     pat("py-weak-random", r"\brandom\.(?:random|randint|choice|randrange|shuffle)\s*\(",
         "Predictable random number generator",
@@ -342,11 +379,34 @@ def _patterns() -> list[PatternRule]:
         "it are guessable.",
         "Use the secrets module for anything security-relevant.",
         cwe="CWE-338", owasp=A02, category="weak-random", node_type="call")
-    pat("py-crypto-weak-hash", r"hashlib\.(?:md5|sha1)\s*\(",
+    pat("py-crypto-weak-hash",
+        r"hashlib\.(?:md5|sha1)\s*\(|hashlib\.new\s*\(\s*['\"](?:md5|sha1)['\"]",
         "Weak cryptographic hash (MD5/SHA-1)",
         "MD5 and SHA-1 are broken for signatures, integrity and passwords.",
         "Use SHA-256+ for integrity and bcrypt/scrypt/argon2 for passwords.",
         severity="low", cwe="CWE-328", owasp=A02, category="weak-crypto",
+        node_type="call")
+    # `from hashlib import md5` then `md5(...)`: the same hash, missed by the
+    # dotted rule. dvpwa and pygoat both hash passwords this way.
+    pat("py-crypto-weak-hash-imported", r"^(?:md5|sha1)$",
+        "Weak cryptographic hash (MD5/SHA-1)",
+        "MD5 and SHA-1 are broken for signatures, integrity and passwords.",
+        "Use SHA-256+ for integrity and bcrypt/scrypt/argon2 for passwords.",
+        severity="low", cwe="CWE-328", owasp=A02, category="weak-crypto",
+        node_type="call", match_field="callee",
+        requires=r"from\s+hashlib\s+import\b[^\n]*\b(?:md5|sha1)\b")
+    # The stdlib XML parsers ignore external entities since Python 3.7.1
+    # unless told otherwise; turning them on is the vulnerability. lxml's
+    # resolve_entities=True and a parser without no_network do the same.
+    pat("py-xxe-external-entities",
+        r"setFeature\s*\(\s*(?:\w+\.)?feature_external_[gp]es\s*,\s*(?:True|1)\b"
+        r"|resolve_entities\s*=\s*True",
+        "XML external entities enabled",
+        "The parser is configured to resolve external entities, so an XML "
+        "document can read local files (file:///etc/passwd) or reach internal "
+        "services through entity URLs.",
+        "Leave external entities off, or parse untrusted XML with defusedxml.",
+        severity="high", cwe="CWE-611", owasp=A05, category="xxe",
         node_type="call")
     pat("py-tls-verify-disabled", r"verify\s*=\s*False",
         "TLS certificate verification disabled",

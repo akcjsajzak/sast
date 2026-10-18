@@ -242,6 +242,10 @@ class PatternRule:
     # rule express "this was created but never hardened" — a cookie built
     # without setSecure, for instance — which a per-node match cannot say.
     absent: Optional[str] = None
+    # Only fire when this regex DOES appear somewhere in the file: a bare
+    # `md5(...)` is hashlib's only after `from hashlib import md5`.
+    # Generic engine only, like `absent`'s file-level counterpart below.
+    requires: Optional[str] = None
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)

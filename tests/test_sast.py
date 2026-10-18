@@ -3780,3 +3780,86 @@ class TestJinjaTemplates(unittest.TestCase):
             "    aiohttp_jinja2.setup(app, loader=None, autoescape=False)\n"
             "    env = jinja2.Environment(autoescape=True)\n")
         self.assertEqual(found, [("py-jinja-autoescape-off", 3)])
+
+
+class TestPythonPathAndPatternGaps(unittest.TestCase):
+    """Rules missing for shapes found in vulpy, dvpwa and pygoat."""
+
+    def test_pathlib_methods_and_glob_patterns(self):
+        """vulpy's API keys: a username into Path().touch(), a header into
+        Path.glob() — where the key `*` matches every user's key file."""
+        found = _py_rules(
+            "from pathlib import Path\n"
+            "from flask import request\n"
+            "def keygen(username):\n"
+            "    for f in Path('/tmp/').glob('k.' + username + '.*'):\n"
+            "        f.unlink()\n"
+            "    Path('/tmp/k.{}'.format(username)).touch()\n"
+            "def authenticate(request):\n"
+            "    key = request.headers['X-APIKEY']\n"
+            "    for f in Path('/tmp/').glob('k.*.' + key):\n"
+            "        return f.name\n"
+            "def route():\n"
+            "    keygen(request.get_json()['username'])\n"
+            "def fixed():\n"
+            "    Path('/etc/app.conf').read_text()\n")
+        self.assertEqual(found, [
+            ("py-path-glob", 4), ("py-path-glob", 9),
+            ("py-path-pathlib-touch", 6), ("py-path-pathlib-unlink", 5)])
+
+    def test_weak_hash_imported_bare_or_by_name(self):
+        found = _py_rules(
+            "from hashlib import md5\n"
+            "import hashlib\n"
+            "a = md5(b'x').hexdigest()\n"
+            "b = hashlib.new('sha1', b'x')\n"
+            "c = hashlib.sha256(b'x')\n")
+        self.assertEqual(found, [("py-crypto-weak-hash", 4),
+                                 ("py-crypto-weak-hash-imported", 3)])
+        self.assertEqual(_py_rules("from fasthash import md5\na = md5(b'x')\n"),
+                         [])
+
+    def test_xml_external_entities_enabled(self):
+        """pygoat's XXE lab turns feature_external_ges on explicitly."""
+        found = _py_rules(
+            "from xml.sax import make_parser\n"
+            "from xml.sax.handler import feature_external_ges\n"
+            "from lxml import etree\n"
+            "p = make_parser()\n"
+            "p.setFeature(feature_external_ges, True)\n"
+            "q = etree.XMLParser(resolve_entities=True)\n"
+            "r = etree.XMLParser(resolve_entities=False)\n"
+            "p.setFeature(feature_external_ges, False)\n")
+        self.assertEqual(found, [("py-xxe-external-entities", 5),
+                                 ("py-xxe-external-entities", 6)])
+
+
+class TestPythonPrecisionFixes(unittest.TestCase):
+    """False positives seen while measuring recall."""
+
+    def test_commented_out_code_is_not_a_finding(self):
+        self.assertEqual(_py_rules(
+            "from flask import Flask\n"
+            "app = Flask(__name__)\n"
+            "# app.run(debug=True)\n"
+            "app.run(debug=True)\n"), [("py-flask-debug", 4)])
+
+    def test_secure_filename_sanitizes_an_upload_path(self):
+        self.assertEqual(_py_rules(
+            "from flask import Flask, request\n"
+            "from werkzeug.utils import secure_filename\n"
+            "app = Flask(__name__)\n"
+            "def up():\n"
+            "    f = request.files['file']\n"
+            "    open('/srv/up/' + secure_filename(f.filename), 'w')\n"
+            "    open('/srv/up/' + f.filename, 'w')\n"), [("py-path-open", 7)])
+
+    def test_rendered_template_is_escaped_html(self):
+        self.assertEqual(_py_rules(
+            "from django.http import HttpResponse\n"
+            "from django.template.loader import render_to_string\n"
+            "def v(request):\n"
+            "    return HttpResponse(render_to_string('t.html', {'u': request.GET['u']}))\n"
+            "def bad(request):\n"
+            "    return HttpResponse('<p>' + request.GET['u'])\n"),
+            [("py-xss-httpresponse", 6)])
