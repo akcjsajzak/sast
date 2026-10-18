@@ -194,6 +194,7 @@ __BANNER__
       <div class="viewer-bar">
         <span class="viewer-title" id="v-title">No report selected</span>
         <a class="btn-sm" id="v-open" href="#" target="_blank" style="display:none;text-decoration:none">Open ↗</a>
+        <a class="btn-sm" id="v-code" href="#" target="_blank" style="display:none;text-decoration:none">Code</a>
         <a class="btn-sm" id="v-json" href="#" target="_blank" style="display:none;text-decoration:none">JSON</a>
         <button class="btn-sm" id="v-del" type="button" style="display:none">Delete</button>
       </div>
@@ -310,7 +311,7 @@ __BANNER__
   function show(){
     var rec = records[current];
     var body = $("v-body"), title = $("v-title");
-    ["v-open","v-json","v-del"].forEach(function(id){ $(id).style.display = "none"; });
+    ["v-open","v-code","v-json","v-del"].forEach(function(id){ $(id).style.display = "none"; });
     if (!rec) {
       title.textContent = "No report selected";
       body.innerHTML = '<div class="empty">Run a scan, or pick one from the history.</div>';
@@ -324,6 +325,7 @@ __BANNER__
     } else if (rec.status === "done") {
       $("v-open").style.display = ""; $("v-open").href = "report/" + rec.id;
       $("v-json").style.display = ""; $("v-json").href = "report/" + rec.id + ".json";
+      $("v-code").style.display = ""; $("v-code").href = "code/" + rec.id;
       if (body.dataset.shown !== rec.id) {
         body.innerHTML = '<iframe src="report/' + rec.id + '" title="Scan report"></iframe>';
         body.dataset.shown = rec.id;

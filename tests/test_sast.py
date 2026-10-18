@@ -4356,3 +4356,138 @@ class TestJavaVulnerableAppShapes(unittest.TestCase):
             self.assertIn(expected, found)
         # Filter.encodeValue() escapes the filter value (line 8).
         self.assertNotIn(("java-ldap-ldapconnection-search", 8), found)
+
+
+class TestCodeBrowser(unittest.TestCase):
+    """The web interface's code browser and the snapshot behind it."""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from sast.web.server import make_server
+        cls.httpd, cls.store, cls.service = make_server(
+            "127.0.0.1", 0, tempfile.mkdtemp(prefix="sast-web-"))
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        cls.src = tempfile.mkdtemp(prefix="sast-src-")
+        files = {
+            "package.json": '{"dependencies":{"express":"4"}}',
+            "model/db.js": ("const pool = require('pg').Pool();\n"
+                            "function lookup(u) {\n"
+                            "  return pool.query(\"SELECT * FROM t WHERE n = '\" + u + \"'\");\n"
+                            "}\nmodule.exports = { lookup };\n"),
+            "routes/a b.js": ("const db = require('../model/db');\n"
+                              "const app = require('express')();\n"
+                              "// <script>alert(1)</script>\n"
+                              "app.get('/x', (req, res) => { db.lookup(req.query.u); });\n"),
+            "unreferenced.js": "const secret = 1;\n",
+        }
+        for rel, text in files.items():
+            path = os.path.join(cls.src, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(text)
+        cls.scan_id = cls.service.start("path", cls.src)
+        assert cls.service.wait(120)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.store.close()
+
+    def _get(self, path):
+        import urllib.error
+        import urllib.request
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=30) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8")
+
+    def test_snapshot_holds_only_referenced_files(self):
+        self.assertEqual(self.store.source_files(self.scan_id),
+                         ["model/db.js", "routes/a b.js"])
+
+    def test_file_page_marks_sinks_and_steps_and_escapes(self):
+        code, page = self._get(f"/code/{self.scan_id}/model/db.js")
+        self.assertEqual(code, 200)
+        self.assertIn('id="L3" class="has-sink"', page)
+        self.assertIn("js-sqli-query", page)
+        code, page = self._get(f"/code/{self.scan_id}/routes/a%20b.js")
+        self.assertEqual(code, 200)
+        self.assertIn('id="L4" class="has-step"', page)
+        # The step's note links to the sink in the other file.
+        self.assertIn("model/db.js#L3", page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
+        self.assertNotIn("<script>alert(1)", page)
+
+    def test_index_lists_the_snapshot(self):
+        code, page = self._get(f"/code/{self.scan_id}")
+        self.assertEqual(code, 200)
+        self.assertIn("db.js", page)
+        self.assertNotIn("unreferenced.js", page)
+
+    def test_only_snapshot_names_are_served(self):
+        for path in ("unreferenced.js", "..%2F..%2Fetc%2Fpasswd",
+                     "../../etc/passwd", "%2Fetc%2Fpasswd", "package.json"):
+            code, _ = self._get(f"/code/{self.scan_id}/{path}")
+            self.assertEqual(code, 404, path)
+        self.assertEqual(self._get("/code/deadbeef/model/db.js")[0], 404)
+
+    def test_report_marks_references_for_the_browser(self):
+        _, report = self._get(f"/report/{self.scan_id}")
+        self.assertIn('class="coderef" data-path="model/db.js" data-line="3"', report)
+        self.assertIn('data-path="routes/a b.js"', report)
+        self.assertIn("codeBase + scanId", report)
+
+    def test_delete_removes_the_snapshot(self):
+        sid = self.service.start("path", self.src)
+        self.assertTrue(self.service.wait(120))
+        snapshot = self.store.sources_path(sid)
+        self.assertTrue(os.path.exists(snapshot))
+        self.assertTrue(self.store.delete(sid))
+        self.assertFalse(os.path.exists(snapshot))
+
+
+class TestSourceSnapshotLimits(unittest.TestCase):
+    def test_caps_links_and_files_outside_the_root(self):
+        from sast.web.store import ScanStore
+        store = ScanStore(tempfile.mkdtemp(prefix="sast-store-"))
+        self.addCleanup(store.close)
+        root = tempfile.mkdtemp()
+        outside = tempfile.NamedTemporaryFile("w", delete=False, suffix=".js")
+        outside.write("x"); outside.close()
+        paths = []
+        for name, size in (("small.js", 10), ("big.js", 5000), ("b.js", 10)):
+            p = os.path.join(root, name)
+            with open(p, "w") as fh:
+                fh.write("x" * size)
+            paths.append(p)
+        link = os.path.join(root, "link.js")
+        os.symlink(outside.name, link)
+        rec = store.create("path", root)
+        kept = store.write_sources(rec.id, root, paths + [link, outside.name],
+                                   max_file=1000, max_total=1000, max_files=10)
+        self.assertEqual(kept, 2)
+        self.assertEqual(store.source_files(rec.id), ["b.js", "small.js"])
+        self.assertIsNone(store.read_source(rec.id, "big.js"))
+
+    def test_nothing_is_written_for_a_deleted_scan(self):
+        from sast.web.store import ScanStore
+        store = ScanStore(tempfile.mkdtemp(prefix="sast-store-"))
+        self.addCleanup(store.close)
+        root = tempfile.mkdtemp()
+        p = os.path.join(root, "a.js")
+        with open(p, "w") as fh:
+            fh.write("x")
+        rec = store.create("path", root)
+        store.delete(rec.id)
+        self.assertEqual(store.write_sources(rec.id, root, [p], 100, 100, 10), 0)
+        self.assertFalse(os.path.exists(store.sources_path(rec.id)))
+
+    def test_standalone_report_keeps_plain_references(self):
+        """Opened as a file there is no browser: the references stay text."""
+        html_out = render_html(_scan({"a.php": '<?php system($_GET["c"]);'}))
+        self.assertIn('class="coderef"', html_out)
+        self.assertNotIn('<a class="coderef"', html_out)

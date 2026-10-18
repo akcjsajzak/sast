@@ -252,6 +252,22 @@ sast server --port 9000 --data-dir /var/lib/sast
 
 ![sast web interface](docs/web.png)
 
+Every code reference in a report served this way (a finding's sink, each
+step of its trace, a route's declaration) opens the file in a built-in code
+browser at that line. The page shows line numbers, marks each line where a
+finding sinks (by severity) or a trace passes through, and lists the scanned
+files beside it. A source or step note links to its sink, so a cross-file
+trace can be followed by clicking. The **Code** button opens the file list
+for a scan.
+
+The browser reads from a snapshot taken when the scan finishes, not from
+disk. An uploaded archive or a git checkout is deleted after the scan, and a
+local path can change under the report. The snapshot holds only the files
+the report refers to, so the browser cannot be used to read anything else
+on the machine. Files over 2 MB are left out, and a scan keeps at most 64 MB
+or 2000 files, dropping the least-referenced first. Deleting a scan deletes
+its snapshot. Scans made before this feature have no snapshot.
+
 It is built on `http.server` from the standard library; adding a web framework
 would have cost the tool its defining property of running offline with nothing
 installed.
@@ -423,5 +439,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-366 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+375 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.

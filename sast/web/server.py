@@ -24,10 +24,11 @@ import time
 import traceback
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 from ..engine import ScanEngine, ScanOptions
 from ..reporting import render_html, render_json
-from . import multipart
+from . import codeview, multipart
 from .sources import SourceError, resolve
 from .store import ScanStore
 from .ui import render_page
@@ -141,6 +142,12 @@ class ScanService:
                     scan_id, render_html(result), render_json(result)):
                 self._log(scan_id, "deleted while running; report discarded")
                 return
+            # Before the checkout is cleaned up: the browser reads only this.
+            kept = self.store.write_sources(
+                scan_id, result.root, codeview.referenced_files(result),
+                codeview.MAX_SNAPSHOT_FILE_BYTES,
+                codeview.MAX_SNAPSHOT_TOTAL_BYTES, codeview.MAX_SNAPSHOT_FILES)
+            self._log(scan_id, f"kept {kept} source file(s) for the code browser")
             self.store.finish(scan_id, result, time.time() - started)
             self._log(scan_id, "done: "
                       f"{len(result.findings)} finding(s), "
@@ -292,6 +299,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"verdicts": self.store.triage(scan_id)})
             return
 
+        if path.startswith("/code/"):
+            self._handle_code(path[len("/code/"):])
+            return
+
         if path == "/healthz":
             self._json(200, {"status": "ok"})
             return
@@ -321,6 +332,32 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_triage(path.rsplit("/", 1)[-1])
             return
         self._error(404, "Not found.")
+
+    def _handle_code(self, rest: str) -> None:
+        """The code browser: `/code/<scan>` and `/code/<scan>/<path>`."""
+        scan_id, _, encoded = rest.partition("/")
+        record = self.store.get(scan_id)
+        if record is None:
+            self._error(404, "No such scan.")
+            return
+        try:
+            files = self.store.source_files(scan_id)
+        except ValueError:
+            self._error(404, "No such scan.")
+            return
+        notes = codeview.annotations(self.store.read_json_report(scan_id))
+        label = record.source_label or record.root
+        if not encoded:
+            page = codeview.render_index(scan_id, label, files, notes)
+            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        rel = unquote(encoded)
+        content = self.store.read_source(scan_id, rel)
+        if content is None:
+            self._error(404, "That file is not in this scan's snapshot.")
+            return
+        page = codeview.render_file(scan_id, label, rel, content, files, notes)
+        self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
 
     def _handle_triage(self, scan_id: str) -> None:
         """Record triage verdicts sent by a report page.

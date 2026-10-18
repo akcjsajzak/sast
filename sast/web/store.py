@@ -12,6 +12,7 @@ import os
 import sqlite3
 import threading
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -250,7 +251,8 @@ class ScanStore:
         under the same lock.
         """
         try:
-            paths = (self.report_path(scan_id), self.json_path(scan_id))
+            paths = (self.report_path(scan_id), self.json_path(scan_id),
+                     self.sources_path(scan_id))
         except ValueError:
             return False  # not an id this store could have issued
         with self._lock:
@@ -287,6 +289,76 @@ class ScanStore:
                 with open(self.json_path(scan_id), "w", encoding="utf-8") as fh:
                     fh.write(payload)
         return True
+
+    # ------------------------------------------------------------------
+    # Source snapshot for the code browser (see web/codeview.py)
+    def sources_path(self, scan_id: str) -> str:
+        return os.path.join(self.reports_dir, f"{_safe_id(scan_id)}.src.zip")
+
+    def write_sources(self, scan_id: str, root: str, paths: list,
+                      max_file: int, max_total: int, max_files: int) -> int:
+        """Snapshot `paths` (absolute, under `root`) for one scan.
+
+        Returns how many files were kept. Nothing is written for a scan
+        deleted meanwhile, for the same reason as write_report.
+        """
+        from .codeview import rel_path
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM scans WHERE id = ?", (scan_id,)).fetchone()
+            if row is None:
+                return 0
+            kept, total = 0, 0
+            tmp = self.sources_path(scan_id) + ".tmp"
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+                for path in paths:
+                    rel = rel_path(root, path)
+                    if not rel or kept >= max_files:
+                        continue
+                    try:
+                        if not os.path.isfile(path) or os.path.islink(path):
+                            continue
+                        size = os.path.getsize(path)
+                        if size > max_file or total + size > max_total:
+                            continue
+                        with open(path, "rb") as fh:
+                            data = fh.read(max_file + 1)
+                    except OSError:
+                        continue
+                    zf.writestr(rel, data)
+                    kept += 1
+                    total += len(data)
+            os.replace(tmp, self.sources_path(scan_id))
+        return kept
+
+    def source_files(self, scan_id: str) -> list:
+        """Relative paths kept in a scan's snapshot (empty if it has none)."""
+        try:
+            with zipfile.ZipFile(self.sources_path(scan_id)) as zf:
+                return sorted(zf.namelist())
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return []
+
+    def read_source(self, scan_id: str, rel: str):
+        """One snapshot file's bytes, or None.
+
+        Only a name listed in the archive is read, so no request can reach
+        anything the scan did not store, whatever the path contains.
+        """
+        try:
+            with zipfile.ZipFile(self.sources_path(scan_id)) as zf:
+                if rel not in set(zf.namelist()):
+                    return None
+                return zf.read(rel)
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+            return None
+
+    def read_json_report(self, scan_id: str) -> str:
+        try:
+            with open(self.json_path(scan_id), "r", encoding="utf-8") as fh:
+                return fh.read()
+        except (OSError, ValueError):
+            return ""
 
     def read_report(self, scan_id: str) -> str:
         try:

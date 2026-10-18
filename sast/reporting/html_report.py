@@ -46,6 +46,26 @@ def _rel(root: str, path: str) -> str:
     return rel if not rel.startswith("..") else path
 
 
+def _ref(root: str, path: str, line) -> str:
+    """`path:line` as a code reference.
+
+    A path inside the scan root carries data-path/data-line, which the
+    page turns into a link to the code browser when `sast server` serves it
+    (the file is in that scan's snapshot); opened as a local file there is
+    nothing to link to, and it reads as plain text.
+    """
+    shown = f"{_rel(root, path)}:{_esc(line)}"
+    try:
+        rel = os.path.relpath(path, root) if path and root else ""
+    except ValueError:
+        rel = ""
+    if not rel or rel.startswith("..") or os.path.isabs(rel):
+        return shown
+    rel = rel.replace(os.sep, "/")
+    return (f'<span class="coderef" data-path="{_esc(rel)}" '
+            f'data-line="{_esc(line)}">{shown}</span>')
+
+
 def _chip(label: str, value) -> str:
     value = _esc(value)
     if not value:
@@ -198,7 +218,7 @@ def _surface_section(routes: list, root: str) -> str:
             f'<td class="mono">{_esc(r.path)}</td>'
             f'<td class="mono rt-h">{handler}</td>'
             f'<td>{guard}</td>'
-            f'<td class="mono rt-f">{_rel(root, r.file)}:{_esc(r.line)}</td></tr>'
+            f'<td class="mono rt-f">{_ref(root, r.file, r.line)}</td></tr>'
         )
     return (
         '<details class="surface"><summary>Attack surface '
@@ -247,7 +267,7 @@ _TRIAGE_CONTROL = (
 
 
 def _finding_card(i: int, f, root: str) -> str:
-    sink_loc = f"{_rel(root, f.location.file)}:{_esc(f.location.line)}"
+    sink_loc = _ref(root, f.location.file, f.location.line)
 
     chips = "".join(
         c for c in (
@@ -349,7 +369,7 @@ def _trace_timeline(f, root: str) -> str:
             kind, tag = "sink", '<span class="step-tag st-sink">SINK</span>'
         else:
             kind, tag = "hop", ""
-        loc_str = f"{_rel(root, loc.file)}:{_esc(loc.line)}" if loc and loc.file else ""
+        loc_str = _ref(root, loc.file, loc.line) if loc and loc.file else ""
         code = _code(step.code) if step.code else ""
         items.append(
             f'<li class="step step-{kind}">'
@@ -663,6 +683,9 @@ h2.sec .n {{
 }}
 
 /* Trace timeline */
+a.coderef {{ color:var(--link); text-decoration:none;
+  border-bottom:1px dotted currentColor; }}
+a.coderef:hover {{ border-bottom-style:solid; }}
 details.trace {{ margin-top:14px; border-top:1px solid var(--border); padding-top:10px; }}
 details.trace summary {{
   cursor:pointer; font-size:12.5px; font-weight:650; color:var(--muted-2);
@@ -784,14 +807,33 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
   }}
   // The API sits beside /report/, so it is found from the report's own
   // path: a server mounted under a prefix by a reverse proxy keeps working.
-  var apiBase = '';
+  var apiBase = '', codeBase = '';
   var scanId = (function(){{
     var m = location.pathname.match(new RegExp('/report/([A-Za-z0-9_-]+)'));
     if (!m) return '';
     apiBase = location.pathname.slice(0, m.index) + '/api/triage/';
+    codeBase = location.pathname.slice(0, m.index) + '/code/';
     return m[1];
   }})();
   var remote = !!scanId && location.protocol.indexOf('http') === 0;
+
+  // Served by `sast server`, every code reference opens the file in the code
+  // browser at that line; the scan kept a snapshot of each referenced file.
+  if (remote) {{
+    Array.prototype.forEach.call(
+      document.querySelectorAll('.coderef[data-path]'), function(el){{
+        var path = el.getAttribute('data-path').split('/')
+          .map(encodeURIComponent).join('/');
+        var a = document.createElement('a');
+        a.className = 'coderef';
+        a.href = codeBase + scanId + '/' + path + '#L' + el.getAttribute('data-line');
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.title = 'Open in the code browser';
+        a.textContent = el.textContent;
+        el.parentNode.replaceChild(a, el);
+      }});
+  }}
   var storeKey = 'sast-triage:' + (scanId || location.pathname);
   var whereEl = document.getElementById('triage-where');
 
