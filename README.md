@@ -69,6 +69,18 @@ missing grammar or data file would pass them and still break for users, so CI
 runs the smoke test on both platforms before uploading an artifact. Re-run
 `make` now and then to refresh the embedded vulnerability data.
 
+### Releases
+
+Pushing a version tag publishes a GitHub release. The tag must match
+`sast.__version__` and have a section in `CHANGELOG.md`, which becomes the
+release notes; CI builds and smoke-tests both binaries first, then attaches
+`sast-<version>-linux-x86_64.tar.gz`, `sast-<version>-windows-x86_64.zip`
+and their `SHA256SUMS`.
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
 ## Language coverage
 
 | Language | Frameworks |

@@ -6,4 +6,4 @@ scanning, all in a single self-contained binary with an embedded advisory
 database.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

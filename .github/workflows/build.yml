@@ -2,7 +2,13 @@ name: build
 
 on:
   push:
+    branches: ["**"]
+    # A version tag (v1.0.0) builds and publishes a GitHub release.
+    tags: ["v*"]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -27,6 +33,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e . pyinstaller
+
+      - name: Check the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VERSION=$(python -c "import sast; print(sast.__version__)")
+          if [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match sast.__version__ $VERSION"
+            exit 1
+          fi
 
       - name: Run unit tests
         run: python -m unittest tests.test_sast
@@ -69,3 +85,49 @@ jobs:
           name: sast-${{ matrix.os }}
           path: dist/sast*
           if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download executables
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package executables
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir release
+          # Artifacts do not keep the executable bit; a tarball does.
+          chmod +x artifacts/sast-ubuntu-latest/sast
+          tar -czf "release/sast-${VERSION}-linux-x86_64.tar.gz" \
+            -C artifacts/sast-ubuntu-latest sast
+          (cd artifacts/sast-windows-latest && \
+            zip -q "../../release/sast-${VERSION}-windows-x86_64.zip" sast.exe)
+          (cd release && sha256sum * > SHA256SUMS)
+
+      - name: Extract release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v v="$VERSION" '
+            $0 ~ "^## " { if (found) exit; found = ($2 == v); next }
+            found' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "sast ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag
