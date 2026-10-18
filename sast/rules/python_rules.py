@@ -97,13 +97,14 @@ def _sinks() -> list[SinkRule]:
 
     def sink(rid, match, title, severity, cwe, owasp, category, desc, fix, tags,
              arg_index=-1, obj_hint=None, frameworks=("*",), confidence="high",
-             kind="call", receiver_tainted=False):
+             kind="call", receiver_tainted=False, file_requires=None):
         k.append(SinkRule(rule_id=rid, kind=kind, match=match, title=title,
                           severity=severity, cwe=cwe, owasp=owasp,
                           category=category, description=desc, remediation=fix,
                           tags=tags, arg_index=arg_index, obj_hint=obj_hint,
                           frameworks=frameworks, confidence=confidence,
-                          receiver_tainted=receiver_tainted))
+                          receiver_tainted=receiver_tainted,
+                          file_requires=file_requires))
 
     # Code execution
     for fn in ("eval", "exec", "compile"):
@@ -152,7 +153,11 @@ def _sinks() -> list[SinkRule]:
              "Untrusted data is formatted into a SQL statement instead of being "
              "bound as a parameter.",
              "Use parameterised queries: cursor.execute(sql, (params,)).",
-             _SQL, arg_index=0)
+             _SQL, arg_index=0,
+             # `text` is SQLAlchemy's raw-SQL constructor only in a file that
+             # uses SQLAlchemy (or SQLModel, which re-exports it); anywhere
+             # else it is someone's string helper.
+             file_requires=r"sqlalchemy|sqlmodel" if fn == "text" else None)
     sink("py-sqli-extra", "extra", "SQL injection via Django .extra()", "high",
          "CWE-89", A03, "sql-injection",
          "QuerySet.extra() interpolates raw SQL fragments.",

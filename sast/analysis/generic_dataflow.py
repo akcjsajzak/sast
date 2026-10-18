@@ -11,6 +11,8 @@ language are directly comparable in a report.
 """
 from __future__ import annotations
 
+import os
+
 from tree_sitter import Node
 
 from ..models import Finding, Severity, TaintStep
@@ -61,12 +63,18 @@ class GenericTaintEngine:
         # candidate expression, so without this a scan spends most of its
         # time re-searching the same text for the same answer.
         self._file_gate_cache: dict = {}
+        # Python only: dotted names of first-party modules, and per file the
+        # names that refer to project code. See _calls_first_party.
+        self._modules: set = set()
+        self._bindings: dict = {}
         # Declared element counts for fixed-size arrays, so an index finding
         # can name the bound it may exceed.
         self._array_sizes: dict = {}
 
     # ------------------------------------------------------------------
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
+        if self.p.module_bindings:
+            self._modules = _module_index(files)
         for sf in files:
             self.walk_block(sf.root, sf, {}, Ctx())
         # Function bodies again with a clean environment, so a sink inside a
@@ -651,6 +659,34 @@ class GenericTaintEngine:
             cache[key] = text
         return text
 
+    def _calls_first_party(self, name: str, node: Node, sf: SourceFile) -> bool:
+        """True when a call resolves to the project's own code.
+
+        Library sinks are matched by name, so a project helper called
+        `text`, `raw` or `execute` read as SQLAlchemy, Django or a DB-API
+        cursor: every call to one with request data was a SQL injection.
+        A bare call is first-party when the name is defined in this file or
+        imported from a first-party module. `x.m()` is first-party when `x`
+        is a first-party module or a class defined in the file, and
+        `self.m()` / `cls.m()` when `m` is a method defined in the file. An
+        object imported from project code is not enough: `from app import db`
+        may well be a SQLAlchemy instance, and `db.execute()` its real sink.
+        """
+        bound = self._bindings.get(sf.path)
+        if bound is None:
+            bound = self._bindings[sf.path] = _file_bindings(
+                sf.root, self.p, self._modules)
+        callables, namespaces, methods = bound
+        recv = self._receiver_node(node)
+        if recv is None:
+            return name in callables
+        if recv.type not in self.p.identifier:
+            return False
+        root = _text(recv)
+        if root in self.p.self_names:
+            return name in methods
+        return root in namespaces
+
     def _file_allows(self, src, sf: SourceFile) -> bool:
         """Whether a file-gated source applies to this file, cached."""
         key = (id(src), sf.path)
@@ -752,12 +788,19 @@ class GenericTaintEngine:
                      steps=list(t.steps), confidence=t.confidence)
 
     def check_call_sink(self, name, root, path, args, node, sf, env, ctx):
+        if self.p.module_bindings and self._calls_first_party(name, node, sf):
+            # Project code, not the library function the rule names. The
+            # call is still followed into its definition, so a real sink
+            # inside it is reported there.
+            return
         for sink in self.rules.sinks:
             if sink.kind != "call":
                 continue
             if not match_callee(name, sink.match):
                 continue
             if sink.obj_hint and not _hint(sink.obj_hint, root, path):
+                continue
+            if sink.file_requires and not self._file_allows(sink, sf):
                 continue
             # A sink that needs no tainted argument (an inherently unsafe API
             # such as gets() or strcpy()) is reported on sight.
@@ -1051,6 +1094,106 @@ def _hint(hint: str, root: str, path: str) -> bool:
     if root and hint in root.lower():
         return True
     return bool(path) and hint in path.lower()
+
+
+def _module_index(files: list[SourceFile]) -> set:
+    """Every dotted name under which a scanned Python file can be imported.
+
+    The scan root is not known here, so each path contributes every dotted
+    suffix: `/src/app/db/text.py` gives `text`, `db.text`, `app.db.text`
+    and so on, and its directory gives `db`, `app.db`, ... for packages,
+    including namespace packages with no __init__.py. Over-inclusive at the
+    top of the path, which only matters for a library named like one of the
+    directories the project sits in.
+    """
+    out: set = set()
+    for sf in files:
+        parts = os.path.splitext(sf.path.replace("\\", "/"))[0].split("/")
+        parts = [p for p in parts if p and p not in (".", "..")]
+        if parts and parts[-1] == "__init__":
+            parts = parts[:-1]
+        for chain in (parts, parts[:-1]):
+            for i in range(len(chain)):
+                out.add(".".join(chain[i:]))
+    return out
+
+
+def _file_bindings(root: Node, profile: LangProfile, modules: set) -> tuple:
+    """(callables, namespaces, methods) naming first-party code in one file.
+
+    `callables`: functions and classes defined outside a class body, and
+    every name imported from a first-party module, under its alias.
+    `namespaces`: first-party modules bound by an import, and classes
+    defined in the file — the receivers whose `.m()` is project code.
+    `methods`: methods defined in the file's classes, for `self.m()`.
+    A relative import is always first-party.
+    """
+    callables: set = set()
+    namespaces: set = set()
+    methods: set = set()
+
+    def first_party(module: Node) -> bool:
+        if module.type == "relative_import":
+            return True
+        dotted = _text(module)
+        return dotted in modules or dotted.split(".", 1)[0] in modules
+
+    def split(item: Node):
+        """(imported dotted name, name it is bound to)."""
+        if item.type == "aliased_import":
+            target = item.child_by_field_name("name")
+            alias = item.child_by_field_name("alias")
+            if target is None or alias is None:
+                return None, None
+            return _text(target), _text(alias)
+        if item.type == "dotted_name":
+            return _text(item), None
+        return None, None
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        kind = node.type
+        if kind == "import_statement":
+            # `import a.b` binds `a`; `import a.b as c` binds `c`.
+            for item in node.named_children:
+                dotted, alias = split(item)
+                if dotted and (dotted in modules
+                               or dotted.split(".", 1)[0] in modules):
+                    namespaces.add(alias or dotted.split(".", 1)[0])
+            continue
+        if kind == "import_from_statement":
+            module = node.child_by_field_name("module_name")
+            if module is None or not first_party(module):
+                continue
+            prefix = "" if module.type == "relative_import" else _text(module) + "."
+            for item in node.children_by_field_name("name"):
+                dotted, alias = split(item)
+                if not dotted:
+                    continue
+                bound = alias or dotted
+                callables.add(bound)
+                # `from pkg import mod` imports a module when one exists.
+                if (prefix + dotted) in modules:
+                    namespaces.add(bound)
+            continue
+        if kind in profile.function or kind in profile.class_def:
+            name = node.child_by_field_name(profile.f_name)
+            holder = node.parent
+            if holder is not None and holder.type == "decorated_definition":
+                holder = holder.parent
+            in_class = (holder is not None and holder.type in profile.block
+                        and holder.parent is not None
+                        and holder.parent.type in profile.class_def)
+            if name is not None:
+                if in_class and kind in profile.function:
+                    methods.add(_text(name))
+                else:
+                    callables.add(_text(name))
+                    if kind in profile.class_def:
+                        namespaces.add(_text(name))
+        stack.extend(node.named_children)
+    return callables, namespaces, methods
 
 
 def build_symbols(files: list[SourceFile], profile: LangProfile) -> dict:

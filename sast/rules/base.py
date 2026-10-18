@@ -68,14 +68,7 @@ class TaintSource:
     file_requires: Optional[str] = None
 
     def file_allows(self, text: str) -> bool:
-        if not self.file_requires:
-            return True
-        cached = getattr(self, "_file_re", None)
-        if cached is None:
-            import re
-            cached = re.compile(self.file_requires)
-            object.__setattr__(self, "_file_re", cached)
-        return bool(cached.search(text))
+        return _file_gate_allows(self, text)
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)
@@ -134,9 +127,30 @@ class SinkRule:
     # `"literal {}".format(untrusted)` is ordinary formatting. Checking the
     # arguments for these would invert the rule.
     receiver_tainted: bool = False
+    # Regex that must appear somewhere in the file for this sink to apply,
+    # for a library function whose name is too common to claim on its own:
+    # SQLAlchemy's `text()` is one import away from any project's own
+    # `text()` helper. Honoured by the generic engine, like the same field
+    # on TaintSource.
+    file_requires: Optional[str] = None
+
+    def file_allows(self, text: str) -> bool:
+        return _file_gate_allows(self, text)
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)
+
+
+def _file_gate_allows(rule, text: str) -> bool:
+    """Whether `rule.file_requires` matches the file, compiling it once."""
+    if not rule.file_requires:
+        return True
+    cached = getattr(rule, "_file_re", None)
+    if cached is None:
+        import re
+        cached = re.compile(rule.file_requires)
+        object.__setattr__(rule, "_file_re", cached)
+    return bool(cached.search(text))
 
 
 @dataclass

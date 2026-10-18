@@ -3499,3 +3499,114 @@ class TestPythonMethodBinding(unittest.TestCase):
             "@app.route('/x')\n"
             "def h():\n"
             "    run(request.args['c'])\n"), [6])
+
+
+class TestPythonFirstPartyCalls(unittest.TestCase):
+    """A project's own function is not the library sink sharing its name.
+
+    Sinks are matched by callee name, so a helper called `text`, `raw` or
+    `execute` read as SQLAlchemy, Django or a DB-API cursor, and every call
+    to one with request data was reported as SQL injection.
+    """
+
+    HEAD = ("from flask import Flask, request\n"
+            "app = Flask(__name__)\n\n")
+
+    def _sqli(self, files):
+        found = _scan(files).findings
+        return sorted((os.path.basename(f.location.file), f.location.line)
+                      for f in found if f.category == "sql-injection")
+
+    def test_helper_defined_in_the_file(self):
+        self.assertEqual(self._sqli({"app.py": self.HEAD +
+            "def text(value):\n"
+            "    return value.strip()\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    return text(request.args['q'])\n"}), [])
+
+    def test_helper_imported_from_a_project_module(self):
+        files = {
+            "util/strings.py": "def raw(value):\n    return value.strip()\n",
+            "app.py": self.HEAD +
+                "from util.strings import raw\n"
+                "import util.strings as s\n\n"
+                "@app.route('/x')\n"
+                "def h():\n"
+                "    a = raw(request.args['q'])\n"
+                "    return s.raw(request.args['q'])\n",
+        }
+        self.assertEqual(self._sqli(files), [])
+
+    def test_relative_import_and_self_method(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/helpers.py": "def execute(value):\n    return value\n",
+            "pkg/app.py": self.HEAD +
+                "from .helpers import execute\n"
+                "from . import helpers as hp\n\n"
+                "class Job:\n"
+                "    def execute(self, value):\n"
+                "        return value\n"
+                "    def go(self, v):\n"
+                "        return self.execute(v)\n\n"
+                "@app.route('/x')\n"
+                "def h():\n"
+                "    q = request.args['q']\n"
+                "    execute(q)\n"
+                "    hp.execute(q)\n"
+                "    return Job().go(q)\n",
+        }
+        self.assertEqual(self._sqli(files), [])
+
+    def test_a_real_sink_inside_the_helper_is_still_reported(self):
+        files = {
+            "db.py": ("import sqlite3\n"
+                      "def execute(sql):\n"
+                      "    return sqlite3.connect('x').cursor().execute(sql)\n"),
+            "app.py": self.HEAD +
+                "from db import execute\n\n"
+                "@app.route('/x')\n"
+                "def h():\n"
+                "    return execute('SELECT ' + request.args['q'])\n",
+        }
+        self.assertEqual(self._sqli(files), [("db.py", 3)])
+
+    def test_library_calls_are_still_sinks(self):
+        files = {"app.py": self.HEAD +
+            "import sqlite3\n"
+            "from sqlalchemy import text\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    q = request.args['q']\n"
+            "    cur = sqlite3.connect('x').cursor()\n"
+            "    cur.execute('SELECT ' + q)\n"
+            "    return text('SELECT ' + q)\n"}
+        self.assertEqual(self._sqli(files), [("app.py", 11), ("app.py", 12)])
+
+    def test_object_imported_from_project_code_keeps_its_sinks(self):
+        """`from app import db` may be a SQLAlchemy instance, not a module."""
+        files = {
+            "core/__init__.py": "from sqlalchemy import create_engine\n"
+                                "db = create_engine('sqlite://')\n",
+            "app.py": self.HEAD +
+                "from core import db\n\n"
+                "@app.route('/x')\n"
+                "def h():\n"
+                "    return db.execute('SELECT ' + request.args['q'])\n",
+        }
+        self.assertEqual(self._sqli(files), [("app.py", 8)])
+
+    def test_text_needs_sqlalchemy_in_the_file(self):
+        """A third-party `text()` that is not SQLAlchemy's is not a sink."""
+        self.assertEqual(self._sqli({"app.py": self.HEAD +
+            "from markup_helpers import text\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    return text(request.args['q'])\n"}), [])
+        self.assertEqual(self._sqli({"app.py": self.HEAD +
+            "import sqlalchemy as sa\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    return sa.text('SELECT ' + request.args['q'])\n"}),
+            [("app.py", 8)])
