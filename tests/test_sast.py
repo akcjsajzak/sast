@@ -4234,3 +4234,59 @@ class TestCSharpDetails(unittest.TestCase):
         self.assertEqual(detect_framework(tmp, "csharp",
                                           [os.path.join(tmp, "A.cs")]).framework,
                          "ASP.NET Core")
+
+
+class TestPhpXvwaShapes(unittest.TestCase):
+    """XVWA's ssti, xpath and fileupload labs, and DVWA's upload module."""
+
+    def _rules(self, code):
+        return sorted((f.rule_id, f.location.line)
+                      for f in _scan({"a.php": "<?php\n" + code}).findings)
+
+    def test_twig_render_of_request_data(self):
+        found = self._rules(
+            "$loader = new Twig_Loader_String();\n"
+            "$twig = new Twig_Environment($loader);\n"
+            "echo $twig->render($_GET['name']);\n"
+            "$view = new View();\n"
+            "$view->render($_GET['name']);\n")
+        self.assertIn(("php-ssti-twig-render-twig_environment", 4), found)
+        self.assertNotIn(6, [line for r, line in found if "ssti" in r])
+
+    def test_domxpath_query_is_xpath_not_sql(self):
+        found = self._rules(
+            "$xpath = new DOMXPath($doc);\n"
+            "$xpath->query(\"/Coffees/Coffee[@ID='\" . $_POST['s'] . \"']\");\n"
+            "$db->query('SELECT ' . $_POST['s']);\n")
+        self.assertEqual(found, [("php-sqli-pdo-query", 4),
+                                 ("php-xpath-domxpath-query", 3)])
+
+    def test_client_filename_kept_on_upload(self):
+        found = self._rules(
+            "$p = 'up/'; $p .= basename($_FILES['u']['name']);\n"
+            "if (!move_uploaded_file($_FILES['u']['tmp_name'], $p)) { echo 1; }\n"
+            "$ext = substr($_FILES['g']['name'], strrpos($_FILES['g']['name'], '.') + 1);\n"
+            "move_uploaded_file($_FILES['g']['tmp_name'], 'up/' . md5(uniqid()) . '.' . $ext);\n"
+            "move_uploaded_file($_FILES['h']['tmp_name'], 'up/' . $_POST['dir'] . '/x.jpg');\n")
+        self.assertEqual([r for r in found if r[0] == "php-upload-unrestricted"],
+                         [("php-upload-unrestricted", 3)])
+        # basename() ends traversal; the extracted extension can still hold
+        # `/../` and a request directory obviously can.
+        self.assertEqual([r for r in found if r[0] == "php-path-move_uploaded_file"],
+                         [("php-path-move_uploaded_file", 5),
+                          ("php-path-move_uploaded_file", 6)])
+
+
+class TestPhpExpressionsAreEvaluated(unittest.TestCase):
+    """taint_of() returned without looking inside expression types it did
+    not name, so a sink under `!` or `@` was never checked."""
+
+    def test_negation_and_error_suppression(self):
+        found = sorted((f.rule_id, f.location.line) for f in _scan({"a.php": (
+            "<?php\n"
+            "if (!system($_GET['c'])) {}\n"
+            "$r = @mysql_query('SELECT ' . $_GET['q']);\n"
+            "$y = !empty($_GET['a']);\n"
+            "mysql_query('x' . $y);\n")}).findings)
+        self.assertEqual(found, [("php-cmdi-system", 2),
+                                 ("php-sqli-mysql_query", 3)])

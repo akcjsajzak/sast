@@ -29,8 +29,10 @@ TAG_LABELS = {
     "csv": "Formula (CSV) Injection",
 }
 
+# `upload` is deliberately absent: it marks an upload's client filename,
+# so only $_FILES and Laravel's $request->file() produce it.
 _ALL_TAGS = ["sql", "xss", "cmd", "ssrf", "lfi", "deser", "xxe", "ldap",
-             "redirect", "path", "upload", "code", "mass", "log",
+             "redirect", "path", "code", "mass", "log",
              "ssti", "el", "xpath", "redos", "session", "csv",
              # `email` was used by the mail() rule but never produced by any
              # source, so that rule could not fire at all.
@@ -73,8 +75,12 @@ def _sources() -> list[TaintSource]:
     s = []
     # Superglobals that are wholly attacker-controlled.
     for name in ("_GET", "_POST", "_REQUEST", "_COOKIE", "_FILES"):
+        # An upload's client-side name also carries the `upload` tag: kept
+        # whole as the stored filename, its extension decides whether the
+        # web server executes the file.
         s.append(TaintSource(
-            kind="superglobal", match=name, tags=_ALL_TAGS,
+            kind="superglobal", match=name,
+            tags=_ALL_TAGS + (["upload"] if name == "_FILES" else []),
             description=f"Untrusted data from superglobal ${name}",
         ))
 
@@ -576,6 +582,21 @@ def _sinks() -> list[SinkRule]:
         tags=_PATH, arg_index=1,
     ))
 
+    # The client's filename kept whole, extension included. basename() stops
+    # traversal but not `shell.php`, which then sits in a web directory:
+    # DVWA's upload/low and XVWA's fileupload store files exactly this way.
+    k.append(SinkRule(
+        rule_id="php-upload-unrestricted", kind="function", match="move_uploaded_file",
+        title="Unrestricted file upload (client filename kept)",
+        severity="high", cwe="CWE-434", owasp="A04:2021 — Insecure Design", category="file-upload",
+        description="The uploaded file is stored under the name the client sent, "
+                    "extension included, so a .php upload becomes executable "
+                    "code wherever the upload directory is served.",
+        remediation="Generate the stored name server-side and choose the extension "
+                    "from an allow-list after validating the content.",
+        tags=["upload"], arg_index=1,
+    ))
+
     # --- Log injection ---
     for fn in ("error_log", "syslog", "trigger_error"):
         k.append(SinkRule(
@@ -599,7 +620,35 @@ def _sinks() -> list[SinkRule]:
             tags=["ssti"],
         ))
 
+    # Twig's render() takes the template's *name*; with Twig_Loader_String
+    # (or an ArrayLoader fed from input) the name is the template source,
+    # so request data passed to it is compiled. XVWA's ssti lab does this.
+    # Typed on the receiver, so an unrelated ->render() is left alone.
+    for cls in ("Twig_Environment", "Environment"):
+        k.append(SinkRule(
+            rule_id=f"php-ssti-twig-render-{cls.lower()}", kind="method",
+            match="render", cls=cls,
+            title="Server-side template injection via Twig render()",
+            severity="high", cwe="CWE-1336", owasp=A03, category="ssti",
+            description="Untrusted data is passed as the template to render(); "
+                        "with a string loader it is compiled as Twig, so "
+                        "{{ }} expressions in it execute on the server.",
+            remediation="Render a fixed template name and pass input as variables.",
+            tags=["ssti"], arg_index=0,
+        ))
+
     # --- XPath injection ---
+    # DOMXPath::query shares its name with PDO::query; typed on the receiver
+    # so a DOMXPath built with `new` is reported as XPath, not SQL.
+    k.append(SinkRule(
+        rule_id="php-xpath-domxpath-query", kind="method", match="query",
+        cls="DOMXPath",
+        title="XPath injection via DOMXPath->query()",
+        severity="high", cwe="CWE-643", owasp=A03, category="xpath-injection",
+        description="Untrusted data flows into an XPath expression.",
+        remediation="Whitelist XPath expressions; never build them from untrusted input.",
+        tags=["xpath"],
+    ))
     k.append(SinkRule(
         rule_id="php-xpath-xpath", kind="method", match="xpath",
         title="XPath injection via ->xpath()",
@@ -687,6 +736,19 @@ def _sanitizers() -> list[SanitizerRule]:
     # Laravel's e() defaults to ENT_QUOTES.
     s.append(SanitizerRule(kind="function", match="e", neutralize=["xss"],
                            frameworks=("Laravel",)))
+
+    # basename() drops every directory component, so it ends traversal; the
+    # name it keeps is still the client's (see php-upload-unrestricted).
+    s.append(SanitizerRule(kind="function", match="basename",
+                           neutralize=["path", "lfi"]))
+    # An upload name hashed, or reduced to its extension, is no longer the
+    # client's whole filename (the extension is then the code's to check).
+    # The value is the last argument for hash() and explode(), the first for
+    # the rest; reading a delimiter would declare the result clean.
+    for fn in ("md5", "sha1", "hash", "crc32", "uniqid", "bin2hex", "substr",
+               "pathinfo", "strrchr", "explode"):
+        s.append(SanitizerRule(kind="function", match=fn, neutralize=["upload"],
+                               arg_index=-1 if fn in ("hash", "explode") else 0))
 
     # SQL escaping. The driver-aware functions are sound; addslashes is not.
     # These escape quotes, so they are sound only inside a quoted literal;

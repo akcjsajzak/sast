@@ -784,6 +784,17 @@ class TaintEngine:
                 if tt is not None:
                     merged = tt if merged is None else merged.merge(tt)
             return merged
+        # `@f($x)` and `clone $o` evaluate to their operand.
+        if t in ("error_suppression_expression", "clone_expression"):
+            nc = node.named_children
+            return self.taint_of(nc[-1], sf, env, ctx) if nc else None
+        # Any other expression is still evaluated for the sinks inside it.
+        # Returning without looking hid `if (!move_uploaded_file(...))`, the
+        # way DVWA and XVWA both store an upload, and anything under `!`,
+        # `++` or a construct this method does not name.
+        if t.endswith("_expression"):
+            for c in node.named_children:
+                self.taint_of(c, sf, env, ctx)
         return None
 
     def variable_taint(self, node: Node, sf: SourceFile, env: dict, ctx: Ctx):
@@ -890,6 +901,10 @@ class TaintEngine:
         cls = None
         if node.type == "scoped_call_expression":
             cls, callee = au.callee_parts(node)
+        elif kind == "method":
+            # The receiver's class when it came from `new C()`, so a rule can
+            # be typed: DOMXPath::query is XPath, PDO::query is SQL.
+            cls = self._receiver_class(node, env)
         args = au.argument_values(node)
 
         if kind == "function" and not callee:
@@ -1140,12 +1155,20 @@ class TaintEngine:
                      confidence=t.confidence)
 
     def check_call_sink(self, kind, callee, cls, args, node, sf, env, ctx):
+        # A rule typed for the receiver's class is more specific than an
+        # untyped one of the same name, and replaces it: `new DOMXPath()`
+        # then ->query() is XPath injection, not PDO SQL injection.
+        typed = kind == "method" and cls and any(
+            s.kind == kind and s.cls and match_callee(callee, s.match)
+            and match_callee(cls, s.cls) for s in self.rules.sinks)
         for sink in self.rules.sinks:
             if sink.kind != kind:
                 continue
             if not match_callee(callee, sink.match):
                 continue
             if sink.cls and not match_callee(cls, sink.cls):
+                continue
+            if typed and not sink.cls:
                 continue
             indices = range(len(args)) if sink.arg_index < 0 else [sink.arg_index]
             for i in indices:
