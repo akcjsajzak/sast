@@ -208,7 +208,8 @@ against distro advisories. A CycloneDX or SPDX SBOM is read when present.
 
 Rendering and deployment posture live outside `.php` and `.java` files: Twig
 (`|raw`), JSP (`<%= %>`, `<c:out escapeXml="false">`), Thymeleaf (`th:utext`),
-FreeMarker (`#noescape`), Blade (`{!! !!}`), plus `.env`,
+FreeMarker (`#noescape`), Blade (`{!! !!}`), Jinja2 and Django (`|safe`,
+`{% autoescape off %}`, and `autoescape=False` in Python), plus `.env`,
 `application.properties`, `web.xml` and `php.ini` for debug flags, exposed
 actuators, disabled TLS and committed secrets.
 

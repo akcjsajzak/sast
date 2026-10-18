@@ -1,6 +1,6 @@
 """Scanners for template languages the taint engines never parse.
 
-Twig, JSP and Thymeleaf templates hold the final HTML-rendering step of a
+Twig, JSP, Thymeleaf and Jinja/Django templates hold the final HTML-rendering step of a
 request, so an unescaped expression there is reflected XSS regardless of how
 clean the controller is. They are not PHP or Java source, so tree-sitter never
 sees them; these are deliberately shallow regex scanners over the raw text.
@@ -19,10 +19,17 @@ TEMPLATE_EXTENSIONS = {
     ".jspf": "jsp",
     ".tag": "jsp",
     ".ftl": "freemarker",
+    ".jinja": "jinja",
+    ".jinja2": "jinja",
+    ".j2": "jinja",
 }
 
 # Thymeleaf lives in .html, so it is only scanned when the markers appear.
 _THYMELEAF_HINT = re.compile(r"th:(?:utext|text|href|src|attr)|xmlns:th=")
+# So do Flask's Jinja and Django templates: an .html file is treated as one
+# when it carries an expression or a block tag. Angular and Vue share the
+# `{{ }}` syntax but never trip the rules, which look for Jinja's filters.
+_JINJA_HINT = re.compile(r"\{\{.*?\}\}|\{%.*?%\}", re.DOTALL)
 
 _A03 = "A03:2021 — Injection"
 _A05 = "A05:2021 — Security Misconfiguration"
@@ -150,8 +157,36 @@ _FREEMARKER_RULES = [
     ),
 ]
 
+# Jinja2 (Flask, aiohttp, FastAPI) and Django templates share the filter and
+# the block. Both escape by default; these are the two ways to turn it off.
+_JINJA_RULES = [
+    _Rule(
+        "jinja-xss-safe-filter",
+        # Not csrf_token (server-generated) or a Django form field, which
+        # renders its own escaped widget: both are |safe'd routinely and
+        # carry no user markup.
+        r"\{\{(?!\s*(?:csrf_token\b|form\.))[^}]*?\|\s*safe(?:seq)?\b[^}]*?\}\}",
+        "Unescaped template output (|safe)",
+        "The |safe filter marks the value as already-escaped HTML, so the "
+        "template engine renders it verbatim. If it carries user-controlled "
+        "data — a post, a comment, a flashed message echoing input — this is "
+        "XSS.",
+        "Drop |safe, or sanitize the value first (e.g. with bleach) and keep "
+        "the |safe only on the sanitized result.",
+    ),
+    _Rule(
+        "jinja-xss-autoescape-off",
+        r"\{%-?\s*autoescape\s+(?:false|off)\s*-?%\}",
+        "Template auto-escaping disabled",
+        "An autoescape block turns escaping off for everything inside it.",
+        "Remove the block, or scope it as tightly as possible and escape by hand.",
+        severity=Severity.HIGH,
+    ),
+]
+
 _RULES_BY_KIND = {
     "twig": _TWIG_RULES,
+    "jinja": _JINJA_RULES,
     "jsp": _JSP_RULES,
     "thymeleaf": _THYMELEAF_RULES,
     "freemarker": _FREEMARKER_RULES,
@@ -162,6 +197,7 @@ _FRAMEWORK_BY_KIND = {
     "jsp": ("Jakarta EE", "java"),
     "thymeleaf": ("Spring", "java"),
     "freemarker": ("Spring", "java"),
+    "jinja": ("raw", "python"),
 }
 
 
@@ -180,7 +216,7 @@ def collect_template_files(root: str) -> list[tuple[str, str]]:
             path = os.path.join(dirpath, fname)
             if kind:
                 out.append((path, kind))
-            elif ext in (".html", ".xhtml"):
+            elif ext in (".html", ".htm", ".xhtml"):
                 # Only a Thymeleaf template if it actually uses th: attributes.
                 try:
                     with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -189,6 +225,8 @@ def collect_template_files(root: str) -> list[tuple[str, str]]:
                     continue
                 if _THYMELEAF_HINT.search(head):
                     out.append((path, "thymeleaf"))
+                elif _JINJA_HINT.search(head):
+                    out.append((path, "jinja"))
     out.sort()
     return out
 

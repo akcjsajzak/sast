@@ -3735,3 +3735,48 @@ class TestYamlLoaders(unittest.TestCase):
         self.assertEqual(found, [
             ("py-deser-yaml-load", 6), ("py-deser-yaml-load", 7),
             ("py-deser-yaml-load-all", 10), ("py-deser-yaml-unsafe-load", 8)])
+
+
+class TestJinjaTemplates(unittest.TestCase):
+    """Flask/aiohttp Jinja2 and Django templates were never scanned.
+
+    Found against vulpy (`{{ post.text | safe }}`, stored XSS), pygoat's XSS
+    labs (`{{ query|safe }}`) and dvpwa (`setup_jinja(autoescape=False)`).
+    """
+
+    def _rules(self, files):
+        return sorted((f.rule_id, os.path.basename(f.location.file),
+                       f.location.line) for f in _scan(files).findings
+                      if "jinja" in f.rule_id)
+
+    def test_safe_filter_and_autoescape_block(self):
+        found = self._rules({
+            "templates/post.html": "<p>{{ post.text | safe }}</p>\n"
+                                   "{% autoescape off %}{{ x }}{% endautoescape %}\n"
+                                   "<p>{{ post.title }}</p>\n",
+            "templates/list.jinja2": "{% for p in posts %}{{ p|safeseq }}{% endfor %}\n",
+            "templates/inc.j2": "{%- autoescape false -%}{{ y }}{% endautoescape %}\n",
+        })
+        self.assertEqual(found, [
+            ("jinja-xss-autoescape-off", "inc.j2", 1),
+            ("jinja-xss-autoescape-off", "post.html", 2),
+            ("jinja-xss-safe-filter", "list.jinja2", 1),
+            ("jinja-xss-safe-filter", "post.html", 1),
+        ])
+
+    def test_framework_generated_values_are_not_reported(self):
+        self.assertEqual(self._rules({"templates/f.html": (
+            '<script>var t = "{{ csrf_token|safe }}";</script>\n'
+            "{{ form.username|safe }}\n")}), [])
+
+    def test_html_without_template_syntax_is_left_alone(self):
+        self.assertEqual(self._rules({"static/page.html": (
+            "<p>safe | raw text with no tags</p>\n")}), [])
+
+    def test_autoescape_disabled_in_python(self):
+        found = _py_rules(
+            "import aiohttp_jinja2, jinja2\n"
+            "def setup(app):\n"
+            "    aiohttp_jinja2.setup(app, loader=None, autoescape=False)\n"
+            "    env = jinja2.Environment(autoescape=True)\n")
+        self.assertEqual(found, [("py-jinja-autoescape-off", 3)])

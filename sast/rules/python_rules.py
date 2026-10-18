@@ -373,6 +373,12 @@ def _patterns() -> list[PatternRule]:
         "password-reset links and cache keys.",
         "List the hostnames the application actually serves.",
         severity="medium", cwe="CWE-16", owasp=A05, frameworks=DJANGO)
+    pat("py-jinja-autoescape-off", r"\bautoescape\s*=\s*False\b",
+        "Template auto-escaping disabled",
+        "Jinja2 escapes nothing when autoescape is False, so every variable a "
+        "template renders is raw HTML; any of them carrying user input is XSS.",
+        "Pass autoescape=True, or select_autoescape() for HTML templates.",
+        severity="high", cwe="CWE-79", owasp=A03, category="xss")
     pat("py-flask-debug", r"\.run\s*\([^)]*debug\s*=\s*True",
         "Flask debug mode enabled",
         "The Werkzeug debugger exposes an interactive console that executes "
