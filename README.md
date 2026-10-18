@@ -209,7 +209,9 @@ against distro advisories. A CycloneDX or SPDX SBOM is read when present.
 Rendering and deployment posture live outside `.php` and `.java` files: Twig
 (`|raw`), JSP (`<%= %>`, `<c:out escapeXml="false">`), Thymeleaf (`th:utext`),
 FreeMarker (`#noescape`), Blade (`{!! !!}`), Jinja2 and Django (`|safe`,
-`{% autoescape off %}`, and `autoescape=False` in Python), plus `.env`,
+`{% autoescape off %}`, and `autoescape=False` in Python), the Node view
+engines EJS (`<%- %>`), Handlebars (`{{{ }}}`), Pug (`!{}`, `!=`) and
+Nunjucks (`|safe`), plus `.env`,
 `application.properties`, `web.xml` and `php.ini` for debug flags, exposed
 actuators, disabled TLS and committed secrets.
 
@@ -421,5 +423,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-340 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+366 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.
