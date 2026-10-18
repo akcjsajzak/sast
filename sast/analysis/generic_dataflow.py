@@ -173,15 +173,28 @@ class GenericTaintEngine:
                 it = self.taint_of(right, sf, be, ctx)
                 if left is not None and it is not None:
                     self.assign_to(left, it, sf, be)
+        # The arms of an if/match are alternatives: each starts from the state
+        # before the statement, not from whatever the previous arm left
+        # behind. Sharing one environment meant `if t is None: t = "x"`
+        # followed by `else: pickle.loads(t)` saw `t` as the constant and
+        # missed the cookie flowing into it. Loops and try blocks keep the
+        # shared environment, since their parts do run in sequence.
+        arms = [be]
+        is_branch = stmt.type in p.branch
         for c in stmt.named_children:
             if c.type in p.comment:
                 continue
+            target = be
+            if is_branch and (c.type in p.block or c.type in p.branch):
+                target = dict(env)
+                arms.append(target)
             if c.type in p.block:
-                ret = _merge_taint(ret, self.walk_block(c, sf, be, ctx))
+                ret = _merge_taint(ret, self.walk_block(c, sf, target, ctx))
             else:
-                ret = _merge_taint(ret, self.walk_stmt(c, sf, be, ctx))
-        for k, v in be.items():
-            env[k] = v if k not in env else env[k].merge(v)
+                ret = _merge_taint(ret, self.walk_stmt(c, sf, target, ctx))
+        for arm in arms:
+            for k, v in arm.items():
+                env[k] = v if k not in env else env[k].merge(v)
         return ret
 
     def handle_declaration(self, stmt: Node, sf: SourceFile, env: dict, ctx: Ctx):
@@ -708,6 +721,8 @@ class GenericTaintEngine:
                 continue
             if src.obj_hint and not _hint(src.obj_hint, root, path):
                 continue
+            if src.receivers and not _receiver_named(src.receivers, path):
+                continue
             if src.keys is not None and not src.key_matches(name):
                 continue
             return src
@@ -801,6 +816,8 @@ class GenericTaintEngine:
             if sink.obj_hint and not _hint(sink.obj_hint, root, path):
                 continue
             if sink.file_requires and not self._file_allows(sink, sf):
+                continue
+            if sink.safe_args and sink.args_safe([_text(a) for a in args]):
                 continue
             # A sink that needs no tainted argument (an inherently unsafe API
             # such as gets() or strcpy()) is reported on sight.
@@ -1087,6 +1104,18 @@ def _restrict_tags(taint, keep: tuple):
         return None
     return Taint(tags=tags, origins=list(taint.origins),
                  steps=list(taint.steps), confidence=taint.confidence)
+
+
+def _receiver_named(names: tuple, path: str) -> bool:
+    """True when the receiver in a dotted callee path is one of `names`.
+
+    `self.request.json` has receiver `self.request`, whose last segment is
+    `request`. A bare call has no receiver and never matches.
+    """
+    if not path or "." not in path:
+        return False
+    receiver = path.rsplit(".", 1)[0]
+    return receiver.rsplit(".", 1)[-1] in names
 
 
 def _hint(hint: str, root: str, path: str) -> bool:

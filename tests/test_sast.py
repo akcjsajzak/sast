@@ -3610,3 +3610,128 @@ class TestPythonFirstPartyCalls(unittest.TestCase):
             "def h():\n"
             "    return sa.text('SELECT ' + request.args['q'])\n"}),
             [("app.py", 8)])
+
+
+def _py_rules(source: str, extra: dict = None) -> list:
+    """(rule_id, line) for every finding in a one-file Python project."""
+    files = {"views.py": source}
+    files.update(extra or {})
+    return sorted((f.rule_id, f.location.line) for f in _scan(files).findings
+                  if f.language == "python")
+
+
+class TestPythonRequestSources(unittest.TestCase):
+    """Request attributes from Django and aiohttp that were not sources.
+
+    Found against pygoat (Django: a pickled cookie, a YAML upload) and
+    dvpwa (aiohttp: SQL injection from a posted form), where all three
+    went unreported.
+    """
+
+    def test_django_cookies_files_and_meta(self):
+        found = _py_rules(
+            "import pickle, yaml, os\n"
+            "def v(request):\n"
+            "    pickle.loads(request.COOKIES.get('t'))\n"
+            "    yaml.load(request.FILES['f'], yaml.Loader)\n"
+            "    os.system(request.META['HTTP_X'])\n")
+        self.assertIn(("py-deser-pickle-loads", 3), found)
+        self.assertIn(("py-deser-yaml-load", 4), found)
+        self.assertIn(("py-cmdi-os-system", 5), found)
+
+    def test_aiohttp_request_body_and_path(self):
+        found = _py_rules(
+            "async def v(request):\n"
+            "    data = await request.post()\n"
+            "    await cur.execute('INSERT %s' % data['name'])\n"
+            "    await cur.execute('x' + request.match_info['id'])\n"
+            "    body = await request.json()\n"
+            "    await cur.execute('y' + body['q'])\n")
+        self.assertEqual([r for r in found if r[0] == "py-sqli-execute"],
+                         [("py-sqli-execute", 3), ("py-sqli-execute", 4),
+                          ("py-sqli-execute", 6)])
+
+    def test_http_client_response_is_not_request_input(self):
+        """`requests.post()` shares a name with aiohttp's request.post()."""
+        self.assertEqual(_py_rules(
+            "import os, requests\n"
+            "def v():\n"
+            "    r = requests.post('https://example.com')\n"
+            "    os.system(r.json()['cmd'])\n"), [])
+
+
+class TestBranchArmsAreIndependent(unittest.TestCase):
+    """Each arm of an if/elif/else starts from the state before it.
+
+    The arms shared one environment, so assigning a constant in the `if`
+    arm hid the taint from the `else` arm: pygoat's
+    `if token == None: token = encoded_user / else: pickle.loads(token)`
+    was missed.
+    """
+
+    def test_else_arm_does_not_see_the_if_arms_assignment(self):
+        self.assertIn(("py-deser-pickle-loads", 7), _py_rules(
+            "import pickle\n"
+            "def v(request):\n"
+            "    token = request.COOKIES.get('token')\n"
+            "    if token == None:\n"
+            "        token = 'x'\n"
+            "    else:\n"
+            "        pickle.loads(token)\n"))
+
+    def test_elif_arm_and_the_merge_after(self):
+        found = _py_rules(
+            "import os\n"
+            "def v(request):\n"
+            "    c = request.GET['c']\n"
+            "    if c == 'a':\n"
+            "        c = 'ls'\n"
+            "    elif c == 'b':\n"
+            "        os.system(c)\n"
+            "    else:\n"
+            "        c = 'pwd'\n"
+            "    os.system(c)\n")
+        # Line 10: the elif arm leaves `c` tainted, so it may still be.
+        self.assertEqual([r for r in found if r[0] == "py-cmdi-os-system"],
+                         [("py-cmdi-os-system", 7), ("py-cmdi-os-system", 10)])
+
+    def test_reassigned_in_every_arm_is_clean_inside_later_code(self):
+        """A sanitising assignment inside one arm still applies within it."""
+        self.assertEqual([r for r in _py_rules(
+            "import os\n"
+            "def v(request):\n"
+            "    c = request.GET['c']\n"
+            "    if c:\n"
+            "        c = 'ls'\n"
+            "        os.system(c)\n") if r[0] == "py-cmdi-os-system"], [])
+
+    def test_go_else_if_chain(self):
+        found = [f for f in _scan({"main.go": (
+            'package main\nimport ("net/http"; "os/exec")\n'
+            'func h(w http.ResponseWriter, r *http.Request) {\n'
+            '    c := r.URL.Query().Get("c")\n'
+            '    if c == "" {\n'
+            '        c = "ls"\n'
+            '    } else if c == "x" {\n'
+            '        exec.Command(c).Run()\n'
+            '    }\n'
+            '}\n')}).findings if "cmdi" in f.rule_id]
+        self.assertEqual([f.location.line for f in found], [8])
+
+
+class TestYamlLoaders(unittest.TestCase):
+    def test_the_named_loader_decides(self):
+        found = _py_rules(
+            "import yaml\n"
+            "def v(request):\n"
+            "    f = request.FILES['f']\n"
+            "    yaml.load(f, Loader=yaml.SafeLoader)\n"
+            "    yaml.load(f, yaml.CSafeLoader)\n"
+            "    yaml.load(f, yaml.Loader)\n"
+            "    yaml.load(f, Loader=yaml.FullLoader)\n"
+            "    yaml.unsafe_load(f)\n"
+            "    yaml.load_all(f, Loader=yaml.SafeLoader)\n"
+            "    yaml.load_all(f)\n")
+        self.assertEqual(found, [
+            ("py-deser-yaml-load", 6), ("py-deser-yaml-load", 7),
+            ("py-deser-yaml-load-all", 10), ("py-deser-yaml-unsafe-load", 8)])

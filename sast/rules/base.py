@@ -66,6 +66,12 @@ class TaintSource:
     # an http.server handler and a filename in everything else. Gating on the
     # base class the file actually names keeps the source without the noise.
     file_requires: Optional[str] = None
+    # Receiver names the call must be made on, matched exactly against the
+    # last segment of the receiver (`request` in `self.request.json()`).
+    # obj_hint is a substring test, which is right for a hint like "Statement"
+    # but makes "request" match `requests.post(url)` — the HTTP client, whose
+    # return value is a response, not attacker input. Generic engine only.
+    receivers: Optional[tuple] = None
 
     def file_allows(self, text: str) -> bool:
         return _file_gate_allows(self, text)
@@ -133,9 +139,23 @@ class SinkRule:
     # `text()` helper. Honoured by the generic engine, like the same field
     # on TaintSource.
     file_requires: Optional[str] = None
+    # Regex over the call's argument text that makes it safe: an explicit
+    # `Loader=yaml.SafeLoader` turns yaml.load() into safe_load(). Matched
+    # against every argument, keyword arguments included. Generic engine.
+    safe_args: Optional[str] = None
 
     def file_allows(self, text: str) -> bool:
         return _file_gate_allows(self, text)
+
+    def args_safe(self, arg_texts: list) -> bool:
+        if not self.safe_args:
+            return False
+        cached = getattr(self, "_safe_re", None)
+        if cached is None:
+            import re
+            cached = re.compile(self.safe_args)
+            object.__setattr__(self, "_safe_re", cached)
+        return any(cached.search(t or "") for t in arg_texts)
 
     def applies(self, framework) -> bool:
         return _framework_applies(self.frameworks, framework)

@@ -25,9 +25,15 @@ FASTAPI = ("FastAPI",)
 def _sources() -> list[TaintSource]:
     s: list[TaintSource] = []
     # Flask / Django / FastAPI request objects.
+    # Flask: args form values json data files cookies headers stream url
+    # full_path query_string view_args path. Django: GET POST COOKIES FILES
+    # META body path path_info. Starlette/FastAPI: query_params path_params.
+    # aiohttp: match_info query rel_url.
     for prop in ("args", "form", "values", "json", "data", "files", "cookies",
                  "headers", "query_params", "path_params", "GET", "POST",
-                 "body", "stream", "url", "full_path", "query_string"):
+                 "body", "stream", "url", "full_path", "query_string",
+                 "view_args", "path", "COOKIES", "FILES", "META", "path_info",
+                 "match_info", "query", "rel_url"):
         s.append(TaintSource(
             kind="member", match=prop, tags=_ALL, obj_hint="request",
             description=f"Untrusted data from the HTTP request (request.{prop})",
@@ -35,6 +41,16 @@ def _sources() -> list[TaintSource]:
     for m in ("get_json", "get_data", "read"):
         s.append(TaintSource(
             kind="call", match=m, tags=_ALL, obj_hint="request",
+            description=f"Untrusted data from the HTTP request (request.{m}())",
+        ))
+    # Methods that return the body or URL: aiohttp and Starlette's awaitable
+    # `post() json() text() form() body()`, Django's get_full_path() and
+    # build_absolute_uri(). Names this generic need the receiver to be the
+    # request itself, or `requests.post(url)` would read as attacker input.
+    for m in ("post", "json", "text", "form", "body", "multipart",
+              "get_full_path", "build_absolute_uri"):
+        s.append(TaintSource(
+            kind="call", match=m, tags=_ALL, receivers=("request", "req"),
             description=f"Untrusted data from the HTTP request (request.{m}())",
         ))
     # A stdlib http.server handler receives the request through attributes on
@@ -97,14 +113,15 @@ def _sinks() -> list[SinkRule]:
 
     def sink(rid, match, title, severity, cwe, owasp, category, desc, fix, tags,
              arg_index=-1, obj_hint=None, frameworks=("*",), confidence="high",
-             kind="call", receiver_tainted=False, file_requires=None):
+             kind="call", receiver_tainted=False, file_requires=None,
+             safe_args=None):
         k.append(SinkRule(rule_id=rid, kind=kind, match=match, title=title,
                           severity=severity, cwe=cwe, owasp=owasp,
                           category=category, description=desc, remediation=fix,
                           tags=tags, arg_index=arg_index, obj_hint=obj_hint,
                           frameworks=frameworks, confidence=confidence,
                           receiver_tainted=receiver_tainted,
-                          file_requires=file_requires))
+                          file_requires=file_requires, safe_args=safe_args))
 
     # Code execution
     for fn in ("eval", "exec", "compile"):
@@ -122,11 +139,25 @@ def _sinks() -> list[SinkRule]:
              "pickle data is remote code execution.",
              "Use JSON for data interchange, or sign payloads and verify first.",
              ["deser", "code"], arg_index=0, obj_hint="pickle")
+    # A loader named explicitly decides it: SafeLoader and BaseLoader build
+    # only plain types, while Loader, UnsafeLoader and FullLoader (before
+    # PyYAML 5.4) construct arbitrary objects.
+    for fn in ("load_all", "unsafe_load", "unsafe_load_all"):
+        sink(f"py-deser-yaml-{fn.replace('_', '-')}", fn,
+             f"Insecure deserialization via yaml.{fn}()", "critical",
+             "CWE-502", A08, "insecure-deserialization",
+             f"yaml.{fn}() without SafeLoader constructs arbitrary Python "
+             "objects.",
+             "Use yaml.safe_load() / yaml.safe_load_all().",
+             ["deser", "code"], arg_index=0, obj_hint="yaml",
+             safe_args=r"\b(?:C?SafeLoader|BaseLoader)\b"
+             if not fn.startswith("unsafe") else None)
     sink("py-deser-yaml-load", "load",
          "Insecure deserialization via yaml.load()", "critical", "CWE-502", A08,
          "insecure-deserialization",
          "yaml.load() without SafeLoader constructs arbitrary Python objects.",
-         "Use yaml.safe_load().", ["deser", "code"], arg_index=0, obj_hint="yaml")
+         "Use yaml.safe_load().", ["deser", "code"], arg_index=0, obj_hint="yaml",
+         safe_args=r"\b(?:C?SafeLoader|BaseLoader)\b")
 
     # Command injection
     for fn in ("system", "popen", "spawnl", "spawnv", "execl", "execv"):
