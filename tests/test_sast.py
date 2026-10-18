@@ -3403,3 +3403,99 @@ class TestWebServerHardening(unittest.TestCase):
         self.assertNotIn("fetch('/api/triage/'", page)
         self.assertIn("location.pathname.slice(0, m.index) + '/api/triage/'",
                       page)
+
+
+class TestPythonMethodBinding(unittest.TestCase):
+    """Arguments reach the right parameter when Python declares `self`.
+
+    Calls were bound positionally from the first declared parameter, so in
+    `r.run(x)` the value landed in `self`: the flow into the real parameter
+    was lost, and every `self.attr` in the method read as tainted.
+    """
+
+    HEAD = ("import os\nfrom flask import Flask, request\n"
+            "app = Flask(__name__)\n\n")
+
+    def _cmdi(self, body):
+        found = _scan({"app.py": self.HEAD + body}).findings
+        return sorted(f.location.line for f in found
+                      if f.rule_id == "py-cmdi-os-system")
+
+    def test_instance_method_argument_reaches_its_parameter(self):
+        self.assertEqual(self._cmdi(
+            "class Runner:\n"
+            "    def run(self, cmd):\n"
+            "        os.system(cmd)\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    Runner().run(request.args['c'])\n"), [7])
+
+    def test_argument_does_not_taint_self(self):
+        self.assertEqual(self._cmdi(
+            "class Runner:\n"
+            "    def __init__(self):\n"
+            "        self.prog = 'ls'\n"
+            "    def run(self, label):\n"
+            "        os.system(self.prog)\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    Runner().run(request.args['c'])\n"), [])
+
+    def test_call_through_self(self):
+        self.assertEqual(self._cmdi(
+            "class Svc:\n"
+            "    def handle(self, v):\n"
+            "        self.run(v, 'x')\n"
+            "    def run(self, cmd, label):\n"
+            "        os.system(cmd)\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    Svc().handle(request.args['c'])\n"), [9])
+
+    def test_classmethod_skips_cls(self):
+        self.assertEqual(self._cmdi(
+            "class Runner:\n"
+            "    @classmethod\n"
+            "    def run(cls, cmd):\n"
+            "        os.system(cmd)\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    Runner.run(request.args['c'])\n"), [8])
+
+    def test_staticmethod_binds_every_argument(self):
+        self.assertEqual(self._cmdi(
+            "class Runner:\n"
+            "    @staticmethod\n"
+            "    def run(cmd):\n"
+            "        os.system(cmd)\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    Runner.run(request.args['c'])\n"), [8])
+
+    def test_instance_passed_explicitly_through_the_class(self):
+        self.assertEqual(self._cmdi(
+            "class Runner:\n"
+            "    def run(self, cmd):\n"
+            "        os.system(cmd)\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    Runner.run(Runner(), request.args['c'])\n"), [7])
+
+    def test_other_decorators_keep_the_receiver(self):
+        self.assertEqual(self._cmdi(
+            "import functools\n"
+            "class Runner:\n"
+            "    @functools.lru_cache()\n"
+            "    def run(self, cmd):\n"
+            "        os.system(cmd)\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    Runner().run(request.args['c'])\n"), [9])
+
+    def test_plain_functions_are_unchanged(self):
+        self.assertEqual(self._cmdi(
+            "def run(cmd):\n"
+            "    os.system(cmd)\n\n"
+            "@app.route('/x')\n"
+            "def h():\n"
+            "    run(request.args['c'])\n"), [6])

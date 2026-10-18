@@ -579,10 +579,34 @@ class GenericTaintEngine:
                 return result
         return None
 
+    def _receiver_params(self, sym, node: Node) -> int:
+        """How many leading parameters the call fills implicitly.
+
+        Python declares the receiver: `def run(self, cmd)` called as
+        `r.run(x)` binds `x` to `cmd`. Binding positionally from the first
+        parameter put `x` in `self` instead, which lost the flow into `cmd`
+        and made every `self.attr` in the method look attacker-controlled.
+
+        `Cls.method(obj, x)` passes the instance explicitly, so an instance
+        method reached through its own class name skips nothing. A bare call
+        `run(x)` cannot reach a method in Python; it binds as before.
+        """
+        kind = sym.get("receiver")
+        if not kind or not self.p.implicit_receiver:
+            return 0
+        recv = self._receiver_node(node)
+        if recv is None:
+            return 0
+        if (kind == "instance" and recv.type in self.p.identifier
+                and _text(recv) == sym.get("class_name")):
+            return 0
+        return 1
+
     def _invoke_symbol(self, sym, name, args, node, sf, env, ctx):
         new_env = {}
         sig = []
-        for i, pname in enumerate(sym["params"]):
+        skip = self._receiver_params(sym, node)
+        for i, pname in enumerate(sym["params"][skip:]):
             if i < len(args):
                 t = self.taint_of(args[i], sf, env, ctx)
                 if t is not None:
@@ -592,7 +616,7 @@ class GenericTaintEngine:
                         code=sf.node_line(node),
                     ))
                     sig.append((i, _taint_key(t)))
-        key = (id(sym["node"]), ctx.depth, tuple(sig))
+        key = (id(sym["node"]), ctx.depth, skip, tuple(sig))
         if key in self._call_memo:
             return self._call_memo[key]
         body = self._body(sym["node"])
@@ -1113,6 +1137,35 @@ def build_symbols(files: list[SourceFile], profile: LangProfile) -> dict:
                 names.append(_text(ident))
         return names
 
+    def receiver_kind(node: Node):
+        """How a method receives its object: 'instance', 'class' or None.
+
+        Only for languages that declare the receiver as a parameter. None
+        for a plain function and for a @staticmethod, whose parameters are
+        all explicit. Returns (kind, enclosing class name).
+        """
+        if not profile.implicit_receiver:
+            return None, ""
+        holder = node.parent
+        decorators = []
+        if holder is not None and holder.type == "decorated_definition":
+            decorators = [_text(c).lstrip("@").strip()
+                          for c in holder.named_children if c.type == "decorator"]
+            holder = holder.parent
+        if (holder is None or holder.type not in profile.block
+                or holder.parent is None
+                or holder.parent.type not in profile.class_def):
+            return None, ""
+        cls_name = holder.parent.child_by_field_name(profile.f_name)
+        cls_name = _text(cls_name) if cls_name is not None else ""
+        if any(d.split("(")[0].rsplit(".", 1)[-1] == "staticmethod"
+               for d in decorators):
+            return None, cls_name
+        if any(d.split("(")[0].rsplit(".", 1)[-1] == "classmethod"
+               for d in decorators):
+            return "class", cls_name
+        return "instance", cls_name
+
     def self_has_body(node: Node) -> bool:
         if node.child_by_field_name(profile.f_body) is not None:
             return True
@@ -1134,9 +1187,11 @@ def build_symbols(files: list[SourceFile], profile: LangProfile) -> dict:
                 # the implementation that actually builds the SQL, which is
                 # how a whole provider-backed data layer went untracked.
                 # Prefer a declaration that can actually be analysed.
+                receiver, class_name = receiver_kind(child)
                 entry = {"node": child, "source": sf,
                          "params": params_of(child),
-                         "bodied": self_has_body(child)}
+                         "bodied": self_has_body(child),
+                         "receiver": receiver, "class_name": class_name}
                 existing = symbols.get(name)
                 if existing is None or (entry["bodied"]
                                         and not existing["bodied"]):

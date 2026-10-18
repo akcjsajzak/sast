@@ -75,6 +75,14 @@ class LangProfile:
     # True when a bare call's callee is written `pkg.func(...)`, so the engine
     # should treat the member root as the receiver hint.
     dotted_calls: bool = True
+    # True when a method declares the object it is called on as its first
+    # parameter (Python's `self`, or `cls` for a classmethod). A call written
+    # `obj.m(a)` then binds `a` to the *second* declared parameter.
+    implicit_receiver: bool = False
+    # True when import statements and definitions bind module-level names
+    # (Python). A call to a name the file defines, or imports from first-party
+    # code, is to project code and never matches a library sink of that name.
+    module_bindings: bool = False
     # Comment node types to skip.
     comment: tuple = ("comment", "line_comment", "block_comment")
     # Extra node types that introduce a new name binding (for-loop variables).
@@ -117,6 +125,8 @@ PYTHON = LangProfile(
     f_property="attribute",
     f_arguments="arguments",
     self_names=("self", "cls"),
+    implicit_receiver=True,
+    module_bindings=True,
     loop_binding=("for_statement",),
     f_loop_left="left",
     f_loop_right="right",
