@@ -3863,3 +3863,48 @@ class TestPythonPrecisionFixes(unittest.TestCase):
             "def bad(request):\n"
             "    return HttpResponse('<p>' + request.GET['u'])\n"),
             [("py-xss-httpresponse", 6)])
+
+
+class TestAiohttpAndClassResolution(unittest.TestCase):
+    """dvpwa (aiohttp): no routes, and its SQL injection unreported."""
+
+    FILES = {
+        "requirements.txt": "aiohttp\n",
+        "app/routes.py": (
+            "from app import views\n"
+            "def setup_routes(app):\n"
+            "    app.router.add_route('GET', r'/students/', views.students)\n"
+            "    app.router.add_route('POST', r'/students/', views.students)\n"
+            "    app.router.add_get('/courses/{id}', views.course)\n"),
+        "app/dao/course.py": (
+            "class Course:\n"
+            "    @staticmethod\n"
+            "    async def create(conn, title):\n"
+            "        return await conn.cursor().execute('x', {'t': title})\n"),
+        "app/dao/student.py": (
+            "class Student:\n"
+            "    @staticmethod\n"
+            "    async def create(conn, name):\n"
+            "        q = \"INSERT (%(name)s)\" % {'name': name}\n"
+            "        async with conn.cursor() as cur:\n"
+            "            await cur.execute(q)\n"),
+        "app/views.py": (
+            "from app.dao.student import Student\n"
+            "async def students(request):\n"
+            "    data = await request.post()\n"
+            "    await Student.create(conn, data['name'])\n"
+            "async def course(request):\n"
+            "    return request.match_info['id']\n"),
+    }
+
+    def test_router_registrations_are_routes(self):
+        routes = sorted((r.method, r.path) for r in _scan(self.FILES).routes)
+        self.assertEqual(routes, [("GET", "/courses/{id}"), ("GET", "/students/"),
+                                  ("POST", "/students/")])
+
+    def test_class_qualified_call_reaches_that_class(self):
+        """`Student.create` went to `Course.create`, indexed first by name."""
+        found = [(os.path.basename(f.location.file), f.location.line)
+                 for f in _scan(self.FILES).findings
+                 if f.rule_id == "py-sqli-execute"]
+        self.assertEqual(found, [("student.py", 6)])

@@ -554,7 +554,13 @@ _REGISTER_TAILS = {
     "handle": ANY, "handlefunc": ANY, "handlefuncs": ANY,
     "add": ANY, "addroute": ANY, "route": ANY, "resource": ANY,
     "apiresource": ANY, "path": ANY, "re_path": ANY, "url": ANY,
+    # aiohttp: app.router.add_get('/x', h), and add_route('GET', '/x', h),
+    # which states the method as its first string.
+    "add_get": "GET", "add_post": "POST", "add_put": "PUT",
+    "add_patch": "PATCH", "add_delete": "DELETE", "add_head": "HEAD",
+    "add_view": ANY, "add_route": ANY,
 }
+_HTTP_VERBS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 # Receivers that plausibly own routes. Without this, every `foo.get(key)` in
 # the codebase would read as a route declaration — a map lookup, an HTTP
 # client call and a getter all spell themselves the same way.
@@ -609,6 +615,13 @@ def _registered_routes(sf, framework: str, language: str) -> list:
         if tail.lower() in ("route", "path", "at") and _is_chain_base(call):
             continue
         path = _first_string(call) or _receiver_path(call)
+        if tail.lower() == "add_route":
+            # The method comes first: add_route('GET', '/x', handler).
+            strings = [v for v in (_string_value(a) for a in _args(call)) if v]
+            if len(strings) >= 2 and strings[0].upper() in _HTTP_VERBS + ("*",):
+                if strings[0] != "*":
+                    method = strings[0].upper()
+                path = strings[1]
         if not path:
             continue
         if not (path.startswith("/") or path.startswith("*")

@@ -587,6 +587,19 @@ class GenericTaintEngine:
         sym = self.symbols.get(name)
         if sym is None:
             return None
+        # `Student.create(...)` names its class, so when one implementation
+        # of `create` is defined in a class of that name, it is the target.
+        # The table is keyed by bare name and prefers the first one indexed,
+        # so dvpwa's call went to `Course.create`; that one returned a value,
+        # the other implementations were never tried, and the SQL injection
+        # in `Student.create` went unreported.
+        owned = self._class_owned(sym, node)
+        if owned:
+            for impl in owned:
+                result = self._invoke_symbol(impl, name, args, node, sf, env, ctx)
+                if result is not None:
+                    return result
+            return None
         result = self._invoke_symbol(sym, name, args, node, sf, env, ctx)
         if result is not None:
             return result
@@ -599,6 +612,20 @@ class GenericTaintEngine:
             if result is not None:
                 return result
         return None
+
+    def _class_owned(self, sym, node: Node) -> list:
+        """The implementations defined in the class a call is made through.
+
+        Only for a receiver that is a bare name matching a recorded class
+        (`Cls.method()`); an instance receiver carries no type here, so it
+        resolves as before.
+        """
+        recv = self._receiver_node(node)
+        if recv is None or recv.type not in self.p.identifier:
+            return []
+        cls = _text(recv)
+        return [impl for impl in (sym, *sym.get("alternatives", ()))
+                if impl.get("class_name") == cls]
 
     def _receiver_params(self, sym, node: Node) -> int:
         """How many leading parameters the call fills implicitly.
