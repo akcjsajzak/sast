@@ -442,7 +442,7 @@ The limits are documented rather than hidden:
 
 ### Maybe in the future
 
-Neither of these is implemented, and both are worth knowing about before
+None of these is implemented, and all are worth knowing about before
 putting this in a pipeline:
 
 - **Suppression and a baseline.** There is no way to accept a finding — no
@@ -454,6 +454,13 @@ putting this in a pipeline:
   findings are left out of the SARIF entirely. GitHub code scanning accepts
   the file but will not attach annotations to source, and dismissals do not
   survive a line shifting.
+- **Per-language engine isolation.** The engines run in one process with no
+  boundary between them, so an unhandled exception in one language's analysis
+  aborts the whole scan and no report is written at all — the other languages
+  included. A crash in the PHP engine on `$this->$method()` took the Java
+  results of a polyglot repository down with it. Each language's analysis
+  should be contained, with the failure reported as an error in the scan
+  result rather than as a lost scan.
 
 ## Tests
 
@@ -461,5 +468,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-399 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+400 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.
