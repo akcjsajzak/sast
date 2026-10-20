@@ -291,18 +291,32 @@ def _literal_text(node: Node) -> str:
 
     Enough to tell whether a later value lands inside quotes: the quotes
     are in the literals, never in the interpolated variables.
+
+    Walked with an explicit stack rather than by recursion. A concatenation
+    nests one level per `.`, and recursing through `"".join(...)` put a C
+    frame on the stack at every level: that is bounded by the interpreter's
+    C recursion limit, which `sys.setrecursionlimit` does not raise and which
+    is far lower on Windows, so a long concatenation ended the scan there
+    while passing on Linux.
     """
-    if node.type == "string":
-        raw = au.text(node)
-        return raw[1:-1] if len(raw) >= 2 else ""
-    if node.type == "encapsed_string":
-        return "".join(au.text(c) for c in node.named_children
-                       if c.type == "string_content")
-    if node.type == "binary_expression":
-        return "".join(_literal_text(c) for c in node.named_children)
-    if node.type == "parenthesized_expression" and node.named_children:
-        return _literal_text(node.named_children[0])
-    return ""
+    parts: list = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+        kind = current.type
+        if kind == "string":
+            raw = au.text(current)
+            parts.append(raw[1:-1] if len(raw) >= 2 else "")
+        elif kind == "encapsed_string":
+            parts.extend(au.text(c) for c in current.named_children
+                         if c.type == "string_content")
+        elif kind == "binary_expression":
+            stack.extend(reversed(current.named_children))
+        elif kind == "parenthesized_expression" and current.named_children:
+            stack.append(current.named_children[0])
+    return "".join(parts)
 
 
 def _inside_quotes(prefix: str) -> bool:

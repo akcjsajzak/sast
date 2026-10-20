@@ -4787,5 +4787,43 @@ class TestRoundThreeCoverage(unittest.TestCase):
         self.assertIn("cs-cmdi-startinfo-filename", self._rules({"a.cs": code}))
 
 
+class TestRecursionSafety(unittest.TestCase):
+    """Deep input must not take the process down, on any platform."""
+
+    def test_no_recursion_runs_through_a_c_frame(self):
+        """A self-recursive function must not recurse from inside a
+        comprehension or generator expression.
+
+        There each level also puts a C frame on the stack (the `join`, `any`
+        or `sorted` driving it), and C recursion is bounded by a limit
+        `sys.setrecursionlimit` does not raise and that is far lower on
+        Windows. `_literal_text` did this and a long PHP concatenation ended
+        the scan on Windows while passing on Linux, so a Linux-only test run
+        could not see it.
+        """
+        import ast
+        import pathlib
+        comprehensions = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        root = pathlib.Path(__file__).resolve().parent.parent / "sast"
+        offenders = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+                for comp in [n for n in ast.walk(fn) if isinstance(n, comprehensions)]:
+                    for call in [n for n in ast.walk(comp) if isinstance(n, ast.Call)]:
+                        if isinstance(call.func, ast.Name) and call.func.id == fn.name:
+                            offenders.append(f"{path.name}:{call.lineno} {fn.name}()")
+        self.assertEqual(offenders, [], "recursion through a C frame: " + ", ".join(offenders))
+
+    def test_literal_text_handles_a_long_concatenation(self):
+        from sast.parsing.php import PhpParser
+        from sast.analysis.dataflow import _literal_text
+        parser = PhpParser()
+        code = "<?php $a = " + " . ".join(["'x'"] * 5000) + ";"
+        sf = parser.parse("d.php", code.encode())
+        node = next(n for n in sf.walk() if n.type == "binary_expression")
+        self.assertEqual(_literal_text(node), "x" * 5000)
+
+
 if __name__ == "__main__":
     unittest.main()
