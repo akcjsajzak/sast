@@ -4699,6 +4699,19 @@ class TestRoundThreeCoverage(unittest.TestCase):
         unregistered = code.replace('register("get_stock"', 'register("other"')
         self.assertNotIn("php-sqli-mysql_query", self._rules({"ws.php": unregistered}))
 
+    def test_dynamic_method_call_does_not_abort_the_scan(self):
+        """`$this->$m()` has no name to resolve, and resolving by unique name
+        crashed the whole scan on it — DVWA's bundled Parsedown does this."""
+        files = {
+            "p.php": ("<?php class P {\n"
+                      "  function line($l) { return $l; }\n"
+                      "  function run($m, $l) { return $this->$m($l); } }\n"),
+            "f.php": ("<?php function f($o, $m) { $o->$m($_GET['q']);\n"
+                      "  $o->{'x' . $m}($_GET['q']); }\n"
+                      "echo shell_exec($_GET['c']);\n"),
+        }
+        self.assertIn("php-cmdi-shell_exec", self._rules(files))
+
     def test_sqlite3_query_single(self):
         code = ("<?php $db = new SQLite3('t.db');\n"
                 "$db->querySingle('select 1 from s where id = ' . $_GET['id']);\n")

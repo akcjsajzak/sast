@@ -1252,7 +1252,7 @@ class TaintEngine:
             msym = None
             if ctx.current_class:
                 msym = self.symbols.lookup_method(ctx.current_class, callee, ctx.namespace)
-            if msym is None and not cls:
+            if msym is None and not cls and callee:
                 msym = self.symbols.unique_method(callee)
             if msym is not None:
                 return self.analyze_method_call(msym, args, node, sf, env, ctx)

@@ -133,14 +133,15 @@ class SymbolTable:
         when the name leaves no choice: Mutillidae's pages call
         `$SQLQueryHandler->getUserAccount()` on an object made elsewhere.
         """
+        # A dynamic call (`$o->$m()`) has no name to resolve.
+        if not method_name or method_name.startswith("__"):
+            return None
         index = getattr(self, "_methods_by_name", None)
         if index is None:
             index = self._methods_by_name = {}
             for cls in self.classes.values():
                 for name, m in cls.methods.items():
                     index.setdefault(name.lower(), []).append(m)
-        if method_name.startswith("__"):
-            return None
         found = index.get(method_name.lower(), [])
         return found[0] if len(found) == 1 else None
 
