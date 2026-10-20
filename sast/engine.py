@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -93,6 +94,14 @@ class ScanEngine:
 
     def scan(self, root: str) -> ScanResult:
         start = time.time()
+        # The walkers recurse once per level of AST nesting and spend several
+        # frames doing it, so the default limit is reached well before
+        # MAX_NODE_DEPTH, which is the bound that should decide where analysis
+        # stops. Raised, never lowered: scans share the interpreter with each
+        # other (the web server runs them in worker threads) and with whatever
+        # embeds this.
+        if sys.getrecursionlimit() < _RECURSION_LIMIT:
+            sys.setrecursionlimit(_RECURSION_LIMIT)
         root = os.path.abspath(root)
         # Loaded first, so a database the user named but that cannot be read
         # fails the scan before the code analysis rather than after it.
@@ -377,6 +386,11 @@ class ScanEngine:
 # binding), as opposed to only the parameters named in the URL pattern.
 _BINDS_ALL_PARAMS = {("python", "FastAPI"), ("csharp", "ASP.NET Core"),
                      ("csharp", "ASP.NET")}
+
+
+# Frames to allow the analysis, sized from MAX_NODE_DEPTH: a few frames per
+# level of nesting, plus the scan's own stack, with room to spare.
+_RECURSION_LIMIT = 20_000
 
 
 def _entry_params(routes: list, language: str, framework: str) -> dict:

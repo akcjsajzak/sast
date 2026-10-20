@@ -20,7 +20,7 @@ from ..models import Finding, Severity, TaintStep
 from ..parsing.source import SourceFile
 from ..rules.base import RuleSet, SanitizerRule
 from .dataflow import (
-    Ctx, Taint, _merge_taint, _taint_key, make_loc, match_callee,
+    Ctx, Taint, _merge_taint, _taint_key, depth_guarded, make_loc, match_callee,
     weakest_confidence,
 )
 from .lang_profile import LangProfile
@@ -213,6 +213,7 @@ class GenericTaintEngine:
             ret = _merge_taint(ret, self.walk_stmt(stmt, sf, env, ctx))
         return ret
 
+    @depth_guarded
     def walk_stmt(self, stmt: Node, sf: SourceFile, env: dict, ctx: Ctx):
         p = self.p
         t = stmt.type
@@ -458,6 +459,7 @@ class GenericTaintEngine:
             seen += 1
         return _text(node) if node is not None and node.type in p.identifier else ""
 
+    @depth_guarded
     def taint_of(self, node: Node, sf: SourceFile, env: dict, ctx: Ctx):
         p = self.p
         if node is None:

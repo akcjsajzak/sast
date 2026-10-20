@@ -14,7 +14,7 @@ from ..parsing.source import SourceFile
 from ..rules.base import RuleSet, SanitizerRule
 from . import js_ast as ja
 from .dataflow import (
-    Ctx, Taint, _merge_taint, _taint_key, make_loc, match_callee,
+    Ctx, Taint, _merge_taint, _taint_key, depth_guarded, make_loc, match_callee,
     weakest_confidence,
 )
 from .js_symbols import JsSymbolTable
@@ -123,6 +123,7 @@ class JsTaintEngine:
                 ret = _merge_taint(ret, r)
         return ret
 
+    @depth_guarded
     def process_stmt(self, stmt: Node, sf: SourceFile, env: dict, ctx: Ctx):
         t = stmt.type
         if t in _SKIP_TOP:
@@ -281,6 +282,7 @@ class JsTaintEngine:
     # ------------------------------------------------------------------
     # Expressions
     # ------------------------------------------------------------------
+    @depth_guarded
     def taint_of(self, node: Node, sf: SourceFile, env: dict, ctx: Ctx):
         if node is None:
             return None

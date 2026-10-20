@@ -412,6 +412,10 @@ The limits are documented rather than hidden:
   `mvn dependency:tree` output for full coverage.
 - PHP variable variables (`$$name`), Vue/Svelte single-file components, and
   dynamic imports are not followed.
+- Expressions nested more than 400 levels deep stop being followed at that
+  point. Machine-written code reaches it (a few hundred chained string
+  concatenations is enough); the deepest file in the test corpora nests 172
+  levels, so hand-written code does not.
 - C/C++ analysis is function-local: no pointer or alias analysis, so heap-shape
   bugs beyond the dedicated use-after-free checker are out of reach.
 - IaC rules are textual: values computed by a module are not resolved.
@@ -468,5 +472,5 @@ putting this in a pipeline:
 python -m unittest tests.test_sast -v
 ```
 
-400 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+402 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.

@@ -9,7 +9,8 @@ from ..models import Finding, Severity, TaintStep
 from ..parsing.source import SourceFile
 from ..rules.base import RuleSet
 from . import java_ast as ja
-from .dataflow import Ctx, Taint, _merge_taint, _taint_key, make_loc, match_callee, pattern_loc
+from .dataflow import (Ctx, Taint, _merge_taint, _taint_key, depth_guarded, make_loc,
+                       match_callee, pattern_loc)
 from .java_symbols import JavaSymbolTable
 
 MAX_DEPTH = 8
@@ -459,6 +460,7 @@ class JavaTaintEngine:
             return self.process_block(body, sf, env, tenv, ctx)
         return self.process_stmt(body, sf, env, tenv, ctx)
 
+    @depth_guarded
     def process_stmt(self, stmt: Node, sf: SourceFile, env: dict, tenv: dict, ctx: Ctx):
         t = stmt.type
         if t == "local_variable_declaration":
@@ -780,6 +782,7 @@ class JavaTaintEngine:
         return ret
 
     # ------------------------------------------------------------------
+    @depth_guarded
     def taint_of(self, node: Node, sf: SourceFile, env: dict, tenv: dict, ctx: Ctx):
         if node is None:
             return None
@@ -912,9 +915,12 @@ class JavaTaintEngine:
     # ------------------------------------------------------------------
     def method_invocation_taint(self, node: Node, sf: SourceFile, env: dict, tenv: dict, ctx: Ctx):
         obj, mname, args = ja.mi_parts(node)
-        # Evaluate receiver for embedded sinks.
-        if obj is not None:
-            self.taint_of(obj, sf, env, tenv, ctx)
+        # Evaluated once, for the sinks embedded in it and for every branch
+        # below that needs it. Each branch used to evaluate the receiver
+        # again, and in a chained call the receiver is the rest of the chain,
+        # so the work doubled per link: a 20-call fluent chain took a minute.
+        recv_taint = (self.taint_of(obj, sf, env, tenv, ctx)
+                      if obj is not None else None)
 
         # Sink before source: a call can be both (reading a file with an
         # attacker-controlled path is an SSRF/traversal sink *and* returns
@@ -923,7 +929,8 @@ class JavaTaintEngine:
         self.check_algorithm(mname, obj, args, node, sf, tenv)
         san = self.match_sanitizer(mname)
         if san is None:
-            self.check_method_sink(mname, obj, args, node, sf, env, tenv, ctx)
+            self.check_method_sink(mname, obj, args, node, sf, env, tenv, ctx,
+                                   recv_taint=recv_taint)
 
         st = self.source_taint(mname, obj, args, node, sf, env, tenv, ctx)
         if st is not None:
@@ -942,9 +949,8 @@ class JavaTaintEngine:
         if obj is not None and ctx.depth < MAX_DEPTH:
             lam = next((a for a in args if a.type == "lambda_expression"), None)
             if lam is not None:
-                recv = self.taint_of(obj, sf, env, tenv, ctx)
-                if recv is not None:
-                    lt = self._invoke_lambda(lam, recv, node, sf, env, tenv, ctx)
+                if recv_taint is not None:
+                    lt = self._invoke_lambda(lam, recv_taint, node, sf, env, tenv, ctx)
                     if lt is not None:
                         return lt
 
@@ -961,8 +967,7 @@ class JavaTaintEngine:
             # `replace` and `concat` are also String methods returning a new
             # string, which carries the receiver's taint: without it
             # `token.replace('-', '+')` came back clean.
-            recv = (self.taint_of(obj, sf, env, tenv, ctx)
-                    if obj is not None and mname in _STRING_TRANSFORMS else None)
+            recv = recv_taint if mname in _STRING_TRANSFORMS else None
             return _merge_taint(merged, recv)
 
         if mname == "format" and obj is not None and ja.text(obj) == "String":
@@ -988,9 +993,8 @@ class JavaTaintEngine:
         # fall out of this one rule. Predicates returning a size or a boolean
         # carry no attacker bytes, so they are excluded.
         if obj is not None and mname not in NON_PROPAGATING:
-            recv = self.taint_of(obj, sf, env, tenv, ctx)
-            if recv is not None:
-                return recv
+            if recv_taint is not None:
+                return recv_taint
 
         # A call this analysis could not resolve — a helper in a class that was
         # not scanned, or a method reached through an interface whose concrete
@@ -1108,7 +1112,8 @@ class JavaTaintEngine:
         visit(obj)
         return " ".join(parts).lower()
 
-    def check_method_sink(self, mname, obj, args, node, sf, env, tenv, ctx):
+    def check_method_sink(self, mname, obj, args, node, sf, env, tenv, ctx,
+                          recv_taint=None):
         rkey = self._receiver_key(obj, tenv).lower()
         full = ja.text(node).lower()
         for sink in self.rules.sinks:
@@ -1121,9 +1126,8 @@ class JavaTaintEngine:
             if sink.type_arg and not _declares_type_arg(node, sink.type_arg):
                 continue
             if sink.receiver_tainted:
-                t = self.taint_of(obj, sf, env, tenv, ctx) if obj is not None else None
-                if t is not None and (t.tags & set(sink.tags)):
-                    self.emit_finding(sink, t, node, sf)
+                if recv_taint is not None and (recv_taint.tags & set(sink.tags)):
+                    self.emit_finding(sink, recv_taint, node, sf)
                 continue
             indices = range(len(args)) if sink.arg_index < 0 else [sink.arg_index]
             for i in indices:

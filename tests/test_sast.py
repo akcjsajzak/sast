@@ -4699,6 +4699,33 @@ class TestRoundThreeCoverage(unittest.TestCase):
         unregistered = code.replace('register("get_stock"', 'register("other"')
         self.assertNotIn("php-sqli-mysql_query", self._rules({"ws.php": unregistered}))
 
+    def test_deep_nesting_does_not_exhaust_the_stack(self):
+        """Nesting deeper than the interpreter's stack allows used to end the
+        whole scan with a RecursionError, not just lose the file."""
+        n = 1200
+        concat = " + ".join('"x%d"' % i for i in range(n))
+        java = ("public class C { String f(String q) {\n"
+                "  String s = " + concat + " + q;\n"
+                "  return s; } }\n")
+        php = ("<?php function f($q) { return "
+               + " . ".join("'x%d'" % i for i in range(n)) + " . $q; }\n"
+               "echo shell_exec($_GET['c']);\n")
+        rules = self._rules({"C.java": java, "a.php": php})
+        # The scan completes, and the file next to the pathological one is
+        # still analysed.
+        self.assertIn("php-cmdi-shell_exec", rules)
+
+    def test_long_call_chain_is_not_exponential(self):
+        """Every branch of a method call re-evaluated the receiver, and in a
+        chain the receiver is the rest of the chain, so the work doubled per
+        link: 20 links took a minute, 25 effectively hung. Taint must still
+        flow through the chain."""
+        chain = ".trim()" * 25
+        found = {f.rule_id for f in self._java(
+            '@GetMapping("/a") public void a(@RequestParam String q) throws Exception {\n'
+            '  Runtime.getRuntime().exec(q' + chain + '); }')}
+        self.assertIn("java-cmdi-exec", found)
+
     def test_dynamic_method_call_does_not_abort_the_scan(self):
         """`$this->$m()` has no name to resolve, and resolving by unique name
         crashed the whole scan on it — DVWA's bundled Parsedown does this."""

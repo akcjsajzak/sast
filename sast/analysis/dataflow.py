@@ -1,6 +1,7 @@
 """Source-to-sink taint analysis engine for PHP."""
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 
@@ -66,6 +67,38 @@ _SKIP_TOP = {
     "trait_declaration", "enum_declaration", "function_definition",
     "const_declaration", "declare_statement",
 }
+
+
+# How deep into an AST the recursive walkers will descend.
+#
+# Each level of nesting costs several Python frames, so a file nested deeper
+# than the interpreter's stack allows ends the *whole* scan with a
+# RecursionError rather than losing one file. Generated code reaches that
+# easily: 500 chained string concatenations is enough, and machine-written
+# dispatchers, lexers and SQL builders are routinely longer. Real code is far
+# below this cap — the deepest file across the test corpora nests 172 levels
+# (a generated PHP INSERT), Java 35 — so a value well above it keeps every
+# genuine flow while making the depth bounded by us rather than by the stack.
+MAX_NODE_DEPTH = 400
+
+
+def depth_guarded(method):
+    """Stop descending an absurdly nested AST instead of exhausting the stack.
+
+    Past the cap the expression is treated as carrying no taint, which loses
+    precision on code no human wrote and keeps the rest of the scan alive.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        depth = getattr(self, "_node_depth", 0) + 1
+        if depth > MAX_NODE_DEPTH:
+            return None
+        self._node_depth = depth
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._node_depth = depth - 1
+    return wrapper
 
 
 def _short(name: str) -> str:
@@ -449,6 +482,7 @@ class TaintEngine:
             return self.process_block(body, sf, env, ctx)
         return self.process_stmt(body, sf, env, ctx)
 
+    @depth_guarded
     def process_stmt(self, stmt: Node, sf: SourceFile, env: dict, ctx: Ctx):
         t = stmt.type
         if t == "assignment_expression":
@@ -766,6 +800,7 @@ class TaintEngine:
     # ------------------------------------------------------------------
     # Expression taint evaluation
     # ------------------------------------------------------------------
+    @depth_guarded
     def taint_of(self, node: Node, sf: SourceFile, env: dict, ctx: Ctx):
         if node is None:
             return None
