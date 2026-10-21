@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import argparse
+import contextlib
 import json
 import os
 import re
@@ -569,6 +571,63 @@ class TestSarifMetadata(unittest.TestCase):
         doc = json.loads(render_sarif(r))
         self.assertEqual(doc["runs"][0]["tool"]["driver"]["informationUri"],
                          "https://github.com/akcjsajzak/sast")
+
+
+class TestSarifFidelity(unittest.TestCase):
+    """What a SARIF consumer needs to attach a result to a line of code."""
+
+    def _doc(self, files):
+        return json.loads(render_sarif(_scan(files)))
+
+    def test_locations_are_repository_relative(self):
+        doc = self._doc({"src/a.php": "<?php echo $_GET['x'];"})
+        run = doc["runs"][0]
+        loc = run["results"][0]["locations"][0]["physicalLocation"]
+        self.assertEqual(loc["artifactLocation"]["uri"], "src/a.php")
+        self.assertEqual(loc["artifactLocation"]["uriBaseId"], "%SRCROOT%")
+        base = run["originalUriBaseIds"]["%SRCROOT%"]["uri"]
+        self.assertTrue(base.startswith("file:///"), base)
+        self.assertTrue(base.endswith("/"), base)
+
+    def test_fingerprints_survive_a_line_moving(self):
+        sink = "echo $_GET['x'];\n"
+        first = self._doc({"a.php": "<?php\n" + sink})["runs"][0]["results"][0]
+        moved = self._doc({"a.php": "<?php\n// a new comment\n" + sink})
+        after = moved["runs"][0]["results"][0]
+        self.assertEqual(first["partialFingerprints"], after["partialFingerprints"])
+        # The line number did move, so it is the fingerprint doing the work.
+        self.assertNotEqual(first["locations"][0]["physicalLocation"]["region"]["startLine"],
+                            after["locations"][0]["physicalLocation"]["region"]["startLine"])
+
+    def test_trace_steps_carry_their_explanation(self):
+        doc = self._doc({"a.php": "<?php $q = $_GET['x']; echo $q;"})
+        flow = doc["runs"][0]["results"][0]["codeFlows"][0]["threadFlows"][0]
+        self.assertTrue(all(step["location"]["message"]["text"]
+                            for step in flow["locations"]))
+
+    def test_vulnerable_dependencies_are_reported(self):
+        files = {
+            "a.js": "const x = 1;\n",
+            "package.json": json.dumps({"dependencies": {"minimist": "1.2.0"}}),
+        }
+        run = self._doc(files)["runs"][0]
+        deps = [r for r in run["results"] if r["properties"].get("package")]
+        self.assertTrue(deps, "no dependency result in the SARIF")
+        issue = deps[0]
+        self.assertEqual(issue["properties"]["package"], "minimist")
+        self.assertEqual(
+            issue["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "package.json")
+        self.assertIn(issue["ruleId"], {r["id"] for r in run["tool"]["driver"]["rules"]})
+
+    def test_a_failed_stage_marks_the_run_unsuccessful(self):
+        import unittest.mock as mock
+        with mock.patch("sast.engine.scan_secrets", side_effect=RuntimeError("boom")):
+            result = _scan({"a.php": "<?php echo $_GET['x'];"})
+        run = json.loads(render_sarif(result))["runs"][0]
+        self.assertFalse(run["invocations"][0]["executionSuccessful"])
+        note = run["invocations"][0]["toolExecutionNotifications"][0]
+        self.assertIn("secrets", note["message"]["text"])
 
 
 class TestPropagation(unittest.TestCase):
@@ -4785,6 +4844,190 @@ class TestRoundThreeCoverage(unittest.TestCase):
                 '    p.StartInfo.FileName = bin;\n'
                 '    p.Start(); return ""; } }\n')
         self.assertIn("cs-cmdi-startinfo-filename", self._rules({"a.cs": code}))
+
+
+class TestSuppression(unittest.TestCase):
+    """Accepting a finding: inline markers and a baseline."""
+
+    def _findings(self, files, **options):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        for rel, content in files.items():
+            path = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        return ScanEngine(ScanOptions(**options)).scan(tmp)
+
+    def _marked(self, line: str, rule: str = "php-cmdi-shell_exec"):
+        code = "<?php\n" + line + "\n"
+        result = self._findings({"a.php": code})
+        hits = [f for f in result.findings if f.rule_id == rule]
+        self.assertTrue(hits, f"no {rule} finding for: {line}")
+        return hits[0].suppression
+
+    def test_marker_shapes_each_language_writes(self):
+        sink = "echo shell_exec($_GET['c']);"
+        for comment in ("// sast:ignore", "# sast:ignore", "/* sast:ignore */"):
+            self.assertIsNotNone(self._marked(f"{sink}  {comment}"), comment)
+
+    def test_marker_names_one_rule_only(self):
+        line = "echo shell_exec($_GET['c']);  // sast:ignore php-cmdi-shell_exec"
+        self.assertIsNotNone(self._marked(line))
+        # The other rule firing on the same line is untouched.
+        self.assertIsNone(self._marked(line, rule="php-xss-echo"))
+
+    def test_marker_carries_its_reason(self):
+        line = ("echo shell_exec($_GET['c']);  "
+                "// sast:ignore php-cmdi-shell_exec -- argument is an allow-listed verb")
+        sup = self._marked(line)
+        self.assertEqual(sup.kind, "inline")
+        self.assertEqual(sup.reason, "argument is an allow-listed verb")
+
+    def test_next_line_marker(self):
+        result = self._findings({"a.php": "<?php\n// sast:ignore-next-line\n"
+                                          "echo shell_exec($_GET['c']);\n"})
+        self.assertTrue(all(f.suppression for f in result.findings))
+
+    def test_the_marker_must_be_in_a_comment(self):
+        # The same text inside a string suppresses nothing.
+        result = self._findings({"a.php": "<?php\n"
+                                          "$note = 'sast:ignore'; echo shell_exec($_GET['c']);\n"})
+        self.assertTrue(any(f.suppression is None for f in result.findings))
+
+    def test_markers_can_be_turned_off(self):
+        files = {"a.php": "<?php\necho shell_exec($_GET['c']);  // sast:ignore\n"}
+        off = self._findings(files, inline_suppressions=False)
+        self.assertTrue(all(f.suppression is None for f in off.findings))
+
+    def test_baseline_accepts_today_and_still_gates_tomorrow(self):
+        import io
+        import tempfile
+        from sast.analysis.suppress import build_baseline
+        from sast.cli import _exit_code
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "a.php"), "w", encoding="utf-8") as fh:
+            fh.write("<?php\necho shell_exec($_GET['c']);\n")
+        quiet = io.StringIO()
+        first = ScanEngine(ScanOptions()).scan(tmp)
+        self.assertEqual(_exit_code(first, "high", stream=quiet), 1)
+
+        path = os.path.join(tmp, "baseline.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(build_baseline(first).to_dict(), fh)
+
+        accepted = ScanEngine(ScanOptions(baseline=path)).scan(tmp)
+        self.assertEqual(_exit_code(accepted, "high", stream=quiet), 0)
+        self.assertTrue(all(f.suppression.kind == "baseline"
+                            for f in accepted.findings))
+        self.assertEqual(accepted.stats()["critical"], 0)
+
+        # A new finding is not in the baseline, so the gate closes again.
+        with open(os.path.join(tmp, "b.php"), "w", encoding="utf-8") as fh:
+            fh.write("<?php\neval($_GET['x']);\n")
+        later = ScanEngine(ScanOptions(baseline=path)).scan(tmp)
+        self.assertEqual(_exit_code(later, "high", stream=quiet), 1)
+        new = [f for f in later.findings if not f.suppression]
+        self.assertEqual([f.rule_id for f in new], ["php-code-eval"])
+
+    def test_a_baseline_survives_a_line_moving(self):
+        import tempfile
+        from sast.analysis.suppress import build_baseline
+        tmp = tempfile.mkdtemp()
+        sink = "echo shell_exec($_GET['c']);\n"
+        target = os.path.join(tmp, "a.php")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("<?php\n" + sink)
+        base = build_baseline(ScanEngine(ScanOptions()).scan(tmp))
+        path = os.path.join(tmp, "baseline.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(base.to_dict(), fh)
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("<?php\n// an added line\n" + sink)
+        again = ScanEngine(ScanOptions(baseline=path)).scan(tmp)
+        self.assertTrue(all(f.suppression for f in again.findings))
+
+    def test_suppressed_findings_stay_visible_in_the_reports(self):
+        files = {"a.php": "<?php\necho shell_exec($_GET['c']);  // sast:ignore -- known\n"}
+        result = self._findings(files)
+        doc = json.loads(render_json(result))
+        self.assertEqual(doc["suppressed"], {"inline": len(result.findings)})
+        self.assertTrue(all(f["suppression"]["kind"] == "inline"
+                            for f in doc["findings"]))
+        sarif = json.loads(render_sarif(result))["runs"][0]["results"][0]
+        self.assertEqual(sarif["suppressions"][0]["kind"], "inSource")
+        self.assertEqual(sarif["suppressions"][0]["justification"], "known")
+        html = render_html(result)
+        self.assertIn("Accepted", html)
+
+    def test_a_baseline_is_refused_from_an_incomplete_scan(self):
+        import io
+        import tempfile
+        import unittest.mock as mock
+        from sast.cli import cmd_baseline
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "a.php"), "w", encoding="utf-8") as fh:
+            fh.write("<?php echo $_GET['x'];\n")
+        out = os.path.join(tmp, "baseline.json")
+        args = argparse.Namespace(path=tmp, output=out, min_severity="info",
+                                  include_tests=False, quiet=True)
+        err = io.StringIO()
+        with mock.patch("sast.engine.scan_secrets", side_effect=RuntimeError("boom")), \
+                contextlib.redirect_stderr(err):
+            code = cmd_baseline(args)
+        self.assertEqual(code, 2)
+        self.assertIn("did not complete", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+
+class TestStageIsolation(unittest.TestCase):
+    """A crash in one stage must cost that stage, not the whole scan."""
+
+    def _scan_with_failure(self, target: str):
+        import unittest.mock as mock
+        files = {
+            "a.php": "<?php echo shell_exec($_GET['c']);\n",
+            "b.js": "const u = location.hash; el.innerHTML = u;\n",
+        }
+        with mock.patch(target, side_effect=RuntimeError("boom")):
+            return _scan(files)
+
+    def test_a_failed_language_keeps_the_others(self):
+        result = self._scan_with_failure("sast.engine.TaintEngine")
+        rules = {f.rule_id for f in result.findings}
+        # PHP died; JavaScript still reported.
+        self.assertIn("js-xss-innerhtml", rules)
+        self.assertNotIn("php-cmdi-shell_exec", rules)
+        self.assertEqual([e.stage for e in result.errors], ["php"])
+        self.assertIn("RuntimeError: boom", result.errors[0].error)
+        self.assertIn("raise effect", result.errors[0].detail)
+
+    def test_a_failed_sweep_keeps_the_code_findings(self):
+        result = self._scan_with_failure("sast.engine.scan_secrets")
+        self.assertIn("php-cmdi-shell_exec", {f.rule_id for f in result.findings})
+        self.assertEqual([e.stage for e in result.errors], ["secrets"])
+
+    def test_an_incomplete_scan_fails_the_command(self):
+        from sast.cli import _exit_code
+        import io
+        result = self._scan_with_failure("sast.engine.scan_secrets")
+        out = io.StringIO()
+        # Fails even with no threshold set: the scan did not finish.
+        self.assertEqual(_exit_code(result, "none", stream=out), 1)
+        self.assertIn("INCOMPLETE", out.getvalue())
+        self.assertIn("secrets", out.getvalue())
+
+    def test_the_reports_say_the_scan_is_incomplete(self):
+        result = self._scan_with_failure("sast.engine.scan_secrets")
+        doc = json.loads(render_json(result))
+        self.assertEqual([e["stage"] for e in doc["errors"]], ["secrets"])
+        html = render_html(result)
+        self.assertIn("Incomplete scan", html)
+        self.assertIn("secrets", html)
+        # A clean scan carries neither.
+        clean = _scan({"a.php": "<?php echo 1;\n"})
+        self.assertNotIn("errors", json.loads(render_json(clean)))
+        self.assertNotIn("Incomplete scan", render_html(clean))
 
 
 class TestRecursionSafety(unittest.TestCase):

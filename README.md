@@ -230,7 +230,12 @@ actuators, disabled TLS and committed secrets.
 ## Reports
 
 HTML (a single self-contained file), JSON, and SARIF 2.1.0. SARIF drops
-straight into GitHub code scanning and any other SARIF-aware tool.
+straight into GitHub code scanning and any other SARIF-aware tool: paths are
+repository-relative under a `%SRCROOT%` base, every result carries a
+`partialFingerprint` keyed on the rule, the path and the offending line's
+text rather than its line number (so a dismissal survives an edit above it),
+each trace step carries its explanation, and vulnerable dependencies are
+results too, located at the manifest that declares them.
 
 The HTML report is built to be worked through rather than just read:
 
@@ -315,6 +320,44 @@ instead: a path that is not a directory, or an `--advisory-db` that is
 missing or not valid JSON, so a typo cannot pass the gate by quietly
 checking dependencies against less data than intended.
 
+A scan where a stage crashed exits 1 whatever the threshold, and says which
+stage. The other stages still produce their findings and a report is still
+written — one language's bug does not cost the whole scan — but the run is
+incomplete, and a green exit would claim the failed stage found nothing when
+it never ran.
+
+### Accepting a finding
+
+Gating on everything is unusable on an existing codebase: the first run is
+red and stays red. Two ways to accept one, neither of which deletes
+anything — an accepted finding stays in the report, marked, with the reason:
+
+**Inline**, for a single finding, reviewed in the diff where it lives:
+
+```php
+echo shell_exec($cmd);  // sast:ignore php-cmdi-shell_exec -- fixed verb list
+// sast:ignore-next-line js-xss-innerhtml
+```
+
+Naming rules is optional (a bare `sast:ignore` covers the line), several can
+be listed, and the text after `--` or `:` is kept as the reason. The marker
+counts only inside a comment, so the string in a fixture cannot silence a
+rule. `--no-inline-suppressions` ignores them all.
+
+**A baseline**, for everything that exists today, so the gate acts on what is
+added from now on:
+
+```bash
+sast baseline .                      # writes sast-baseline.json
+sast scan . --fail-on high --baseline sast-baseline.json
+```
+
+The baseline is keyed on the same fingerprints the reports use, so a
+baselined finding stays accepted when code shifts around it, and a genuinely
+new one is not. `sast baseline` refuses to write a file from a scan whose
+stages did not all complete, since that would accept whatever the failed
+stage never reported.
+
 ## Usage reference
 
 ```bash
@@ -336,6 +379,11 @@ sast scan . --no-reachability        # skip the analysis
 # Run only certain scanners
 sast scan . --only iac --only secrets
 sast scan . --no-containers
+
+# Accepting findings
+sast baseline .                      # record today's findings
+sast scan . --baseline sast-baseline.json
+sast scan . --no-inline-suppressions # ignore sast:ignore comments
 
 # Import an OSV / NVD feed offline
 sast import-feed osv-feed.json -o advisories.json
@@ -444,33 +492,11 @@ The limits are documented rather than hidden:
   than none. A finding with no entry point is ranked between open and
   guarded, never buried, since a library or a CLI tool has no routes at all.
 
-### Maybe in the future
-
-None of these is implemented, and all are worth knowing about before
-putting this in a pipeline:
-
-- **Suppression and a baseline.** There is no way to accept a finding — no
-  inline `sast:ignore` comment and no baseline file — so `--fail-on` gates on
-  everything, triaged or not. On an existing codebase that makes the gate
-  hard to adopt.
-- **SARIF fidelity.** Locations are absolute paths rather than
-  repository-relative, there are no `partialFingerprints`, and dependency
-  findings are left out of the SARIF entirely. GitHub code scanning accepts
-  the file but will not attach annotations to source, and dismissals do not
-  survive a line shifting.
-- **Per-language engine isolation.** The engines run in one process with no
-  boundary between them, so an unhandled exception in one language's analysis
-  aborts the whole scan and no report is written at all — the other languages
-  included. A crash in the PHP engine on `$this->$method()` took the Java
-  results of a polyglot repository down with it. Each language's analysis
-  should be contained, with the failure reported as an error in the scan
-  result rather than as a lost scan.
-
 ## Tests
 
 ```bash
 python -m unittest tests.test_sast -v
 ```
 
-404 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+423 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.

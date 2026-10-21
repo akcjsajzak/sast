@@ -21,6 +21,13 @@ def render_json(result: ScanResult) -> str:
             "generated_at": result.advisory_db_date,
         },
         "summary": result.stats(),
+        # Findings and dependency issues accepted by a marker or a baseline.
+        # They stay in the lists below, each carrying why.
+        **({"suppressed": result.suppressed_counts()}
+           if result.suppressed_counts() else {}),
+        # Stages that failed. Present only when something went wrong, so a
+        # consumer can tell an incomplete scan from a clean one.
+        **({"errors": [e.to_dict() for e in result.errors]} if result.errors else {}),
         "attack_surface": {
             "total": len(result.routes),
             "open": sum(1 for r in result.routes if r.open),

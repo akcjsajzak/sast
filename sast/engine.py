@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -32,6 +33,7 @@ from .analysis.routes import (bind_entry_points, exposure_rank,
                               scan_routes)
 from .analysis.requests import build_requests
 from .analysis.secrets import collect_scannable_files, scan_secrets
+from .analysis.suppress import Baseline, apply_suppressions
 from .analysis.symbols import build_symbol_table
 from .detection import (
     collect_source_files_detailed,
@@ -40,7 +42,7 @@ from .detection import (
     is_test_path,
 )
 from .detection.language import DEFAULT_MAX_FILE_BYTES
-from .models import ScanResult, SEVERITY_ORDER
+from .models import ScanError, ScanResult, SEVERITY_ORDER
 from .parsing.generic import GenericParser
 from .parsing.java import JavaParser
 from .parsing.javascript import JsParser
@@ -79,6 +81,10 @@ class ScanOptions:
     # what an auditor wants reading a report once and what nobody wants
     # failing a build. See sast/analysis/authz.py.
     audit: bool = False
+    # Accepting findings. `baseline` is a path written by `sast baseline`;
+    # inline `sast:ignore` markers are honoured unless turned off.
+    baseline: str = ""
+    inline_suppressions: bool = True
 
 
 class ScanEngine:
@@ -115,6 +121,7 @@ class ScanEngine:
         languages = detect_languages(root)
         findings: list = []
         routes: list = []
+        errors: list = []
         # Values from the repository's .properties files, read once and handed
         # to the engines that can resolve a configured constant at a call
         # site: a hash or cipher chosen in configuration is invisible to both
@@ -149,8 +156,11 @@ class ScanEngine:
                 f"Scanning {language}: {len(source_files)} file(s), "
                 f"framework {profile.framework}",
             )
-            lang_findings, parsed_count, unreadable, lang_routes = self._analyze(
-                language, profile.framework, rules, source_files, root,
+            lang_findings, parsed_count, unreadable, lang_routes = self._stage(
+                language, errors,
+                lambda: self._analyze(language, profile.framework, rules,
+                                      source_files, root),
+                default=([], 0, 0, []),
             )
             self._progress(
                 f"{language}: {len(lang_findings)} finding(s), "
@@ -172,14 +182,15 @@ class ScanEngine:
             if not self.options.include_tests:
                 tpl_files = [(p, k) for (p, k) in tpl_files
                              if not is_test_path(os.path.relpath(p, root))]
-            findings.extend(scan_templates(tpl_files))
+            findings.extend(self._stage("templates", errors,
+                                        lambda: scan_templates(tpl_files), []))
             files_scanned += len(tpl_files)
         if self.options.scan_configs:
             self._progress("Scanning configuration")
             cfg_files = collect_config_files(root)
-            findings.extend(scan_configs(
+            findings.extend(self._stage("configuration", errors, lambda: scan_configs(
                 cfg_files, language=primary, framework=frameworks.get(primary, "raw"),
-            ))
+            ), []))
             files_scanned += len(cfg_files)
 
         # Infrastructure as code: where a bucket becomes public or a container
@@ -187,14 +198,16 @@ class ScanEngine:
         if self.options.scan_iac:
             self._progress("Scanning infrastructure-as-code")
             iac_files = collect_iac_files(root)
-            findings.extend(scan_iac(iac_files))
+            findings.extend(self._stage("iac", errors,
+                                        lambda: scan_iac(iac_files), []))
             files_scanned += len(iac_files)
 
         dockerfiles: list = []
         if self.options.scan_containers:
             self._progress("Scanning containers")
             dockerfiles = collect_dockerfiles(root)
-            findings.extend(scan_dockerfiles(dockerfiles))
+            findings.extend(self._stage("containers", errors,
+                                        lambda: scan_dockerfiles(dockerfiles), []))
             files_scanned += len(dockerfiles)
 
         # Secrets are searched across every text file, not only source: a
@@ -202,22 +215,28 @@ class ScanEngine:
         if self.options.scan_secrets:
             self._progress("Scanning secrets")
             secret_files = collect_scannable_files(root)
-            findings.extend(scan_secrets(secret_files, root))
+            findings.extend(self._stage("secrets", errors,
+                                        lambda: scan_secrets(secret_files, root), []))
 
         # Dependency analysis, per language and per module.
         dep_issues: list = []
         if self.options.scan_dependencies:
             self._progress("Checking dependencies")
             for language in languages:
-                found = analyze_dependencies(
-                    root, language, db, module_dirs.get(language) or [root],
+                found = self._stage(
+                    f"dependencies ({language})", errors,
+                    lambda language=language: analyze_dependencies(
+                        root, language, db, module_dirs.get(language) or [root]),
+                    [],
                 )
                 for issue in found:
                     package_language.setdefault(issue.package, language)
                 dep_issues.extend(found)
             # A base image is a dependency like any other.
             if dockerfiles:
-                dep_issues.extend(scan_base_images(dockerfiles, db))
+                dep_issues.extend(self._stage(
+                    "base images", errors,
+                    lambda: scan_base_images(dockerfiles, db), []))
 
         # Reachability: a vulnerable package that first-party code never
         # imports is rarely the same risk as one it calls into.
@@ -230,8 +249,8 @@ class ScanEngine:
                         include_tests=self.options.include_tests,
                         max_file_bytes=self.options.max_file_bytes,
                     )[0])
-            index = build_import_index(all_source_files)
-            annotate_reachability(dep_issues, index, package_language)
+            self._stage("reachability", errors, lambda: annotate_reachability(
+                dep_issues, build_import_index(all_source_files), package_language))
 
         # Tie each finding to the request that reaches it, then rank by how
         # exposed that request is. A finding on a route with no guard found
@@ -239,9 +258,10 @@ class ScanEngine:
         # credentials before it can even be tried.
         if routes and findings:
             self._progress("Resolving entry points")
-            bound = bind_entry_points(findings, routes)
+            bound = self._stage("entry points", errors,
+                                lambda: bind_entry_points(findings, routes), 0)
             self._progress(f"{bound} finding(s) tied to an entry point")
-            build_requests(findings)
+            self._stage("requests", errors, lambda: build_requests(findings))
 
         # Filter + sort.
         min_order = SEVERITY_ORDER.get(_sev_enum(self.options.min_severity or "info"), 99)
@@ -258,7 +278,7 @@ class ScanEngine:
                                        SEVERITY_ORDER.get(d.severity, 99),
                                        d.package))
 
-        return ScanResult(
+        result = ScanResult(
             root=root,
             language=primary or "none",
             framework=frameworks.get(primary, "raw"),
@@ -269,10 +289,43 @@ class ScanEngine:
             findings=findings,
             routes=routes,
             dependency_issues=dep_issues,
+            errors=errors,
             advisory_count=len(db.advisories),
             advisory_db_date=db.generated_at,
             duration_seconds=round(time.time() - start, 3),
         )
+        # Last, so acceptance is applied to exactly what would be reported.
+        baseline = None
+        if self.options.baseline:
+            baseline = self._stage(
+                "baseline", errors,
+                lambda: Baseline.load(self.options.baseline))
+        self._stage("suppressions", errors, lambda: apply_suppressions(
+            result, baseline=baseline,
+            inline=self.options.inline_suppressions))
+        result.errors = errors
+        return result
+
+    # ------------------------------------------------------------------
+    def _stage(self, name: str, errors: list, work, default=None):
+        """Run one stage of the scan, keeping a crash inside it.
+
+        Every stage is independent — a language's analysis, the secrets
+        sweep, the dependency check — so a bug in one is no reason to lose
+        the others and write no report at all. The failure is recorded and
+        reported rather than swallowed: `errors` reaches the reports and the
+        exit code.
+        """
+        try:
+            return work()
+        except Exception as exc:                      # noqa: BLE001 - reported
+            self._progress(f"{name}: FAILED ({type(exc).__name__}: {exc})")
+            errors.append(ScanError(
+                stage=name,
+                error=f"{type(exc).__name__}: {exc}",
+                detail="".join(traceback.format_exc().splitlines(keepends=True)[-6:]),
+            ))
+            return default
 
     # ------------------------------------------------------------------
     def _analyze(self, language, framework, rules, source_files, root):

@@ -4,6 +4,23 @@ Release notes for each tagged version. The release workflow publishes the
 section matching the tag as the GitHub release description, so every tag
 needs an entry here.
 
+## 1.1.0
+
+- **Accepting a finding.** Inline `sast:ignore` / `sast:ignore-next-line`
+  comments, which may name rules and carry a reason, and a baseline file
+  written by `sast baseline` so `--fail-on` gates on new findings only.
+  Accepted findings stay in the reports, marked and explained, rather than
+  disappearing; both mechanisms are keyed on fingerprints that survive code
+  moving.
+- **SARIF fidelity.** Repository-relative paths under `%SRCROOT%`,
+  `partialFingerprints` on every result, explanations on trace steps,
+  vulnerable dependencies reported as results located at their manifest, and
+  suppressions expressed in SARIF's own model.
+- **Per-language engine isolation.** A stage that crashes no longer ends the
+  whole scan: every other language and sweep still reports, the failure is
+  named in the summary, the JSON and HTML reports and the SARIF invocation,
+  and the command exits non-zero because the run is incomplete.
+
 ## 1.0.0
 
 First stable release: an offline, single-binary scanner for code,

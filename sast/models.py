@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from .analysis.suppress import Suppression  # noqa: E402  (dataclass field type)
+
 
 class Severity(str, Enum):
     CRITICAL = "critical"
@@ -138,6 +140,10 @@ class Finding:
     entry_point: Optional[EntryPoint] = None
     # A ready-to-send request reproducing the entry point, when one applies.
     request: str = ""
+    # Set when an inline marker or a baseline accepted this finding. It stays
+    # in the result either way: a suppressed finding that vanished would be
+    # indistinguishable from one that was never found.
+    suppression: Optional["Suppression"] = None
 
     def fingerprint(self, root: str = "") -> str:
         """A stable identity for this finding across scans.
@@ -172,6 +178,7 @@ class Finding:
             "framework": self.framework,
             "language": self.language,
             "location": self.location.to_dict(),
+            "suppression": self.suppression.to_dict() if self.suppression else None,
             "source": self.source.to_dict() if self.source else None,
             "trace": [s.to_dict() for s in self.trace],
             "tags": self.tags,
@@ -197,6 +204,11 @@ class DependencyIssue:
     # image). This is import/call-site evidence, not an exploitability claim.
     reachability: str = ""
     reachability_note: str = ""
+    # The manifest the package was declared in, when one was found. A SARIF
+    # result needs a location, and this is the file a fix is applied to.
+    manifest: str = ""
+    # Set when a baseline accepted this issue. See Finding.suppression.
+    suppression: Optional["Suppression"] = None
 
     def to_dict(self) -> dict:
         return {
@@ -211,7 +223,27 @@ class DependencyIssue:
             "references": self.references,
             "reachability": self.reachability,
             "reachability_note": self.reachability_note,
+            "manifest": self.manifest,
+            "suppression": self.suppression.to_dict() if self.suppression else None,
         }
+
+
+@dataclass
+class ScanError:
+    """A stage of the scan that failed, without ending the others.
+
+    The engines share one process, so an unhandled exception used to abort
+    the whole scan and write no report at all — including for the languages
+    that had analysed cleanly. Each stage is contained instead, and what it
+    was going to contribute is reported as missing rather than silently
+    absent.
+    """
+    stage: str                 # 'php', 'secrets', 'dependencies', ...
+    error: str                 # exception type and message
+    detail: str = ""           # the last frames of the traceback
+
+    def to_dict(self) -> dict:
+        return {"stage": self.stage, "error": self.error, "detail": self.detail}
 
 
 @dataclass
@@ -237,10 +269,27 @@ class ScanResult:
     # Offline advisory database provenance.
     advisory_count: int = 0
     advisory_db_date: str = ""
+    # Stages that raised. A scan with errors is incomplete: whatever those
+    # stages would have found is missing, so the absence of a finding there
+    # means nothing.
+    errors: list = field(default_factory=list)
+
+    def active_findings(self) -> list:
+        """Findings nobody has accepted. What a gate and a reviewer act on."""
+        return [f for f in self.findings if not getattr(f, "suppression", None)]
+
+    def suppressed_counts(self) -> dict:
+        """How many findings and dependency issues each mechanism accepted."""
+        counts: dict = {}
+        for item in (*self.findings, *self.dependency_issues):
+            sup = getattr(item, "suppression", None)
+            if sup is not None:
+                counts[sup.kind] = counts.get(sup.kind, 0) + 1
+        return counts
 
     def stats(self) -> dict:
         counts = {s.value: 0 for s in Severity}
-        for f in self.findings:
+        for f in self.active_findings():
             if f.severity.value in counts:
                 counts[f.severity.value] += 1
         return counts
@@ -254,7 +303,8 @@ class ScanResult:
         threshold = SEVERITY_ORDER.get(severity, 99)
         return sum(
             1 for item in (*self.findings, *self.dependency_issues)
-            if SEVERITY_ORDER.get(item.severity, 99) <= threshold
+            if not getattr(item, "suppression", None)
+            and SEVERITY_ORDER.get(item.severity, 99) <= threshold
         )
 
     def total_skipped(self) -> int:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -11,6 +12,7 @@ from .advisory.importers import import_feed
 from .engine import ScanEngine, ScanOptions
 from .fetch_feeds import fetch
 from .models import Severity
+from .analysis.suppress import build_baseline
 from .reporting import render_html, render_json, render_sarif
 
 
@@ -49,6 +51,8 @@ def cmd_scan(args) -> int:
         reachability=not args.no_reachability,
         progress=None if args.quiet else _stderr_progress,
         audit=args.audit,
+        baseline=args.baseline,
+        inline_suppressions=not args.no_inline_suppressions,
     )
     if not os.path.isdir(args.path):
         print(f"error: not a directory: {args.path}", file=sys.stderr)
@@ -88,7 +92,19 @@ def cmd_scan(args) -> int:
 
 
 def _exit_code(result, fail_on: str, stream=None) -> int:
-    """Exit 1 when the scan meets the configured failure threshold."""
+    """Exit 1 when the scan meets the configured failure threshold.
+
+    A stage that failed also fails the command, whatever the threshold: the
+    scan is incomplete, and a green exit would claim those stages found
+    nothing when in fact they did not run.
+    """
+    out = stream or sys.stdout
+    if result.errors:
+        print(f"\nINCOMPLETE: {len(result.errors)} stage(s) failed; "
+              "their findings are missing from this report.", file=out)
+        for err in result.errors:
+            print(f"  {err.stage}: {err.error}", file=out)
+        return 1
     if not fail_on or fail_on == "none":
         return 0
     try:
@@ -98,7 +114,7 @@ def _exit_code(result, fail_on: str, stream=None) -> int:
     n = result.count_at_or_above(threshold)
     if n:
         print(f"\nFAILED: {n} issue(s) at or above '{fail_on}' severity.",
-              file=stream or sys.stdout)
+              file=out)
         return 1
     return 0
 
@@ -122,6 +138,10 @@ def print_summary(result, stream=None) -> None:
         detail = ", ".join(f"{n} {reason}" for reason, n in sorted(result.files_skipped.items()))
         p(f"  Skipped:     {result.total_skipped()} ({detail})")
     p(f"  Duration:    {result.duration_seconds}s")
+    suppressed = result.suppressed_counts()
+    if suppressed:
+        detail = ", ".join(f"{n} {kind}" for kind, n in sorted(suppressed.items()))
+        p(f"  Accepted:    {sum(suppressed.values())} ({detail})")
     p("  Findings:")
     for sev in ("critical", "high", "medium", "low", "info"):
         if stats.get(sev):
@@ -131,6 +151,9 @@ def print_summary(result, stream=None) -> None:
         p(f"  Attack surface: {len(result.routes)} route(s), "
           f"{openc} with no guard found")
     p(f"  Dependencies with known vulns: {len(result.dependency_issues)}")
+    if result.errors:
+        p(f"  Stages failed: {len(result.errors)} "
+          f"({', '.join(e.stage for e in result.errors)})")
     reach: dict = {}
     for d in result.dependency_issues:
         if d.reachability:
@@ -143,6 +166,44 @@ def print_summary(result, stream=None) -> None:
         stamp = result.advisory_db_date or "unknown date"
         p(f"  Advisory DB: {result.advisory_count} advisories, as of {stamp}")
     p("=" * 60)
+
+
+def cmd_baseline(args) -> int:
+    """Write today's findings to a baseline file.
+
+    Everything the scan reports now becomes accepted, so a later
+    `--fail-on` gates on what is added from here. Nothing is hidden: a
+    baselined finding still appears in reports, marked as accepted.
+    """
+    if not os.path.isdir(args.path):
+        print(f"error: not a directory: {args.path}", file=sys.stderr)
+        return 2
+    options = ScanOptions(
+        min_severity=args.min_severity,
+        include_tests=args.include_tests,
+        progress=None if args.quiet else _stderr_progress,
+        # A baseline records what is there, so nothing is accepted while
+        # building it.
+        inline_suppressions=False,
+    )
+    try:
+        result = ScanEngine(options).scan(args.path)
+    except AdvisoryDBError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if result.errors:
+        print("error: the scan did not complete, so a baseline from it would "
+              "silently accept whatever the failed stages did not report:",
+              file=sys.stderr)
+        for err in result.errors:
+            print(f"  {err.stage}: {err.error}", file=sys.stderr)
+        return 2
+    baseline = build_baseline(result)
+    with open(args.output, "w", encoding="utf-8") as fh:
+        json.dump(baseline.to_dict(), fh, indent=2)
+    print(f"Baseline written to {args.output}: "
+          f"{len(baseline.fingerprints)} finding(s) accepted.")
+    return 0
 
 
 def cmd_import_feed(args) -> int:
@@ -222,11 +283,29 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip infrastructure-as-code scanning")
     p_scan.add_argument("--no-containers", action="store_true",
                         help="Skip Dockerfile and base-image scanning")
+    p_scan.add_argument("--baseline", metavar="FILE", default="",
+                        help="Accept the findings recorded in this baseline, so "
+                             "--fail-on gates on new ones only. Write one with "
+                             "`sast baseline`.")
+    p_scan.add_argument("--no-inline-suppressions", action="store_true",
+                        help="Ignore `sast:ignore` comments in the source")
     p_scan.add_argument("--only", metavar="KIND", action="append", default=[],
                         choices=["code", "secrets", "iac", "containers",
                                  "templates", "config", "deps"],
                         help="Run only these scanners (repeatable)")
     p_scan.set_defaults(func=cmd_scan)
+
+    p_base = sub.add_parser(
+        "baseline",
+        help="Record today's findings so a gate can act on new ones only")
+    p_base.add_argument("path", help="Path to the project to scan")
+    p_base.add_argument("-o", "--output", default="sast-baseline.json",
+                        help="Baseline file to write (default: sast-baseline.json)")
+    p_base.add_argument("--min-severity", default="info",
+                        choices=["critical", "high", "medium", "low", "info"])
+    p_base.add_argument("--include-tests", action="store_true")
+    p_base.add_argument("-q", "--quiet", action="store_true")
+    p_base.set_defaults(func=cmd_baseline)
 
     p_import = sub.add_parser("import-feed", help="Import an OSV/NVD/generic feed")
     p_import.add_argument("feeds", nargs="+", help="Feed JSON file(s)")

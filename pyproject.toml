@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sast"
-version = "1.0.0"
+version = "1.1.0"
 description = "Offline framework-aware static application security testing, SCA, IaC, container and secrets scanning"
 requires-python = ">=3.10"
 dependencies = [

@@ -83,10 +83,34 @@ def _code(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
+def _errors_banner(errors: list) -> str:
+    """Say plainly which stages failed, so no finding is read as absence.
+
+    A report that silently omits what a crashed stage would have found is
+    worse than no report: the reader takes a clean section as a clean
+    result.
+    """
+    if not errors:
+        return ""
+    items = "".join(
+        f"<li><b>{_esc(e.stage)}</b> — {_esc(e.error)}</li>" for e in errors
+    )
+    return (
+        '<div class="scan-errors"><h2>Incomplete scan: '
+        f'{len(errors)} stage(s) failed</h2>'
+        "<p>Whatever these stages would have reported is missing. Treat the "
+        "areas they cover as unscanned, not as clean.</p>"
+        f"<ul>{items}</ul></div>"
+    )
+
+
 def render_html(result: ScanResult) -> str:
     root = result.root
-    findings = result.findings
-    deps = result.dependency_issues
+    # Accepted findings are kept out of the cards and counted in the header
+    # instead: a reviewer reads what is open, and still sees that something
+    # was accepted rather than never found.
+    findings = result.active_findings()
+    deps = [d for d in result.dependency_issues if not d.suppression]
     stats = result.stats()
 
     # Combined severity counts (findings + dependency issues) drive the filter
@@ -138,6 +162,10 @@ def render_html(result: ScanResult) -> str:
         ("Duration", f"{result.duration_seconds}s"),
         ("Generated", generated),
     ]
+    suppressed = result.suppressed_counts()
+    if suppressed:
+        detail = ", ".join(f"{n} {kind}" for kind, n in sorted(suppressed.items()))
+        meta.append(("Accepted", f"{sum(suppressed.values())} ({detail})"))
     if result.advisory_count:
         meta.append((
             "Advisory DB",
@@ -152,6 +180,7 @@ def render_html(result: ScanResult) -> str:
     )
 
     return _PAGE.format(
+        errors=_errors_banner(result.errors),
         title=f"SAST Report — {_esc(os.path.basename(root.rstrip('/')) or root)}",
         meta_items=meta_items,
         summary=summary,
@@ -538,6 +567,14 @@ header.page h1 {{ margin:0 0 14px; font-size:20px; font-weight:650; color:#fff; 
 }}
 
 /* Summary / filter chips */
+.scan-errors {{
+  max-width:1100px; margin:14px auto 0; padding:12px 15px;
+  background:var(--panel); border:1px solid #dc2626; border-left:4px solid #dc2626;
+  border-radius:11px; color:var(--text); box-shadow:var(--shadow);
+}}
+.scan-errors h2 {{ margin:0 0 6px; font-size:15px; color:#dc2626; }}
+.scan-errors p {{ margin:0 0 8px; color:var(--muted-2); font-size:13px; }}
+.scan-errors li {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; }}
 .summary {{ max-width:1100px; margin:0 auto; padding:18px 16px 4px; display:flex; gap:10px; flex-wrap:wrap; }}
 .stat {{
   flex:1 1 120px; min-width:104px; text-align:left; cursor:pointer;
@@ -754,6 +791,7 @@ details.trace summary .hint {{ color:var(--muted); font-weight:450; }}
   </div>
 </div>
 
+{errors}
 <div class="summary">{summary}</div>
 
 <main>
