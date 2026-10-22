@@ -457,6 +457,16 @@ def _sinks() -> list[SinkRule]:
             tags=["code", "cmd"], arg_index=idx,
         ))
     k.append(SinkRule(
+        rule_id="php-code-assert-tainted", kind="function", match="assert",
+        title="Code injection via assert()",
+        severity="high", cwe="CWE-95", owasp=A03, category="code-injection",
+        description="Untrusted input reaches assert(), which evaluates a "
+                    "string argument as PHP code before PHP 8.",
+        remediation="Pass an expression rather than a string, and keep "
+                    "assertions out of production code.",
+        tags=["code"], arg_index=0,
+    ))
+    k.append(SinkRule(
         rule_id="php-code-create_function", kind="function",
         match="create_function",
         title="Code injection via create_function()",
@@ -828,12 +838,19 @@ def _patterns() -> list[PatternRule]:
         remediation="Remove eval() and use explicit, whitelisted logic.",
     ))
     p.append(PatternRule(
-        rule_id="php-code-assert", node_type="function_call_expression", match="assert",
-        match_field="callee", title="Code injection via assert()",
+        # Only the string form evaluates. `assert($x instanceof Y)` is an
+        # ordinary boolean check and the normal way to use assert() on PHP 7+,
+        # so matching the callee alone reported every one of them: composer
+        # and phpMyAdmin contributed 108 between them.
+        rule_id="php-code-assert", node_type="function_call_expression",
+        match=r"^assert\s*\(\s*['\"]", match_field="text", regex=True,
+        title="Code injection via assert()",
         severity="high", cwe="CWE-95", owasp="A03:2021 — Injection",
         category="code-injection",
-        description="assert() with a string argument evaluates it as PHP code.",
-        remediation="Remove assert() in production code.",
+        description="assert() given a string evaluates it as PHP code. The "
+                    "behaviour is removed in PHP 8 but live before it.",
+        remediation="Pass an expression rather than a string, and keep "
+                    "assertions out of production code.",
     ))
     p.append(PatternRule(
         rule_id="php-crypto-md5", node_type="function_call_expression", match="md5",

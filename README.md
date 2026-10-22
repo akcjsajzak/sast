@@ -498,5 +498,5 @@ The limits are documented rather than hidden:
 python -m unittest tests.test_sast -v
 ```
 
-423 tests, plus a binary smoke test (`make smoke`) that runs the frozen
+431 tests, plus a binary smoke test (`make smoke`) that runs the frozen
 executable against one vulnerable fixture per engine on both platforms in CI.

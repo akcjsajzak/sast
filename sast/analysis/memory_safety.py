@@ -321,6 +321,13 @@ class MemorySafetyChecker:
                     continue
                 branch = {k: v.copy() for k, v in states.items()}
                 self._walk_stmt(child, sf, branch)
+                # A branch that returns (or breaks, or goes to a label) does
+                # not reach the code after the `if`, so what it freed is not
+                # freed there. The error-handling shape this misread is the
+                # common one: `if (!new) { free(copy); return; }` made every
+                # later use of `copy` a possible use after free.
+                if _always_exits(child):
+                    continue
                 branches.append(branch)
             self._guarded.pop()
             # With no else, one path skips the branch entirely, so nothing a
@@ -415,18 +422,23 @@ class MemorySafetyChecker:
                        states: dict) -> None:
         if right is not None:
             self._check_expression(right, sf, states)
-        # `q[0] = 'x'`, `*q = 'x'` and `q->f = 0` all *use* q — a write
-        # through a freed pointer is a use-after-free, and the worse kind.
-        # Only a bare name rebinds, so treating every assignment as a rebind
-        # dropped the state and reported nothing.
+        # Writing to an lvalue *rebinds* it; what is used is whatever has to
+        # be dereferenced to reach it. `*out = v` and `ab->b = new` put a
+        # fresh block where the freed one was — the realloc idiom — while
+        # `free(p); *p = 'x';` still writes through a freed p, because there
+        # the freed name is `p` itself.
         if left is not None and left.type in _DEREF:
-            self._check_expression(left, sf, states)
-            # `*out = p` and `s->buf = p` hand the block to whatever owns the
-            # left side, which outlives this function.
-            self._mark_escaped(right)
-            return
+            container = left.child_by_field_name("argument")
+            if container is None:
+                kids = [c for c in left.named_children if c.type != "comment"]
+                container = kids[0] if kids else None
+            self._check_expression(container, sf, states)
+            if left.type != "field_expression":
+                # `*out = p` and `v[0] = p` hand the block to whatever owns
+                # the left side, which outlives this function.
+                self._mark_escaped(right)
 
-        name = self._base_name(left)
+        name = self._freed_name(left)
         if not name:
             return
         # Assigning to anything this function did not declare — a global, a
@@ -481,6 +493,26 @@ class MemorySafetyChecker:
         """The variable a declarator or lvalue ultimately names."""
         return _base_name_of(node)
 
+    @staticmethod
+    def _lvalue(node: Node) -> str:
+        """The name a use applies to, struct fields kept apart."""
+        return _lvalue_name(node)
+
+    @staticmethod
+    def _freed_name(node: Node) -> str:
+        """The name a free applies to.
+
+        `free(v[i])` releases the element, not the array: naming the array
+        here marked it freed, so the loop that frees each element and then
+        frees the array itself came back as a double free, and every later
+        read of the array as a use after free. Keeping the index in the name
+        tells the two apart, and still catches the same element freed twice.
+        """
+        if node is not None and node.type in ("subscript_expression",
+                                             "pointer_expression"):
+            return " ".join(_text(node).split())
+        return _lvalue_name(node)
+
     # ------------------------------------------------------------------
     def _check_expression(self, node: Node, sf: SourceFile,
                           states: dict) -> None:
@@ -494,9 +526,11 @@ class MemorySafetyChecker:
             self._report_use(node, _text(node), sf, states)
             return
         if node.type in _DEREF:
-            name = self._base_name(node)
-            if name:
-                self._report_use(node, name, sf, states)
+            # `ab->b` is a use of the field's own pointer and of the struct
+            # pointer it hangs off; either being freed is a use after free.
+            for name in {self._lvalue(node), self._base_name(node)}:
+                if name:
+                    self._report_use(node, name, sf, states)
             # Still walk the index expression, which is its own use.
             for child in node.named_children[1:]:
                 self._check_expression(child, sf, states)
@@ -511,7 +545,7 @@ class MemorySafetyChecker:
         args = list(args_node.named_children) if args_node is not None else []
 
         if name in DEALLOCATORS and args:
-            target = self._base_name(args[0])
+            target = self._freed_name(args[0])
             state = states.get(target) if target else None
             if state is not None and state.status in (FREED, MAYBE):
                 self._report(
@@ -542,7 +576,7 @@ class MemorySafetyChecker:
         if name == "realloc" and args:
             # realloc frees the old block; using the old pointer afterwards is
             # a use-after-free, so the argument's state ends here.
-            target = self._base_name(args[0])
+            target = self._freed_name(args[0])
             for arg in args:
                 self._check_expression(arg, sf, states)
             if target:
@@ -674,6 +708,51 @@ def _declared_locals(body: Node) -> set:
     return names
 
 
+def _lvalue_name(node: Node) -> str:
+    """The name a free or a use applies to, keeping struct fields apart.
+
+    `_base_name_of` walks down to the first identifier, so `ab->b` and
+    `ab->len` both come back as `ab`: freeing one field marked the whole
+    struct, and every later read of any *other* field was reported as a use
+    after free. That is the shape of the standard grow-a-buffer idiom
+    (`new = realloc(ab->b, n); ... ab->b = new;`), which is why curl and redis
+    each produced dozens of them.
+
+    A chain of plain field accesses becomes a path (`ab->b`, `s.buf.p`);
+    anything computed (an index, a call) falls back to the base identifier,
+    because telling `v[i]` from `v[j]` needs more than this.
+    """
+    parts: list = []
+    seen = 0
+    while node is not None and seen < 8:
+        seen += 1
+        if node.type == "identifier":
+            parts.append(_text(node))
+            return "->".join(reversed(parts))
+        if node.type == "field_expression":
+            field = node.child_by_field_name("field")
+            argument = node.child_by_field_name("argument")
+            if field is None or argument is None:
+                return _base_name_of(node)
+            parts.append(_text(field))
+            node = argument
+            continue
+        if node.type in ("subscript_expression", "pointer_expression",
+                         "parenthesized_expression"):
+            # `ab->b[0]` and `*ab->b` dereference the pointer `ab->b`, so the
+            # name at stake is the field, not the struct it hangs off.
+            argument = node.child_by_field_name("argument")
+            if argument is None:
+                kids = [c for c in node.named_children if c.type != "comment"]
+                argument = kids[0] if kids else None
+            if argument is None:
+                return _base_name_of(node)
+            node = argument
+            continue
+        return _base_name_of(node)
+    return _base_name_of(node)
+
+
 def _base_name_of(node: Node) -> str:
     """The variable a declarator ultimately names."""
     seen = 0
@@ -686,6 +765,37 @@ def _base_name_of(node: Node) -> str:
         node = kids[0]
         seen += 1
     return ""
+
+
+def _always_exits(node: Node) -> bool:
+    """Whether control leaves for good at the end of this branch.
+
+    Only a statement that unconditionally ends the branch counts: the last
+    statement of a block, or the branch statement itself. An exit nested in
+    a further condition leaves the other path falling through.
+    """
+    seen = 0
+    while node is not None and seen < 8:
+        seen += 1
+        if node.type in ("return_statement", "goto_statement",
+                         "break_statement", "continue_statement"):
+            return True
+        if node.type == "compound_statement":
+            kids = [c for c in node.named_children if c.type != "comment"]
+            if not kids:
+                return False
+            node = kids[-1]
+            continue
+        if node.type == "expression_statement":
+            inner = [c for c in node.named_children if c.type != "comment"]
+            # `exit(1);` and `abort();` end the program.
+            if inner and inner[0].type == "call_expression":
+                fn = inner[0].child_by_field_name("function")
+                return bool(fn) and _text(fn) in ("exit", "abort", "_exit",
+                                                  "panic", "longjmp")
+            return False
+        return False
+    return False
 
 
 def _has_goto(body: Node) -> bool:

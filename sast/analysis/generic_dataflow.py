@@ -74,15 +74,22 @@ class GenericTaintEngine:
         self._modules: set = set()
         self._bindings: dict = {}
         # Declared element counts for fixed-size arrays, so an index finding
-        # can name the bound it may exceed.
+        # can name the bound it may exceed. Scoped: declarations seen outside any
+        # function body are the file's, and each function starts from those
+        # alone. The dict used to be filled for the whole run, so a 256-byte
+        # array in one file made an unrelated `ht->table[h]` in another look
+        # like a 256-element array with an unchecked index.
         self._array_sizes: dict = {}
 
     # ------------------------------------------------------------------
     def analyze(self, files: list[SourceFile]) -> list[Finding]:
         if self.p.module_bindings:
             self._modules = _module_index(files)
+        sizes_by_file: dict = {}
         for sf in files:
+            self._array_sizes = {}
             self.walk_block(sf.root, sf, {}, Ctx())
+            sizes_by_file[sf.path] = dict(self._array_sizes)
         # Function bodies again with a clean environment, so a sink inside a
         # handler is found even when the top-level walk never called it.
         #
@@ -95,6 +102,9 @@ class GenericTaintEngine:
             for fn in self._definitions(sf.root):
                 body = self._body(fn)
                 if body is not None:
+                    # Each function starts from the arrays its own file
+                    # declares, never another file's.
+                    self._array_sizes = dict(sizes_by_file.get(sf.path, {}))
                     self.walk_block(body, sf, self._entry_env(fn, sf), Ctx())
         for sf in files:
             self.run_patterns(sf)
@@ -991,7 +1001,10 @@ class GenericTaintEngine:
         index_taint = self.taint_of(kids[1], sf, env, ctx)
         if index_taint is None:
             return
-        name = self.root_of(kids[0]) or _text(kids[0])
+        # The indexed expression as written: `ht->table[h]` indexes the
+        # field, and attributing it to `ht` matched an unrelated array of
+        # that name and cited its size as the bound.
+        name = _text(kids[0]).strip()
         size = self._array_sizes.get(name)
         if not size:
             # Only fixed-size arrays. On a heap pointer the buffer was almost

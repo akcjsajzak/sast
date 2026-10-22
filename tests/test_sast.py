@@ -5030,6 +5030,116 @@ class TestStageIsolation(unittest.TestCase):
         self.assertNotIn("Incomplete scan", render_html(clean))
 
 
+class TestRealWorldFalsePositives(unittest.TestCase):
+    """Shapes that ordinary, non-vulnerable code is full of.
+
+    Each was found by scanning real projects (curl, redis, composer,
+    phpMyAdmin, Newtonsoft.Json) where the finding could not be right.
+    """
+
+    def _c(self, body: str):
+        return {(f.rule_id, f.location.line)
+                for f in _scan({"a.c": body}).findings if f.rule_id.startswith("c-")}
+
+    def test_realloc_idiom_is_not_a_use_after_free(self):
+        # `new = realloc(x->b, n); ...; x->b = new;` — the whole of linenoise,
+        # sds and curl's dynbuf. Freeing a field must not condemn the struct.
+        found = self._c(
+            "#include <stdlib.h>\n#include <string.h>\n"
+            "struct abuf { char *b; int len; };\n"
+            "void abAppend(struct abuf *ab, const char *s, int len) {\n"
+            "  char *new = realloc(ab->b, ab->len + len);\n"
+            "  if (new == NULL) return;\n"
+            "  memcpy(new + ab->len, s, len);\n"
+            "  ab->b = new;\n"
+            "  ab->len += len;\n}\n")
+        self.assertEqual(found, set())
+
+    def test_freeing_a_field_leaves_the_others_alone(self):
+        found = self._c(
+            "#include <stdlib.h>\n"
+            "struct abuf { char *b; int len; };\n"
+            "void freeOne(struct abuf *ab) {\n"
+            "  free(ab->b);\n  ab->b = NULL;\n  ab->len = 0;\n}\n")
+        self.assertEqual(found, set())
+
+    def test_freeing_each_element_then_the_array(self):
+        found = self._c(
+            "#include <stdlib.h>\n"
+            "struct clist { char **cvec; int len; };\n"
+            "void freeAll(struct clist *lc) {\n"
+            "  for (int i = 0; i < lc->len; i++)\n"
+            "    free(lc->cvec[i]);\n"
+            "  if (lc->cvec != NULL)\n    free(lc->cvec);\n}\n")
+        self.assertEqual(found, set())
+
+    def test_a_free_on_a_branch_that_returns_does_not_reach_past_it(self):
+        found = self._c(
+            "#include <stdlib.h>\n"
+            "int add(int len, char ***out) {\n"
+            "  char *copy = malloc(len + 1);\n"
+            "  if (copy == NULL) return -1;\n"
+            "  char **v = realloc(*out, sizeof(char *) * 2);\n"
+            "  if (v == NULL) {\n    free(copy);\n    return -1;\n  }\n"
+            "  *out = v;\n  v[0] = copy;\n  return 0;\n}\n")
+        self.assertEqual(found, set())
+
+    def test_the_real_memory_bugs_still_report(self):
+        cases = {
+            # use after free through a field
+            "#include <stdlib.h>\nstruct s { char *b; };\n"
+            "int f(struct s *x) { free(x->b); return x->b[0]; }\n": "c-use-after-free",
+            # use after free on a plain pointer
+            "#include <stdlib.h>\n"
+            "int g(void) { char *p = malloc(10); free(p); return p[0]; }\n": "c-use-after-free",
+            # the same element freed twice
+            "#include <stdlib.h>\n"
+            "void h(char **v) { free(v[0]); free(v[0]); }\n": "c-double-free",
+            # freed on a branch that falls through
+            "#include <stdlib.h>\n"
+            "int k(int flag) { char *p = malloc(10);\n"
+            "  if (flag) { free(p); }\n  return p[0]; }\n": "c-use-after-free-conditional",
+        }
+        for code, rule in cases.items():
+            self.assertIn(rule, {r for r, _ in self._c(code)}, code.splitlines()[-2])
+
+    def test_array_bounds_do_not_leak_between_files(self):
+        # `char table[256]` in one file said nothing about `ht->table[h]` in
+        # another; it was cited as the bound, and the index claim with it.
+        files = {
+            "sizes.c": "char table[256];\nvoid use(void) { table[0] = 1; }\n",
+            "dict.c": ("struct d { void **table; unsigned mask; };\n"
+                       "void *lookup(struct d *ht, unsigned h) {\n"
+                       "  return ht->table[h & ht->mask];\n}\n"),
+        }
+        rules = {f.rule_id for f in _scan(files).findings}
+        self.assertNotIn("c-oob-index", rules)
+
+    def test_php_assert_only_evaluates_a_string(self):
+        rules = lambda code: {f.rule_id for f in _scan({"a.php": code}).findings}
+        # The normal PHP 7+ usage is a boolean expression, not code.
+        self.assertNotIn("php-code-assert",
+                         rules("<?php assert($this->c instanceof C);\n"))
+        self.assertNotIn("php-code-assert", rules("<?php assert(is_string($x));\n"))
+        # The string form does evaluate, and so does a tainted argument.
+        self.assertIn("php-code-assert", rules("<?php assert('1 === 1');\n"))
+        self.assertIn("php-code-assert-tainted",
+                      rules("<?php assert($_GET['check']);\n"))
+
+    def test_test_directories_of_every_ecosystem_are_excluded(self):
+        from sast.detection.language import is_test_path
+        for path in ("Src/Newtonsoft.Json.Tests/Serialization/X.cs",
+                     "src/Foo.Tests/Bar.cs", "x/MyProjectTests/A.cs",
+                     "src/UnitTests/A.cs", "a/FooTest.cs", "x/ParserSpec.ts",
+                     "y/FooIT.java", "z/parser_test.cc"):
+            self.assertTrue(is_test_path(path), path)
+        # Words that merely contain "test" are application code.
+        for path in ("src/latest/a.py", "lib/Contest.php", "app/Manifest.cs",
+                     "src/Protest/a.go", "a/GreatestHits.java",
+                     "core/Attestation.cs"):
+            self.assertFalse(is_test_path(path), path)
+
+
 class TestRecursionSafety(unittest.TestCase):
     """Deep input must not take the process down, on any platform."""
 

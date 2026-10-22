@@ -6,6 +6,31 @@ needs an entry here.
 
 ## 1.1.0
 
+Also in this release, from scanning twenty widely-used projects that are not
+deliberately vulnerable (curl, redis, Laravel, composer, phpMyAdmin,
+Newtonsoft.Json, Vue, FastAPI and others). None crashed; what they exposed
+was precision, and the total fell from 1844 findings to 1453 with no change
+on the vulnerable corpora or the OWASP Benchmark:
+
+- **C memory safety** misread the ordinary way C grows a buffer. Freeing
+  `x->f` marked the whole struct, so every later read of any other field was
+  a use after free; `v[i]` freed the array rather than the element; writing
+  the fresh block back (`ab->b = new;`) counted as a use; and a `free` on a
+  branch that returns was carried past the `if` it could not escape. Writing
+  to an lvalue now rebinds it, with only the pointers dereferenced on the way
+  counted as uses. curl 196 -> 110 findings, redis 462 -> 387.
+- **Array bounds leaked between files.** `char table[256]` in one file was
+  cited as the bound for `ht->table[h]` in another. Sizes are scoped to the
+  file that declares them, and an indexed field is no longer attributed to
+  the variable it hangs off.
+- **`assert()` in PHP** only evaluates a string. Matching the call itself
+  reported every `assert($x instanceof Y)` — 108 across composer and
+  phpMyAdmin. The pattern now requires the string form, and a tainted
+  argument is caught by a sink instead.
+- **Test code was only recognised by Java and PHP conventions.** `Foo.Tests/`,
+  `UnitTests/`, `FooTest.cs` and `parser_test.cc` were all scanned as
+  application code: 708 of Newtonsoft.Json's 950 files were its test suite.
+
 - **Accepting a finding.** Inline `sast:ignore` / `sast:ignore-next-line`
   comments, which may name rules and carry a reason, and a baseline file
   written by `sast baseline` so `--fail-on` gates on new findings only.

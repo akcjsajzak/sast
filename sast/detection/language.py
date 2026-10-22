@@ -51,11 +51,24 @@ _TEST_DIR_SEGMENTS = {
 _TEST_WORD_RE = re.compile(
     r"(^|[._-])(test|tests|spec|specs)([._-]|$)", re.IGNORECASE,
 )
-# CamelCase suffix conventions: UserTest.java, FooIT.java, AdminSpec.php. Kept
-# case-SENSITIVE and anchored to a preceding lowercase letter or digit, so an
-# ordinary word that merely ends in "test" (Contest.php) is not a test file.
+# CamelCase suffix conventions: UserTest.java, AdminSpec.php, ParserTests.cs.
+# Kept case-SENSITIVE and anchored to a preceding lowercase letter or digit, so
+# an ordinary word that merely ends in "test" (Contest.php) is not a test file.
+# The extension is open: the convention is not Java's alone, and limiting it to
+# java/php meant FooTest.cs, parser_test.cc and HandlerSpec.ts were all scanned
+# as application code.
 _TEST_SUFFIX_RE = re.compile(
-    r"[a-z0-9](Test|Tests|TestCase|IT|ITCase|Spec)\.(java|php|phtml|inc)$",
+    r"[a-z0-9](Test|Tests|TestCase|TestCases|Spec|Specs)\.[A-Za-z0-9]+$",
+)
+# `FooIT.java` is a Maven failsafe integration test. Two letters are too short
+# to claim anywhere else, so this one stays tied to Java.
+_TEST_SUFFIX_JAVA_RE = re.compile(r"[a-z0-9](IT|ITCase)\.java$")
+# Directory conventions that are not a bare word: .NET's `Project.Tests`, and
+# CamelCase `UnitTests` / `MyProjectTests`. Checked on each path segment.
+# The dotted form is case-insensitive (`Newtonsoft.Json.Tests`, `foo.test`);
+# the CamelCase form stays case-sensitive so `latest` is not a test directory.
+_TEST_DIR_SUFFIX_RE = re.compile(
+    r"(?:(?i:\.(?:tests?|specs?))$)|(?:[a-z0-9](?:Tests?|Specs?|TestCases?)$)",
 )
 
 
@@ -65,10 +78,12 @@ def is_test_path(rel_path: str) -> bool:
     parts = norm.split("/")
     # Directory conventions, including Maven/Gradle's src/test/java/...
     for seg in parts[:-1]:
-        if seg.lower() in _TEST_DIR_SEGMENTS:
+        if seg.lower() in _TEST_DIR_SEGMENTS or _TEST_DIR_SUFFIX_RE.search(seg):
             return True
     name = parts[-1]
-    return bool(_TEST_WORD_RE.search(name) or _TEST_SUFFIX_RE.search(name))
+    return bool(_TEST_WORD_RE.search(name)
+                or _TEST_SUFFIX_RE.search(name)
+                or _TEST_SUFFIX_JAVA_RE.search(name))
 
 
 def collect_source_files(
